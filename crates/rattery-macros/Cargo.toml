@@ -1,0 +1,21 @@
+[package]
+name = "rattery-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Proc macros for rattery: the #[rattery::server] attribute"
+
+[lib]
+proc-macro = true
+
+[features]
+default = []
+ssr = ["server_fn_macro/ssr"]
+axum = ["ssr", "server_fn_macro/axum"]
+
+[dependencies]
+server_fn_macro = { workspace = true }
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

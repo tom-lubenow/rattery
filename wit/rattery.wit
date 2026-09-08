@@ -1,0 +1,252 @@
+/// rattery: a sandboxed terminal host for ratatui apps.
+///
+/// The `terminal` interface is the whole contract between a rattery app (the
+/// guest, compiled to a WASI 0.2 component) and the host that owns the real
+/// terminal. It is deliberately shaped like ratatui's `Backend` trait plus a
+/// crossterm-style event stream, so the guest never emits escape sequences and
+/// the host never needs to know what a widget is.
+package rattery:tui@0.1.0;
+
+interface terminal {
+    use wasi:io/poll@0.2.12.{pollable};
+
+    // ---- rendering types -------------------------------------------------
+
+    variant color {
+        reset,
+        black,
+        red,
+        green,
+        yellow,
+        blue,
+        magenta,
+        cyan,
+        gray,
+        dark-gray,
+        light-red,
+        light-green,
+        light-yellow,
+        light-blue,
+        light-magenta,
+        light-cyan,
+        white,
+        rgb(tuple<u8, u8, u8>),
+        indexed(u8),
+    }
+
+    flags modifier {
+        bold,
+        dim,
+        italic,
+        underlined,
+        slow-blink,
+        rapid-blink,
+        reversed,
+        hidden,
+        crossed-out,
+    }
+
+    /// One terminal cell. `symbol` is a grapheme cluster, not necessarily a
+    /// single char.
+    record cell {
+        symbol: string,
+        fg: color,
+        bg: color,
+        underline-color: color,
+        modifier: modifier,
+    }
+
+    /// A cell that changed since the last frame, in absolute coordinates.
+    record cell-update {
+        x: u16,
+        y: u16,
+        cell: cell,
+    }
+
+    record size {
+        width: u16,
+        height: u16,
+    }
+
+    record position {
+        x: u16,
+        y: u16,
+    }
+
+    record window-size {
+        columns-rows: size,
+        pixels: size,
+    }
+
+    enum clear-type {
+        all,
+        after-cursor,
+        before-cursor,
+        current-line,
+        until-new-line,
+    }
+
+    // ---- input types -----------------------------------------------------
+
+    flags key-modifiers {
+        shift,
+        control,
+        alt,
+        super,
+        hyper,
+        meta,
+    }
+
+    enum key-event-kind {
+        press,
+        repeat,
+        release,
+    }
+
+    flags key-event-state {
+        keypad,
+        caps-lock,
+        num-lock,
+    }
+
+    enum media-key {
+        play,
+        pause,
+        play-pause,
+        reverse,
+        stop,
+        fast-forward,
+        rewind,
+        track-next,
+        track-previous,
+        %record,
+        lower-volume,
+        raise-volume,
+        mute-volume,
+    }
+
+    enum modifier-key {
+        left-shift,
+        left-control,
+        left-alt,
+        left-super,
+        left-hyper,
+        left-meta,
+        right-shift,
+        right-control,
+        right-alt,
+        right-super,
+        right-hyper,
+        right-meta,
+        iso-level3-shift,
+        iso-level5-shift,
+    }
+
+    variant key-code {
+        backspace,
+        enter,
+        left,
+        right,
+        up,
+        down,
+        home,
+        end,
+        page-up,
+        page-down,
+        tab,
+        back-tab,
+        delete,
+        insert,
+        f(u8),
+        character(char),
+        null,
+        esc,
+        caps-lock,
+        scroll-lock,
+        num-lock,
+        print-screen,
+        pause,
+        menu,
+        keypad-begin,
+        media(media-key),
+        modifier(modifier-key),
+    }
+
+    record key-event {
+        code: key-code,
+        modifiers: key-modifiers,
+        kind: key-event-kind,
+        state: key-event-state,
+    }
+
+    enum mouse-button {
+        left,
+        right,
+        middle,
+    }
+
+    variant mouse-event-kind {
+        down(mouse-button),
+        up(mouse-button),
+        drag(mouse-button),
+        moved,
+        scroll-down,
+        scroll-up,
+        scroll-left,
+        scroll-right,
+    }
+
+    record mouse-event {
+        kind: mouse-event-kind,
+        column: u16,
+        row: u16,
+        modifiers: key-modifiers,
+    }
+
+    variant event {
+        focus-gained,
+        focus-lost,
+        key(key-event),
+        mouse(mouse-event),
+        paste(string),
+        resize(size),
+    }
+
+    // ---- rendering (mirrors ratatui's Backend trait) ---------------------
+
+    draw: func(updates: list<cell-update>);
+    append-lines: func(n: u16);
+    hide-cursor: func();
+    show-cursor: func();
+    get-cursor-position: func() -> position;
+    set-cursor-position: func(pos: position);
+    clear: func(kind: clear-type);
+    get-size: func() -> size;
+    get-window-size: func() -> window-size;
+    flush: func();
+
+    // ---- input -----------------------------------------------------------
+
+    /// A pollable that becomes ready whenever `read-events` would return at
+    /// least one event. Poll it together with HTTP pollables to multiplex
+    /// keyboard input and server calls.
+    subscribe-events: func() -> pollable;
+
+    /// Drain every event received since the last call. Never blocks.
+    read-events: func() -> list<event>;
+
+    // ---- environment -----------------------------------------------------
+
+    /// The origin (`scheme://host[:port]`) the app was loaded from, if any.
+    /// The host restricts outbound HTTP to this origin unless told otherwise.
+    origin: func() -> option<string>;
+
+    /// Set the terminal window title.
+    set-title: func(title: string);
+}
+
+/// A rattery app imports the terminal and (through `std`) whatever WASI
+/// interfaces it links. It exports `wasi:cli/run` like any other command.
+world app {
+    import terminal;
+}

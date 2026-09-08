@@ -1,0 +1,16 @@
+[package]
+name = "counter-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Server functions shared by the counter app and its server"
+
+[features]
+default = []
+ssr = ["rattery/ssr"]
+axum = ["ssr", "rattery/axum"]
+
+[dependencies]
+rattery = { workspace = true }
+serde = { workspace = true }

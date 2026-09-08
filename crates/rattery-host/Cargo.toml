@@ -1,0 +1,27 @@
+[package]
+name = "rattery-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rattery: a sandboxed terminal host that runs ratatui apps delivered over HTTP"
+
+[[bin]]
+name = "rattery"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+futures = { workspace = true }
+http = { workspace = true }
+http-body-util = "0.1"
+ratatui = { workspace = true, features = ["std", "crossterm_0_29", "underline-color"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+tokio = { workspace = true, features = ["fs", "time"] }
+url = "2"
+wasmtime = "48"
+wasmtime-wasi = "48"
+wasmtime-wasi-http = "48"

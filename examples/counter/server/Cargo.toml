@@ -1,0 +1,15 @@
+[package]
+name = "counter-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "axum server for the counter example: serves the app component and its server functions"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+counter-shared = { path = "../shared", features = ["axum"] }
+rattery = { workspace = true, features = ["axum"] }
+tokio = { workspace = true, features = ["fs", "net"] }

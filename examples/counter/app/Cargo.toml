@@ -1,0 +1,11 @@
+[package]
+name = "counter-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The counter example app; build with --target wasm32-wasip2"
+
+[dependencies]
+rattery = { workspace = true }
+counter-shared = { path = "../shared" }
