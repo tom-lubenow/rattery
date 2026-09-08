@@ -39,6 +39,7 @@ pub use server_fn;
 pub use server_fn::ServerFnError;
 
 pub mod event;
+pub mod multipart;
 
 #[cfg(target_os = "wasi")]
 mod wasi;

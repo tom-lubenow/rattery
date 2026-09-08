@@ -4,10 +4,13 @@ use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
 
-use counter_shared::{Snapshot, adjust_count, chat, fetch_snapshot, live_feed, slow_snapshot};
+use counter_shared::{
+    Snapshot, adjust_count, chat, fetch_snapshot, live_feed, slow_snapshot, upload,
+};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use rattery::event;
+use rattery::multipart::FormData;
 use rattery::prelude::*;
 use rattery::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
@@ -100,6 +103,34 @@ impl App {
         }));
     }
 
+    /// Upload a small file over multipart; the server's summary lands in the feed.
+    fn upload_file(&mut self) {
+        let push = self.feed_writer();
+        let form = FormData::new()
+            .text(
+                "note",
+                format!(
+                    "count was {}",
+                    self.snapshot.as_ref().map_or(0, |s| s.count)
+                ),
+            )
+            .file(
+                "report",
+                "report.txt",
+                "text/plain",
+                b"hello from the terminal\n".to_vec(),
+            );
+        rattery::task::spawn(async move {
+            match upload(form.into()).await {
+                Ok(summary) => summary
+                    .lines()
+                    .for_each(|line| push(format!("upload: {line}"))),
+                Err(err) => push(format!("upload error: {err}")),
+            }
+        })
+        .detach();
+    }
+
     /// Send a ping over the chat websocket.
     fn ping(&mut self) {
         self.pings += 1;
@@ -185,6 +216,7 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('r') => app.start(fetch_snapshot()),
                 KeyCode::Char('s') => app.start(slow_snapshot(2000)),
                 KeyCode::Char('w') => app.ping(),
+                KeyCode::Char('u') => app.upload_file(),
                 _ => {}
             },
             _ => {}
@@ -287,6 +319,8 @@ fn ui(frame: &mut Frame, app: &App) {
             "slow call (2s)  ".into(),
             " w ".bold(),
             "websocket ping  ".into(),
+            " u ".bold(),
+            "upload  ".into(),
             " q ".bold(),
             "quit".into(),
         ]))

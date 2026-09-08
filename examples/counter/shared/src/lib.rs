@@ -4,6 +4,7 @@
 //! each function becomes an HTTP call, and natively inside the server with the
 //! `axum` feature, where the bodies run.
 
+use rattery::multipart::{MultipartData, MultipartFormData};
 use rattery::server_fn::codec::{JsonEncoding, StreamingText, TextStream};
 use rattery::server_fn::{BoxedStream, Websocket};
 use rattery::{ServerFnError, server};
@@ -83,6 +84,33 @@ pub async fn chat(
         })
     });
     Ok(replies.into())
+}
+
+/// A file upload: the app sends `multipart/form-data`, the server describes
+/// what it received.
+#[server(input = MultipartFormData)]
+pub async fn upload(data: MultipartData) -> Result<String, ServerFnError> {
+    let mut multipart = data
+        .into_inner()
+        .ok_or_else(|| ServerFnError::new("upload must run on the server"))?;
+    let mut summary = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+    {
+        let name = field.name().unwrap_or("?").to_owned();
+        let file_name = field.file_name().map(str::to_owned);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+        summary.push(match file_name {
+            Some(file_name) => format!("{name}: {file_name} {}B", bytes.len()),
+            None => format!("{name}: {}", String::from_utf8_lossy(&bytes)),
+        });
+    }
+    Ok(summary.join("\n"))
 }
 
 #[cfg(feature = "ssr")]

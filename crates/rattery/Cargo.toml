@@ -21,6 +21,7 @@ bitflags = "2"
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+multer = "3"
 
 [target.'cfg(target_os = "wasi")'.dependencies]
 # Must be the exact wit-bindgen version `wasip3` uses: spawned tasks only work

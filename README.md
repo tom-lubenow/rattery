@@ -120,6 +120,15 @@ pub async fn chat(
 ) -> Result<BoxedStream<String, ServerFnError>, ServerFnError> {
     Ok(input.map(|m| m.map(|text| format!("echo: {text}"))).into())
 }
+
+/// A file upload. The app builds a `rattery::multipart::FormData`; the server
+/// gets the parsed parts as a `multer` stream.
+#[server(input = MultipartFormData)]
+pub async fn upload(data: MultipartData) -> Result<String, ServerFnError> {
+    let mut parts = data.into_inner().expect("server side");
+    while let Some(field) = parts.next_field().await? { /* ... */ }
+    Ok("thanks".into())
+}
 ```
 
 ```toml
@@ -172,8 +181,8 @@ Router::new()
 ```
 
 `examples/counter` is the complete version: background calls with a spinner, a
-streaming live feed, a websocket echo, cookie sessions with per-session state, ETags
-for `--watch`, and a CORS opt-in flag. `rattery::websocket::WebSocket` is also usable
+streaming live feed, a websocket echo, a multipart upload, cookie sessions with
+per-session state, ETags for `--watch`, and a CORS opt-in flag. `rattery::websocket::WebSocket` is also usable
 directly, outside server functions.
 
 `rattery::location()` returns the URL the app was loaded from, query string included,
@@ -254,12 +263,12 @@ assert!(report.snapshots[0].contains("1"));
 ## Status
 
 Working: rendering, keyboard, mouse, paste, focus and resize events; request/response,
-streaming, and websocket server functions; background tasks on the component model's
-async ABI with HTTP over WASI 0.3; the origin policy with allow lists and CORS; a
-persistent cookie jar; hot reload; the library API; headless mode; a kill switch and
-timeouts; end-to-end tests of all of it. Not yet: multipart bodies, publishing the
-crates (the WIT lives at the workspace root for now). Note that wasmtime's WASI 0.3
-support is marked experimental upstream; rattery pins wasmtime and tracks it.
+streaming, websocket, and multipart server functions; background tasks on the component
+model's async ABI with HTTP over WASI 0.3; the origin policy with allow lists and CORS;
+a persistent cookie jar; hot reload; the library API; headless mode; a kill switch and
+timeouts; end-to-end tests of all of it. Not yet published to crates.io (the WIT lives
+at the workspace root for now). Note that wasmtime's WASI 0.3 support is marked
+experimental upstream; rattery pins wasmtime and tracks it.
 
 ## License
 
