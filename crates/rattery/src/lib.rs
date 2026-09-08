@@ -43,8 +43,8 @@ pub mod event;
 mod wasi;
 #[cfg(target_os = "wasi")]
 pub use wasi::{
-    Terminal, backend::RatteryBackend, client::ServerFnClient, origin, run, runtime, set_title,
-    task, time, websocket, wstd,
+    Terminal, backend::RatteryBackend, client::ServerFnClient, location, origin, run, runtime,
+    set_title, task, time, websocket, wstd,
 };
 
 #[cfg(not(target_os = "wasi"))]

@@ -173,6 +173,7 @@ pub struct App {
     pub(crate) mouse: bool,
     pub(crate) cache: bool,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) location: Option<String>,
     pub(crate) cookies: CookiePolicy,
     pub(crate) watch: bool,
     pub(crate) headless: Option<HeadlessOptions>,
@@ -189,6 +190,7 @@ impl App {
             mouse: true,
             cache: true,
             env: Vec::new(),
+            location: None,
             cookies: CookiePolicy::Persistent,
             watch: false,
             headless: None,
@@ -272,6 +274,14 @@ impl App {
     /// from your environment.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// The URL the app believes it was loaded from, query string included:
+    /// what `rattery::location()` returns. Defaults to the source URL. Set it
+    /// to pass parameters to an app loaded from bytes or a file.
+    pub fn location(mut self, url: impl Into<String>) -> Self {
+        self.location = Some(url.into());
         self
     }
 

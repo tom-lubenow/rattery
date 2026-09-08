@@ -164,6 +164,10 @@ streaming live feed, a websocket echo, cookie sessions with per-session state, E
 for `--watch`, and a CORS opt-in flag. `rattery::websocket::WebSocket` is also usable
 directly, outside server functions.
 
+`rattery::location()` returns the URL the app was loaded from, query string included,
+so `rattery https://host/app.wasm?team=infra` passes parameters the way a web page
+gets them (the example reads `?title=`). `rattery::origin()` is where server calls go.
+
 Event types mirror crossterm's (`KeyCode::Char('q')`, `KeyModifiers::CONTROL`, ...)
 so existing ratatui code ports by changing an import. `event::next_timeout` drives
 animations; `task::wake` lets a long-running task ask for a redraw, which is how the
@@ -175,7 +179,7 @@ example renders a streaming response line by line.
 rattery <URL or path>
         [--origin URL] [--allow-origin URL]... [--allow-all-origins] [--cors]
         [--incognito | --no-cookies | --cookie-jar FILE]
-        [--watch] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
+        [--watch] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
         [--headless COLSxROWS [--script FILE] [--timeout SECS]]
 ```
 

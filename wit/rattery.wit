@@ -241,6 +241,10 @@ interface terminal {
     /// The host restricts outbound HTTP to this origin unless told otherwise.
     origin: func() -> option<string>;
 
+    /// The full URL the app was loaded from, query string included, if it
+    /// was loaded from one. The terminal's `window.location`.
+    location: func() -> option<string>;
+
     /// Set the terminal window title.
     set-title: func(title: string);
 }

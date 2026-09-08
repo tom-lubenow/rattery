@@ -33,6 +33,8 @@ struct App {
     chat_tx: Option<mpsc::UnboundedSender<Result<String, ServerFnError>>>,
     _chat_task: Option<Task<()>>,
     pings: u32,
+    /// From `?title=` in the URL the app was loaded from.
+    title: String,
     quit: bool,
 }
 
@@ -138,8 +140,17 @@ impl App {
 
 pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
     rattery::set_title("rattery counter");
+    let title = rattery::location()
+        .and_then(|location| {
+            let (_, query) = location.split_once('?')?;
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("title=").map(str::to_owned))
+        })
+        .unwrap_or_else(|| "rattery counter".to_owned());
     let mut app = App {
         origin: rattery::origin(),
+        title,
         ..App::default()
     };
     app.start(fetch_snapshot());
@@ -203,7 +214,7 @@ fn ui(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            " rattery counter ".bold().reversed(),
+            format!(" {} ", app.title).bold().reversed(),
             "  served from ".dim(),
             origin.cyan(),
             status,

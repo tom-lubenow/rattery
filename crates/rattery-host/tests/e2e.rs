@@ -347,6 +347,21 @@ async fn watch_reloads_when_the_served_component_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn location_carries_query_parameters() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let report = App::from_url(format!("{}/app.wasm?title=Hello+from+the+URL", server.url))
+        .unwrap()
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert!(report.snapshots[0].contains("Hello+from+the+URL"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn kill_switch_interrupts_a_spinning_app() {
     require_wasip2!();
     let report = App::from_path(guest("spin-app"))

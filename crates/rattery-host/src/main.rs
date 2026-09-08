@@ -34,6 +34,11 @@ struct Cli {
     #[arg(long)]
     cors: bool,
 
+    /// URL reported to the app as its location, query string included
+    /// (defaults to SOURCE when it is a URL).
+    #[arg(long, value_name = "URL")]
+    location: Option<String>,
+
     /// Environment variable to expose to the app (repeatable).
     #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env)]
     env: Vec<(String, String)>,
@@ -136,6 +141,9 @@ async fn main() -> Result<()> {
         .watch(cli.watch);
     if let Some(origin) = cli.origin {
         app = app.origin(origin);
+    }
+    if let Some(location) = cli.location {
+        app = app.location(location);
     }
     for origin in cli.allow_origins {
         app = app.allow_origin(origin);

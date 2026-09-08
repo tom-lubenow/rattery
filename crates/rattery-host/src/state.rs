@@ -126,6 +126,10 @@ impl Host for HostState {
         Ok(self.term.origin().map(str::to_owned))
     }
 
+    async fn location(&mut self) -> wasmtime::Result<Option<String>> {
+        Ok(self.term.location().map(str::to_owned))
+    }
+
     async fn set_title(&mut self, title: String) -> wasmtime::Result<()> {
         self.term.set_title(&title)?;
         Ok(())

@@ -66,18 +66,22 @@ pub async fn run(app: App) -> Result<Report> {
     bindings::websocket::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
     let interrupter = Arc::new(Interrupter::new(engine.clone()));
+    let location = app.location.clone().or_else(|| match &app.source {
+        Source::Url(url) => Some(url.to_string()),
+        _ => None,
+    });
 
     let (session, mut term) = match &app.headless {
         None => {
             let session = Session::enter(app.mouse)?;
-            (
-                Some(session),
-                TerminalHost::interactive(server_origin.clone(), interrupter.clone()),
-            )
+            let term =
+                TerminalHost::interactive(server_origin.clone(), location, interrupter.clone());
+            (Some(session), term)
         }
         Some(options) => {
             let term = TerminalHost::headless(
                 server_origin.clone(),
+                location,
                 interrupter.clone(),
                 options.width,
                 options.height,

@@ -285,18 +285,24 @@ pub struct TerminalHost {
     output: Output,
     queue: Arc<EventQueue>,
     origin: Option<String>,
+    location: Option<String>,
     snapshots: Arc<Mutex<Vec<Screen>>>,
 }
 
 impl TerminalHost {
     /// Interactive: crossterm on stdout, input read from stdin on a task.
-    pub fn interactive(origin: Option<String>, interrupter: Arc<Interrupter>) -> Self {
+    pub fn interactive(
+        origin: Option<String>,
+        location: Option<String>,
+        interrupter: Arc<Interrupter>,
+    ) -> Self {
         let queue = Arc::new(EventQueue::new(interrupter));
         tokio::spawn(read_input(queue.clone()));
         Self {
             output: Output::Crossterm(CrosstermBackend::new(io::stdout())),
             queue,
             origin,
+            location,
             snapshots: Arc::default(),
         }
     }
@@ -304,6 +310,7 @@ impl TerminalHost {
     /// Headless: an in-memory screen, input from a script.
     pub fn headless(
         origin: Option<String>,
+        location: Option<String>,
         interrupter: Arc<Interrupter>,
         width: u16,
         height: u16,
@@ -312,6 +319,7 @@ impl TerminalHost {
             output: Output::Test(Arc::new(Mutex::new(TestBackend::new(width, height)))),
             queue: Arc::new(EventQueue::new(interrupter)),
             origin,
+            location,
             snapshots: Arc::default(),
         }
     }
@@ -334,6 +342,10 @@ impl TerminalHost {
 
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
+    }
+
+    pub fn location(&self) -> Option<&str> {
+        self.location.as_deref()
     }
 
     pub fn draw(&mut self, updates: &[CellUpdate]) -> io::Result<()> {

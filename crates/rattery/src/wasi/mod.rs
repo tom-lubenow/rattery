@@ -28,6 +28,13 @@ pub fn origin() -> Option<String> {
     bindings::terminal::origin()
 }
 
+/// The full URL this app was loaded from, query string included, if it was
+/// loaded from one: the terminal's `window.location`. Parse it with the `url`
+/// crate to read parameters.
+pub fn location() -> Option<String> {
+    bindings::terminal::location()
+}
+
 /// Set the terminal window title.
 pub fn set_title(title: &str) {
     bindings::terminal::set_title(title)
