@@ -60,7 +60,10 @@ fn cargo(args: &[&str]) -> Result<bool> {
 
 fn dev(app: &str, server: &str, bind: &str) -> Result<()> {
     let root = root();
-    let app_wasm = root.join(format!("target/wasm32-wasip2/debug/{app}.wasm"));
+    let app_wasm = root.join(format!(
+        "target/wasm32-wasip2/debug/{}.wasm",
+        app.replace('-', "_")
+    ));
     let server_bin = root.join(format!("target/debug/{server}"));
     let watched = [root.join("crates"), root.join("examples"), root.join("wit")];
 

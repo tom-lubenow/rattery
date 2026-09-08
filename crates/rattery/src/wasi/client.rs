@@ -1,42 +1,40 @@
-//! A `server_fn` client that speaks `wasi:http`.
+//! A `server_fn` client that speaks `wasi:http@0.3`.
 //!
 //! The host decides where these requests may go: by default only the origin
 //! the app was loaded from, the terminal equivalent of the same-origin policy.
 
+use std::pin::Pin;
+use std::rc::Rc;
+
 use bytes::Bytes;
-use futures::{Sink, Stream, TryStreamExt};
+use futures::{Sink, Stream, StreamExt, TryStreamExt};
 use http::header::{ACCEPT, CONTENT_TYPE};
 use http::{HeaderMap, Method, StatusCode};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use send_wrapper::SendWrapper;
 use server_fn::client::{Client, get_server_url};
 use server_fn::error::{FromServerFnError, IntoAppError, ServerFnErrorErr};
 use server_fn::request::ClientReq;
 use server_fn::response::ClientRes;
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
-use wstd::http::{Body, Client as HttpClient, Request as HttpRequest};
+use wasip3::http_compat::{IncomingResponseBody, http_from_wasi_response, http_into_wasi_request};
 
-use super::websocket::{Error as WsError, Message, WebSocket};
+use crate::wasi::websocket::{Error as WsError, Message, WebSocket};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+type OutgoingBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// The client `#[rattery::server]` functions use on `wasm32-wasip2`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServerFnClient;
 
-/// A request waiting to be sent through `wasi:http`.
+/// A request waiting to be sent.
 pub struct Request {
     method: Method,
     url: String,
     content_type: Option<String>,
     accepts: String,
-    body: RequestBody,
-}
-
-enum RequestBody {
-    Empty,
-    Text(String),
-    Bytes(Bytes),
-    Stream(Pin<Box<dyn Stream<Item = Bytes> + Send>>),
+    body: OutgoingBody,
 }
 
 /// Placeholder: multipart bodies are not supported by this client yet.
@@ -48,7 +46,7 @@ pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     url: String,
-    body: SendWrapper<Body>,
+    body: SendWrapper<IncomingResponseBody>,
 }
 
 fn request_error<E: FromServerFnError>(msg: impl ToString) -> E {
@@ -67,6 +65,18 @@ fn check_method<E: FromServerFnError>(method: &Method, allowed: &[Method]) -> Re
             ServerFnErrorErr::UnsupportedRequestMethod(method.to_string()),
         ))
     }
+}
+
+fn empty_body() -> OutgoingBody {
+    Empty::new()
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed_unsync()
+}
+
+fn bytes_body(bytes: Bytes) -> OutgoingBody {
+    Full::new(bytes)
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed_unsync()
 }
 
 impl<E: FromServerFnError> ClientReq<E> for Request {
@@ -100,7 +110,7 @@ impl<E: FromServerFnError> ClientReq<E> for Request {
             url,
             content_type: Some(content_type.to_owned()),
             accepts: accepts.to_owned(),
-            body: RequestBody::Empty,
+            body: empty_body(),
         })
     }
 
@@ -117,7 +127,7 @@ impl<E: FromServerFnError> ClientReq<E> for Request {
             url: absolute(path),
             content_type: Some(content_type.to_owned()),
             accepts: accepts.to_owned(),
-            body: RequestBody::Text(body),
+            body: bytes_body(Bytes::from(body)),
         })
     }
 
@@ -134,7 +144,7 @@ impl<E: FromServerFnError> ClientReq<E> for Request {
             url: absolute(path),
             content_type: Some(content_type.to_owned()),
             accepts: accepts.to_owned(),
-            body: RequestBody::Bytes(body),
+            body: bytes_body(body),
         })
     }
 
@@ -169,12 +179,15 @@ impl<E: FromServerFnError> ClientReq<E> for Request {
         method: Method,
     ) -> Result<Self, E> {
         check_method(&method, &[Method::POST, Method::PUT, Method::PATCH])?;
+        let body =
+            StreamBody::new(body.map(|chunk| Ok::<_, BoxError>(http_body::Frame::data(chunk))))
+                .boxed_unsync();
         Ok(Self {
             method,
             url: absolute(path),
             content_type: Some(content_type.to_owned()),
             accepts: accepts.to_owned(),
-            body: RequestBody::Stream(Box::pin(body)),
+            body,
         })
     }
 }
@@ -224,24 +237,21 @@ where
     fn send(req: Request) -> impl Future<Output = Result<Response, E>> + Send {
         // wasi resources are !Send; the guest is single-threaded so this is sound.
         SendWrapper::new(async move {
-            let mut builder = HttpRequest::builder()
+            let mut builder = http::Request::builder()
                 .method(req.method)
                 .uri(req.url.as_str())
                 .header(ACCEPT, req.accepts.as_str());
             if let Some(content_type) = &req.content_type {
                 builder = builder.header(CONTENT_TYPE, content_type.as_str());
             }
-            let body = match req.body {
-                RequestBody::Empty => Body::empty(),
-                RequestBody::Text(text) => Body::from(text),
-                RequestBody::Bytes(bytes) => Body::from(bytes),
-                RequestBody::Stream(stream) => Body::from_stream(stream),
-            };
-            let request = builder.body(body).map_err(request_error::<E>)?;
-            let response = HttpClient::new()
-                .send(request)
+            let request = builder.body(req.body).map_err(request_error::<E>)?;
+            let request = http_into_wasi_request(request)
+                .map_err(|e| request_error::<E>(format!("{e:?}")))?;
+            let response = wasip3::http::client::send(request)
                 .await
-                .map_err(request_error::<E>)?;
+                .map_err(|e| request_error::<E>(format!("{e:?}")))?;
+            let response = http_from_wasi_response(response)
+                .map_err(|e| request_error::<E>(format!("{e:?}")))?;
             let (parts, body) = response.into_parts();
             Ok(Response {
                 status: parts.status,
@@ -265,10 +275,10 @@ where
     > + Send {
         let path = path.to_owned();
         SendWrapper::new(async move {
-            let socket = Rc::new(WebSocket::connect(&path));
-            socket.open().await.map_err(|err| {
+            let socket = WebSocket::connect(&path).await.map_err(|err| {
                 E::from_server_fn_error(ServerFnErrorErr::Request(err.to_string()))
             })?;
+            let socket = Rc::new(socket);
 
             let stream = futures::stream::unfold(socket.clone(), |socket| async move {
                 let item = match socket.next().await {
@@ -296,7 +306,7 @@ where
     }
 
     fn spawn(future: impl Future<Output = ()> + Send + 'static) {
-        wstd::runtime::spawn(future).detach();
+        wit_bindgen::spawn_local(future);
     }
 }
 
@@ -307,28 +317,35 @@ fn response_error<E: FromServerFnError>(msg: impl ToString) -> E {
 impl<E: FromServerFnError> ClientRes<E> for Response {
     fn try_into_string(self) -> impl Future<Output = Result<String, E>> + Send {
         SendWrapper::new(async move {
-            let mut body = self.body.take();
-            body.str_contents()
+            let bytes = self
+                .body
+                .take()
+                .collect()
                 .await
-                .map(str::to_owned)
-                .map_err(response_error::<E>)
+                .map_err(|e| response_error::<E>(format!("{e:?}")))?;
+            String::from_utf8(bytes.to_bytes().to_vec()).map_err(response_error::<E>)
         })
     }
 
     fn try_into_bytes(self) -> impl Future<Output = Result<Bytes, E>> + Send {
         SendWrapper::new(async move {
-            let mut body = self.body.take();
-            body.bytes_contents().await.map_err(response_error::<E>)
+            self.body
+                .take()
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .map_err(|e| response_error::<E>(format!("{e:?}")))
         })
     }
 
     fn try_into_stream(
         self,
     ) -> Result<impl Stream<Item = Result<Bytes, Bytes>> + Send + Sync + 'static, E> {
-        let body = self.body.take();
-        let stream = http_body_util::BodyStream::new(body.into_boxed_body())
+        let stream = http_body_util::BodyStream::new(self.body.take())
             .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
-            .map_err(|e| E::from_server_fn_error(ServerFnErrorErr::Response(e.to_string())).ser());
+            .map_err(|e| {
+                E::from_server_fn_error(ServerFnErrorErr::Response(format!("{e:?}"))).ser()
+            });
         Ok(SendWrapper::new(stream))
     }
 

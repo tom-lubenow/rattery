@@ -1,62 +1,65 @@
 //! Reading input events from the host.
 //!
-//! The host hands us a `wasi:io` pollable that is ready whenever events are
-//! queued. Waiting on it through the `wstd` reactor lets an app `await` key
-//! presses and server-function responses at the same time.
+//! `terminal.next-event` is an async host function, so waiting for a key is a
+//! plain `.await`. Spawned tasks that finish ask for attention through
+//! [`Event::Wake`], which [`next`] also delivers.
 
-use super::bindings::terminal as t;
-use super::task;
-use crate::event::*;
-use futures::future::Either;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
-use wstd::runtime::AsyncPollable;
 
-struct Source {
-    pollable: AsyncPollable,
-    buffer: VecDeque<Event>,
-}
+use futures::future::Either;
+
+use crate::bindings::terminal as t;
+use crate::event::*;
+use crate::wasi::task;
+
+type PendingEvent = Pin<Box<dyn Future<Output = t::Event>>>;
 
 thread_local! {
-    static SOURCE: RefCell<Option<Source>> = const { RefCell::new(None) };
+    /// Events drained from the host but not yet handed to the app.
+    static BUFFER: RefCell<VecDeque<Event>> = const { RefCell::new(VecDeque::new()) };
+    /// A host call in flight. Kept across wakes so it is not cancelled and
+    /// restarted every time a task finishes.
+    static PENDING: RefCell<Option<PendingEvent>> = const { RefCell::new(None) };
 }
 
-fn with_source<R>(f: impl FnOnce(&mut Source) -> R) -> R {
-    SOURCE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let source = slot.get_or_insert_with(|| Source {
-            pollable: AsyncPollable::new(t::subscribe_events()),
-            buffer: VecDeque::new(),
-        });
-        f(source)
-    })
+fn refill() {
+    BUFFER.with(|b| {
+        b.borrow_mut()
+            .extend(t::read_events().into_iter().map(Event::from))
+    });
 }
 
-fn refill(buffer: &mut VecDeque<Event>) {
-    buffer.extend(t::read_events().into_iter().map(Event::from));
+fn pop() -> Option<Event> {
+    BUFFER.with(|b| b.borrow_mut().pop_front())
+}
+
+fn take_pending() -> PendingEvent {
+    PENDING
+        .with(|p| p.borrow_mut().take())
+        .unwrap_or_else(|| Box::pin(t::next_event()))
 }
 
 /// Wait for the next event: terminal input, or [`Event::Wake`] when a spawned
-/// [`Task`](crate::task::Task) finishes.
-///
-/// Must be called from inside [`crate::run`] (or `runtime::block_on`).
+/// [`Task`](crate::task::Task) finishes or [`task::wake`] is called.
 pub async fn next() -> Event {
-    loop {
-        if let Some(event) = with_source(|s| s.buffer.pop_front()) {
-            return event;
-        }
-        if task::take_wake() {
-            return Event::Wake;
-        }
-        let pollable = with_source(|s| s.pollable.clone());
-        let input = pollable.wait_for();
-        let woken = task::woken();
-        futures::pin_mut!(input);
-        futures::pin_mut!(woken);
-        match futures::future::select(input, woken).await {
-            Either::Left(_) => with_source(|s| refill(&mut s.buffer)),
-            Either::Right(_) => return Event::Wake,
+    if let Some(event) = pop() {
+        return event;
+    }
+    if task::take_wake() {
+        return Event::Wake;
+    }
+    let host = take_pending();
+    let woken = task::woken();
+    futures::pin_mut!(woken);
+    match futures::future::select(host, woken).await {
+        Either::Left((event, _)) => event.into(),
+        Either::Right(((), host)) => {
+            PENDING.with(|p| *p.borrow_mut() = Some(host));
+            Event::Wake
         }
     }
 }
@@ -64,26 +67,38 @@ pub async fn next() -> Event {
 /// Like [`next`], but gives up after `timeout` and returns `None`. Useful for
 /// animations and periodic refreshes.
 pub async fn next_timeout(timeout: Duration) -> Option<Event> {
-    let timer = wstd::time::Timer::after(timeout.into());
-    let event = next();
-    let deadline = timer.wait();
-    futures::pin_mut!(event);
+    if let Some(event) = pop() {
+        return Some(event);
+    }
+    if task::take_wake() {
+        return Some(Event::Wake);
+    }
+    let host = take_pending();
+    let woken = task::woken();
+    let deadline = crate::wasi::time::sleep(timeout);
+    futures::pin_mut!(woken);
     futures::pin_mut!(deadline);
-    match futures::future::select(event, deadline).await {
-        Either::Left((event, _)) => Some(event),
-        Either::Right(_) => None,
+    let wake_or_deadline = futures::future::select(woken, deadline);
+    match futures::future::select(host, wake_or_deadline).await {
+        Either::Left((event, _)) => Some(event.into()),
+        Either::Right((Either::Left(_), host)) => {
+            PENDING.with(|p| *p.borrow_mut() = Some(host));
+            Some(Event::Wake)
+        }
+        Either::Right((Either::Right(_), host)) => {
+            PENDING.with(|p| *p.borrow_mut() = Some(host));
+            None
+        }
     }
 }
 
 /// Return every event received so far without waiting.
 pub fn poll() -> Vec<Event> {
-    with_source(|s| {
-        refill(&mut s.buffer);
-        s.buffer.drain(..).collect()
-    })
+    refill();
+    BUFFER.with(|b| b.borrow_mut().drain(..).collect())
 }
 
-/// An endless stream of input events.
+/// An endless stream of events.
 pub fn stream() -> impl futures::Stream<Item = Event> + Unpin {
     Box::pin(futures::stream::unfold((), |()| async {
         Some((next().await, ()))

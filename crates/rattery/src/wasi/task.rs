@@ -28,60 +28,82 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
+use futures::future::{AbortHandle, Abortable};
+
+struct Slot<T> {
+    value: RefCell<Option<T>>,
+    done: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
 /// A handle to a spawned future. Dropping it cancels the work; call
 /// [`Task::detach`] to let it run to completion unobserved.
 pub struct Task<T> {
-    slot: Rc<RefCell<Option<T>>>,
-    done: Rc<Cell<bool>>,
-    inner: Option<wstd::runtime::Task<()>>,
+    slot: Rc<Slot<T>>,
+    abort: AbortHandle,
+    detached: bool,
 }
 
-/// Run `future` in the background. Must be called from inside [`crate::run`].
+/// Run `future` in the background. Must be called from inside an app.
 pub fn spawn<F>(future: F) -> Task<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let slot = Rc::new(RefCell::new(None));
-    let done = Rc::new(Cell::new(false));
-    let inner = wstd::runtime::spawn({
+    let slot = Rc::new(Slot {
+        value: RefCell::new(None),
+        done: Cell::new(false),
+        waker: RefCell::new(None),
+    });
+    let (abort, registration) = AbortHandle::new_pair();
+    let work = Abortable::new(future, registration);
+    wit_bindgen::spawn_local({
         let slot = slot.clone();
-        let done = done.clone();
         async move {
-            let value = future.await;
-            *slot.borrow_mut() = Some(value);
-            done.set(true);
-            wake();
+            if let Ok(value) = work.await {
+                *slot.value.borrow_mut() = Some(value);
+                slot.done.set(true);
+                if let Some(waker) = slot.waker.borrow_mut().take() {
+                    waker.wake();
+                }
+                wake();
+            }
         }
     });
     Task {
         slot,
-        done,
-        inner: Some(inner),
+        abort,
+        detached: false,
     }
 }
 
 impl<T> Task<T> {
     /// True once the future has produced a value (whether or not it was taken).
     pub fn is_done(&self) -> bool {
-        self.done.get()
+        self.slot.done.get()
     }
 
     /// True while the future is still running.
     pub fn is_pending(&self) -> bool {
-        !self.done.get()
+        !self.slot.done.get()
     }
 
     /// Take the result if the future has finished. Returns `None` while pending
     /// and after the value was already taken.
     pub fn try_take(&mut self) -> Option<T> {
-        self.slot.borrow_mut().take()
+        self.slot.value.borrow_mut().take()
     }
 
     /// Let the future keep running after this handle is dropped.
     pub fn detach(mut self) {
-        if let Some(inner) = self.inner.take() {
-            inner.detach();
+        self.detached = true;
+    }
+}
+
+impl<T> Drop for Task<T> {
+    fn drop(&mut self) {
+        if !self.detached {
+            self.abort.abort();
         }
     }
 }
@@ -89,30 +111,23 @@ impl<T> Task<T> {
 impl<T> Future for Task<T> {
     type Output = T;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        if let Some(value) = self.slot.borrow_mut().take() {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        if let Some(value) = self.slot.value.borrow_mut().take() {
             return Poll::Ready(value);
         }
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("rattery::task::Task polled after completion");
-        match Pin::new(inner).poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(()) => Poll::Ready(
-                self.slot
-                    .borrow_mut()
-                    .take()
-                    .expect("task finished without a value"),
-            ),
-        }
+        assert!(
+            !self.slot.done.get(),
+            "rattery::task::Task polled after its value was taken"
+        );
+        *self.slot.waker.borrow_mut() = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
 impl<T> std::fmt::Debug for Task<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Task")
-            .field("done", &self.done.get())
+            .field("done", &self.slot.done.get())
             .finish()
     }
 }

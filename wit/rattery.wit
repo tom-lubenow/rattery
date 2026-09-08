@@ -8,8 +8,6 @@
 package rattery:tui@0.1.0;
 
 interface terminal {
-    use wasi:io/poll@0.2.12.{pollable};
-
     // ---- rendering types -------------------------------------------------
 
     variant color {
@@ -227,10 +225,9 @@ interface terminal {
 
     // ---- input -----------------------------------------------------------
 
-    /// A pollable that becomes ready whenever `read-events` would return at
-    /// least one event. Poll it together with HTTP pollables to multiplex
-    /// keyboard input and server calls.
-    subscribe-events: func() -> pollable;
+    /// Wait for the next input event. Async: other tasks in the app, such as
+    /// server calls, keep running while it waits.
+    next-event: async func() -> event;
 
     /// Drain every event received since the last call. Never blocks.
     read-events: func() -> list<event>;
@@ -252,8 +249,6 @@ interface terminal {
 /// WebSockets, provided by the host because WASI 0.2 has none. Connections
 /// are subject to the same origin policy and cookie jar as HTTP requests.
 interface websocket {
-    use wasi:io/poll@0.2.12.{pollable};
-
     variant message {
         text(string),
         binary(list<u8>),
@@ -271,22 +266,15 @@ interface websocket {
     }
 
     resource socket {
-        /// Start connecting to a `ws://`, `wss://`, `http://`, or `https://`
-        /// URL. The handshake completes in the background.
-        connect: static func(url: string) -> socket;
+        /// Connect to a `ws://`, `wss://`, `http://`, or `https://` URL and
+        /// complete the handshake.
+        connect: static async func(url: string) -> result<socket, error>;
 
-        /// Ready when there is news: the connection opened, a message is
-        /// waiting, or the connection closed or failed.
-        subscribe: func() -> pollable;
+        /// Wait for the next message. Once the connection has closed or
+        /// failed, the error, every time.
+        receive: async func() -> result<message, error>;
 
-        /// True once the handshake succeeded and until the socket closes.
-        is-open: func() -> bool;
-
-        /// The next queued message, or `none` if nothing is waiting yet.
-        /// Once the queue is drained after a close or failure, the error.
-        receive: func() -> result<option<message>, error>;
-
-        /// Queue a message; delivered once the connection is open.
+        /// Queue a message to send.
         send: func(message: message) -> result<_, error>;
 
         /// Close the connection.
@@ -294,9 +282,14 @@ interface websocket {
     }
 }
 
-/// A rattery app imports the terminal and (through `std`) whatever WASI
-/// interfaces it links. It exports `wasi:cli/run` like any other command.
+/// A rattery app imports the terminal and websockets, plus (through `std` and
+/// the `wasip3` crate) the WASI interfaces it links: 0.2 for stdio and clocks,
+/// 0.3 for HTTP. It exports one async `run`; the host drives it with the
+/// component model's async ABI, so the app is a real async program.
 world app {
     import terminal;
     import websocket;
+
+    /// Run the app to completion. `err` is a message the host shows the user.
+    export run: async func() -> result<_, string>;
 }

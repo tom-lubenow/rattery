@@ -4,10 +4,10 @@ wasmtime::component::bindgen!({
     path: "../../wit",
     world: "app",
     with: {
-        "wasi": wasmtime_wasi::p2::bindings,
         "rattery:tui/websocket.socket": crate::websocket::WsSocket,
     },
     imports: { default: async | trappable },
+    exports: { default: async | store },
     additional_derives: [Clone, PartialEq, Eq],
 });
 

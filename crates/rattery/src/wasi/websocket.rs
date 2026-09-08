@@ -4,9 +4,7 @@
 
 use std::fmt;
 
-use wstd::runtime::AsyncPollable;
-
-use super::bindings::rattery::tui::websocket as w;
+use crate::bindings::websocket as w;
 
 /// A message on a websocket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,56 +72,31 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A websocket connection.
+/// An open websocket connection.
 pub struct WebSocket {
-    // Declared first so it is dropped before the socket it watches.
-    pollable: AsyncPollable,
     socket: w::Socket,
 }
 
 impl WebSocket {
-    /// Start connecting to `url` (`ws://`, `wss://`, `http://`, or `https://`;
-    /// a path like `/api/chat` is resolved against the app's origin). The
-    /// handshake completes in the background; [`WebSocket::open`] waits for it.
-    ///
-    /// Must be called from inside [`crate::run`].
-    pub fn connect(url: &str) -> Self {
+    /// Connect to `url` (`ws://`, `wss://`, `http://`, or `https://`; a path
+    /// like `/api/chat` is resolved against the app's origin) and complete
+    /// the handshake.
+    pub async fn connect(url: &str) -> Result<Self, Error> {
         let url = if url.starts_with('/') {
             format!("{}{url}", server_fn::client::get_server_url())
         } else {
             url.to_owned()
         };
-        let socket = w::Socket::connect(&url);
-        let pollable = AsyncPollable::new(socket.subscribe());
-        Self { pollable, socket }
-    }
-
-    /// Wait until the connection is open, or fail with why it never opened.
-    pub async fn open(&self) -> Result<(), Error> {
-        loop {
-            if self.socket.is_open() {
-                return Ok(());
-            }
-            // Not open: either still connecting, or already failed.
-            if let Err(err) = self.socket.receive() {
-                return Err(err.into());
-            }
-            self.pollable.wait_for().await;
-        }
+        let socket = w::Socket::connect(url).await?;
+        Ok(Self { socket })
     }
 
     /// Wait for the next message. `Err(Closed)` once the peer closes.
     pub async fn next(&self) -> Result<Message, Error> {
-        loop {
-            match self.socket.receive() {
-                Ok(Some(message)) => return Ok(message.into()),
-                Ok(None) => self.pollable.wait_for().await,
-                Err(err) => return Err(err.into()),
-            }
-        }
+        Ok(self.socket.receive().await?.into())
     }
 
-    /// Queue a message. It is sent once the connection is open.
+    /// Queue a message to send.
     pub fn send(&self, message: impl Into<Message>) -> Result<(), Error> {
         self.socket
             .send(&message.into().into())
@@ -156,8 +129,6 @@ impl From<Vec<u8>> for Message {
 
 impl fmt::Debug for WebSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WebSocket")
-            .field("open", &self.socket.is_open())
-            .finish()
+        f.debug_struct("WebSocket").finish()
     }
 }

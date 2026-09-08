@@ -29,9 +29,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 tokio = { workspace = true, features = ["fs", "time"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2"
-wasmtime = "48"
-wasmtime-wasi = "48"
-wasmtime-wasi-http = "48"
+wasmtime = { version = "48", features = ["component-model-async"] }
+wasmtime-wasi = { version = "48", features = ["p3"] }
+wasmtime-wasi-http = { version = "48", features = ["p3"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["process", "io-util"] }

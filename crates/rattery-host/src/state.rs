@@ -1,12 +1,16 @@
 //! The `Store` data: WASI contexts plus the terminal, and the host
-//! implementation of `rattery:tui/terminal`.
+//! implementation of `rattery:tui/terminal` and `rattery:tui/websocket`.
+//!
+//! Synchronous WIT functions land in the `Host` traits and take `&mut self`.
+//! The `async func`s (`next-event`, websocket `connect` and `receive`) land in
+//! the `HostWithStore` traits: they run concurrently with the guest and reach
+//! the store through an `Accessor` only when they need it.
 
-use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::p2::bindings::io::poll::Pollable;
+use wasmtime::component::{Accessor, HasSelf, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::bindings::terminal::{CellUpdate, ClearType, Event, Host, Position, Size, WindowSize};
+use crate::bindings::terminal::{self, CellUpdate, ClearType, Event, Position, Size, WindowSize};
 use crate::bindings::websocket;
 use crate::http::{CookieJar, OriginHooks, OriginPolicy};
 use crate::terminal::TerminalHost;
@@ -39,9 +43,7 @@ impl HostState {
             term,
         }
     }
-}
 
-impl HostState {
     pub fn into_terminal(self) -> TerminalHost {
         self.term
     }
@@ -66,7 +68,7 @@ impl WasiHttpView for HostState {
     }
 }
 
-impl Host for HostState {
+impl terminal::Host for HostState {
     async fn draw(&mut self, updates: Vec<CellUpdate>) -> wasmtime::Result<()> {
         self.term.draw(&updates)?;
         Ok(())
@@ -114,10 +116,6 @@ impl Host for HostState {
         Ok(())
     }
 
-    async fn subscribe_events(&mut self) -> wasmtime::Result<Resource<Pollable>> {
-        self.term.subscribe(&mut self.table)
-    }
-
     async fn read_events(&mut self) -> wasmtime::Result<Vec<Event>> {
         Ok(self.term.drain_events())
     }
@@ -136,32 +134,16 @@ impl Host for HostState {
     }
 }
 
+impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
+    async fn next_event(store: &Accessor<U, Self>) -> wasmtime::Result<Event> {
+        let queue = store.with(|mut view| view.get().term.queue());
+        Ok(queue.next().await)
+    }
+}
+
 impl websocket::Host for HostState {}
 
 impl websocket::HostSocket for HostState {
-    async fn connect(&mut self, url: String) -> wasmtime::Result<Resource<WsSocket>> {
-        let socket = WsSocket::connect(&url, &self.policy, self.cookies.as_ref());
-        Ok(self.table.push(socket)?)
-    }
-
-    async fn subscribe(
-        &mut self,
-        this: Resource<WsSocket>,
-    ) -> wasmtime::Result<Resource<Pollable>> {
-        WsSocket::subscribe(&mut self.table, &this)
-    }
-
-    async fn is_open(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<bool> {
-        Ok(self.table.get(&this)?.is_open())
-    }
-
-    async fn receive(
-        &mut self,
-        this: Resource<WsSocket>,
-    ) -> wasmtime::Result<Result<Option<websocket::Message>, websocket::Error>> {
-        Ok(self.table.get(&this)?.receive())
-    }
-
     async fn send(
         &mut self,
         this: Resource<WsSocket>,
@@ -178,5 +160,27 @@ impl websocket::HostSocket for HostState {
     async fn drop(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<()> {
         self.table.delete(this)?;
         Ok(())
+    }
+}
+
+impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
+    async fn connect(
+        store: &Accessor<U, Self>,
+        url: String,
+    ) -> wasmtime::Result<Result<Resource<WsSocket>, websocket::Error>> {
+        let (policy, cookies) =
+            store.with(|mut view| (view.get().policy.clone(), view.get().cookies.clone()));
+        match WsSocket::connect(&url, &policy, cookies.as_ref()).await {
+            Ok(socket) => Ok(Ok(store.with(|mut view| view.get().table.push(socket))?)),
+            Err(err) => Ok(Err(err)),
+        }
+    }
+
+    async fn receive(
+        store: &Accessor<U, Self>,
+        this: Resource<WsSocket>,
+    ) -> wasmtime::Result<Result<websocket::Message, websocket::Error>> {
+        let shared = store.with(|mut view| view.get().table.get(&this).map(WsSocket::shared))?;
+        Ok(shared.next_message().await)
     }
 }

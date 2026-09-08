@@ -52,9 +52,9 @@ your network, or your other terminals.
   responses at the same time. A second small interface provides websockets, which
   WASI 0.2 lacks; the host applies the same origin policy and cookie jar to them.
 - **`crates/rattery`** is what apps depend on: a ratatui `Backend` over the WIT
-  interface, the event API, background tasks, the async runtime (`wstd`), and a
-  `server_fn` client that speaks `wasi:http`. On native targets it provides only what
-  the server build of a shared crate needs.
+  interface, the event API, background tasks, timers, websockets, and a `server_fn`
+  client that speaks `wasi:http@0.3`. On native targets it provides only what the
+  server build of a shared crate needs.
 - **`crates/rattery-host`** is the `rattery` binary and the `rattery_host` library:
   wasmtime + `wasmtime-wasi` + `wasmtime-wasi-http`, crossterm behind the terminal
   interface, a loader, the origin policy, the cookie jar, and a headless mode.
@@ -62,6 +62,14 @@ your network, or your other terminals.
 
 Diffing happens inside ratatui's `Terminal` in the guest, so a frame is one `draw` call
 carrying only the cells that changed, and one `flush`.
+
+**The app is a real async program.** It exports one `async func run` and the host
+drives it with the component model's async ABI, so waiting for a key press, a server
+response, a websocket message, or a timer is a plain `.await` and other tasks in the
+app keep running meanwhile. Input is an `async func` on the terminal interface; HTTP
+and timers use WASI 0.3, while the standard library keeps using WASI 0.2 for stdio.
+All of this builds on stable Rust for `wasm32-wasip2`: the async ABI does not need
+the `wasm32-wasip3` target, which has no prebuilt standard library yet.
 
 ## Quick start
 
@@ -120,16 +128,20 @@ ssr = ["rattery/ssr"]
 axum = ["ssr", "rattery/axum"]
 ```
 
-The app is an ordinary binary crate built for `wasm32-wasip2`. Server calls run as
-background tasks so the UI never blocks; a finished task surfaces as `Event::Wake`:
+The app is a `cdylib` crate built for `wasm32-wasip2`; `rattery::app!` exports the
+component's entry point. Server calls run as background tasks so the UI never blocks;
+a finished task surfaces as `Event::Wake`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+```
 
 ```rust
 use rattery::prelude::*;
 use rattery::{event, task};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rattery::run(app)
-}
+rattery::app!(app);
 
 async fn app(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0;
@@ -169,9 +181,9 @@ so `rattery https://host/app.wasm?team=infra` passes parameters the way a web pa
 gets them (the example reads `?title=`). `rattery::origin()` is where server calls go.
 
 Event types mirror crossterm's (`KeyCode::Char('q')`, `KeyModifiers::CONTROL`, ...)
-so existing ratatui code ports by changing an import. `event::next_timeout` drives
-animations; `task::wake` lets a long-running task ask for a redraw, which is how the
-example renders a streaming response line by line.
+so existing ratatui code ports by changing an import. `event::next_timeout` and
+`rattery::time::sleep` drive animations; `task::wake` lets a long-running task ask for
+a redraw, which is how the example renders a streaming response line by line.
 
 ## The host
 
@@ -242,11 +254,12 @@ assert!(report.snapshots[0].contains("1"));
 ## Status
 
 Working: rendering, keyboard, mouse, paste, focus and resize events; request/response,
-streaming, and websocket server functions; background tasks; the origin policy with
-allow lists and CORS; a persistent cookie jar; hot reload; the library API; headless
-mode; a kill switch and timeouts; end-to-end tests of all of it. Not yet: multipart
-bodies, WASI 0.3 async, publishing the crates (the WIT lives at the workspace root
-for now).
+streaming, and websocket server functions; background tasks on the component model's
+async ABI with HTTP over WASI 0.3; the origin policy with allow lists and CORS; a
+persistent cookie jar; hot reload; the library API; headless mode; a kill switch and
+timeouts; end-to-end tests of all of it. Not yet: multipart bodies, publishing the
+crates (the WIT lives at the workspace root for now). Note that wasmtime's WASI 0.3
+support is marked experimental upstream; rattery pins wasmtime and tracks it.
 
 ## License
 

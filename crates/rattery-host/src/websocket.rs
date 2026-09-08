@@ -5,28 +5,24 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use crate::bindings::websocket::{Error, Message};
+use crate::http::{CookieJar, Decision, OriginPolicy};
 use futures::{SinkExt, StreamExt};
 use http::header::{COOKIE, ORIGIN};
 use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use url::Url;
-use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
-
-use crate::bindings::websocket::{Error, Message};
-use crate::http::{CookieJar, Decision, OriginPolicy};
 
 #[derive(Default)]
 struct State {
-    open: bool,
-    /// Set when the socket opened and cleared once the guest asked.
-    open_unreported: bool,
     incoming: VecDeque<Message>,
     failure: Option<Error>,
 }
 
-struct Shared {
+/// State shared between the socket resource, its reader task, and any
+/// `receive` call in flight.
+pub struct Shared {
     state: Mutex<State>,
     notify: Notify,
 }
@@ -34,12 +30,25 @@ struct Shared {
 impl Shared {
     fn update(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.state.lock().unwrap());
+        self.notify.notify_waiters();
         self.notify.notify_one();
     }
 
-    fn has_news(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.open_unreported || !state.incoming.is_empty() || state.failure.is_some()
+    /// Wait for the next message. Backs `socket.receive`.
+    pub async fn next_message(&self) -> Result<Message, Error> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(message) = state.incoming.pop_front() {
+                    return Ok(message);
+                }
+                if let Some(failure) = &state.failure {
+                    return Err(failure.clone());
+                }
+            }
+            notified.await;
+        }
     }
 }
 
@@ -52,21 +61,6 @@ enum Outgoing {
 pub struct WsSocket {
     shared: Arc<Shared>,
     outgoing: mpsc::UnboundedSender<Outgoing>,
-}
-
-struct SocketReady(Arc<Shared>);
-
-#[async_trait::async_trait]
-impl Pollable for SocketReady {
-    async fn ready(&mut self) {
-        loop {
-            let notified = self.0.notify.notified();
-            if self.0.has_news() {
-                return;
-            }
-            notified.await;
-        }
-    }
 }
 
 /// Map a websocket URL onto the http URL the policy and cookie jar understand.
@@ -89,48 +83,29 @@ fn as_ws_url(url: &Url) -> Option<Url> {
 }
 
 impl WsSocket {
-    /// Start connecting. Policy violations and malformed URLs surface as a
-    /// failure the guest reads through `receive`, so `connect` never fails.
-    pub fn connect(url: &str, policy: &OriginPolicy, cookies: Option<&CookieJar>) -> Self {
-        let shared = Arc::new(Shared {
-            state: Mutex::default(),
-            notify: Notify::new(),
-        });
-        let (tx, rx) = mpsc::unbounded_channel();
-        let socket = Self {
-            shared: shared.clone(),
-            outgoing: tx,
-        };
-
-        let Some(http_url) = as_http_url(url) else {
-            shared.update(|s| {
-                s.failure = Some(Error::Connect(format!("invalid websocket URL {url:?}")))
-            });
-            return socket;
-        };
-        let uri: http::Uri = match http_url.as_str().parse() {
-            Ok(uri) => uri,
-            Err(err) => {
-                shared.update(|s| s.failure = Some(Error::Connect(err.to_string())));
-                return socket;
-            }
-        };
+    /// Connect and complete the handshake, applying the origin policy and
+    /// attaching the cookie jar.
+    pub async fn connect(
+        url: &str,
+        policy: &OriginPolicy,
+        cookies: Option<&CookieJar>,
+    ) -> Result<Self, Error> {
+        let http_url = as_http_url(url)
+            .ok_or_else(|| Error::Connect(format!("invalid websocket URL {url:?}")))?;
+        let uri: http::Uri = http_url
+            .as_str()
+            .parse()
+            .map_err(|e: http::uri::InvalidUri| Error::Connect(e.to_string()))?;
         if policy.decide(&uri) == Decision::Deny {
-            shared.update(|s| s.failure = Some(Error::Denied));
-            return socket;
+            return Err(Error::Denied);
         }
-        let Some(ws_url) = as_ws_url(&http_url) else {
-            shared.update(|s| s.failure = Some(Error::Connect("invalid websocket URL".into())));
-            return socket;
-        };
+        let ws_url =
+            as_ws_url(&http_url).ok_or_else(|| Error::Connect("invalid websocket URL".into()))?;
 
-        let mut request = match ws_url.as_str().into_client_request() {
-            Ok(request) => request,
-            Err(err) => {
-                shared.update(|s| s.failure = Some(Error::Connect(err.to_string())));
-                return socket;
-            }
-        };
+        let mut request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| Error::Connect(e.to_string()))?;
         if let Some(origin) = policy
             .app_origin()
             .and_then(crate::http::origin_header_value)
@@ -141,40 +116,28 @@ impl WsSocket {
         if let Some(value) = cookies.and_then(|jar| jar.request_header(&http_url)) {
             request.headers_mut().insert(COOKIE, value);
         }
-        let cookies = cookies.cloned();
 
-        tokio::spawn(run_connection(request, http_url, cookies, shared, rx));
-        socket
-    }
-
-    /// A pollable for this socket. It holds its own handle on the shared
-    /// state rather than being a child resource, so the guest may drop the
-    /// socket and the pollable in either order.
-    pub fn subscribe(
-        table: &mut ResourceTable,
-        this: &Resource<WsSocket>,
-    ) -> wasmtime::Result<Resource<DynPollable>> {
-        let shared = table.get(this)?.shared.clone();
-        let ready = table.push(SocketReady(shared))?;
-        subscribe(table, ready)
-    }
-
-    pub fn is_open(&self) -> bool {
-        let mut state = self.shared.state.lock().unwrap();
-        state.open_unreported = false;
-        state.open
-    }
-
-    pub fn receive(&self) -> Result<Option<Message>, Error> {
-        let mut state = self.shared.state.lock().unwrap();
-        state.open_unreported = false;
-        if let Some(message) = state.incoming.pop_front() {
-            return Ok(Some(message));
+        let (stream, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| Error::Connect(e.to_string()))?;
+        if let Some(jar) = cookies {
+            jar.store_response(&http_url, response.headers());
         }
-        match &state.failure {
-            Some(failure) => Err(failure.clone()),
-            None => Ok(None),
-        }
+
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            notify: Notify::new(),
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_connection(stream, shared.clone(), rx));
+        Ok(Self {
+            shared,
+            outgoing: tx,
+        })
+    }
+
+    pub fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 
     pub fn send(&self, message: Message) -> Result<(), Error> {
@@ -205,27 +168,12 @@ impl Drop for WsSocket {
 }
 
 async fn run_connection(
-    request: http::Request<()>,
-    http_url: Url,
-    cookies: Option<CookieJar>,
+    stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
     shared: Arc<Shared>,
     mut outgoing: mpsc::UnboundedReceiver<Outgoing>,
 ) {
-    let (stream, response) = match tokio_tungstenite::connect_async(request).await {
-        Ok(ok) => ok,
-        Err(err) => {
-            shared.update(|s| s.failure = Some(Error::Connect(err.to_string())));
-            return;
-        }
-    };
-    if let Some(jar) = &cookies {
-        jar.store_response(&http_url, response.headers());
-    }
-    shared.update(|s| {
-        s.open = true;
-        s.open_unreported = true;
-    });
-
     let (mut sink, mut source) = stream.split();
     let failure = loop {
         tokio::select! {
@@ -256,8 +204,5 @@ async fn run_connection(
             },
         }
     };
-    shared.update(|s| {
-        s.open = false;
-        s.failure = Some(failure);
-    });
+    shared.update(|s| s.failure = Some(failure));
 }

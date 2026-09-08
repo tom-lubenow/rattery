@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use url::Url;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Cache, Config, Engine, Store};
-use wasmtime_wasi::p2::bindings::Command;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder};
 
+use crate::bindings::App as GuestApp;
 use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::HostState;
@@ -47,7 +47,9 @@ pub async fn run(app: App) -> Result<Report> {
     };
 
     let mut config = Config::new();
-    config.epoch_interruption(true);
+    config
+        .epoch_interruption(true)
+        .wasm_component_model_async(true);
     if app.cache {
         let cache = Cache::from_file(None)
             .map_err(anyhow::Error::from)
@@ -59,9 +61,13 @@ pub async fn run(app: App) -> Result<Report> {
     // Compile before touching the terminal so errors print normally.
     let mut component = compile(&engine, &loaded)?;
 
+    // The standard library links WASI 0.2 (stdio, clocks); HTTP and timers
+    // in the guest use WASI 0.3, which is what makes the app fully async.
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi::p3::add_to_linker(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
     bindings::websocket::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
@@ -139,8 +145,10 @@ pub async fn run(app: App) -> Result<Report> {
 
         let outcome = {
             let run = async {
-                let command = Command::instantiate_async(&mut store, &component, &linker).await?;
-                command.wasi_cli_run().call_run(&mut store).await
+                let guest = GuestApp::instantiate_async(&mut store, &component, &linker).await?;
+                store
+                    .run_concurrent(async move |store| guest.call_run(store).await)
+                    .await?
             };
             tokio::select! {
                 result = run => Some(result),
@@ -169,7 +177,10 @@ pub async fn run(app: App) -> Result<Report> {
             (_, Some(Interrupt::Timeout)) => AppStatus::TimedOut,
             (_, Some(Interrupt::Reload)) | (None, None) => AppStatus::Exited(0),
             (Some(Ok(Ok(()))), None) => AppStatus::Exited(0),
-            (Some(Ok(Err(()))), None) => AppStatus::Exited(1),
+            (Some(Ok(Err(message))), None) => {
+                stderr_all.push_str(&format!("{message}\n"));
+                AppStatus::Exited(1)
+            }
             (Some(Err(err)), None) => match err.downcast_ref::<I32Exit>() {
                 Some(exit) => AppStatus::Exited(exit.0),
                 None => AppStatus::Trapped(format!("{err:?}")),

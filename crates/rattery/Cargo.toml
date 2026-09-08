@@ -23,8 +23,10 @@ futures = { workspace = true }
 http = { workspace = true }
 
 [target.'cfg(target_os = "wasi")'.dependencies]
-wit-bindgen = "0.57"
-wasip2 = "1.0"
-wstd = "0.6"
+# Must be the exact wit-bindgen version `wasip3` uses: spawned tasks only work
+# when the export executor and the spawner share one runtime.
+wit-bindgen = { version = "0.61", features = ["async", "async-spawn"] }
+wasip3 = { version = "0.8", features = ["http-compat"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
+http-body = "1"
 http-body-util = "0.1"

@@ -21,8 +21,6 @@ use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend, TestBackend};
 use tokio::sync::Notify;
 use wasmtime::Engine;
-use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 use crate::bindings::terminal::{
     CellUpdate, ClearType, Event, KeyCode, KeyEventKind, KeyModifiers, Position, Size, WindowSize,
@@ -187,25 +185,16 @@ impl EventQueue {
         self.notify.notify_one();
     }
 
-    fn is_empty(&self) -> bool {
-        self.events.lock().unwrap().is_empty()
-    }
-
     fn drain(&self) -> Vec<Event> {
         self.events.lock().unwrap().drain(..).collect()
     }
-}
 
-/// The `wasi:io/poll.pollable` behind `terminal.subscribe-events`.
-struct EventsReady(Arc<EventQueue>);
-
-#[async_trait::async_trait]
-impl Pollable for EventsReady {
-    async fn ready(&mut self) {
+    /// Wait for the next event. Backs `terminal.next-event`.
+    pub async fn next(&self) -> Event {
         loop {
-            let notified = self.0.notify.notified();
-            if !self.0.is_empty() {
-                return;
+            let notified = self.notify.notified();
+            if let Some(event) = self.events.lock().unwrap().pop_front() {
+                return event;
             }
             notified.await;
         }
@@ -422,11 +411,6 @@ impl TerminalHost {
             out.flush()?;
         }
         Ok(())
-    }
-
-    pub fn subscribe(&self, table: &mut ResourceTable) -> wasmtime::Result<Resource<DynPollable>> {
-        let ready = table.push(EventsReady(self.queue.clone()))?;
-        subscribe(table, ready)
     }
 
     pub fn drain_events(&self) -> Vec<Event> {
