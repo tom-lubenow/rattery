@@ -91,15 +91,18 @@ impl Server {
             .spawn()
             .expect("failed to start counter-server");
         let stdout = child.stdout.take().unwrap();
+        let mut lines = BufReader::new(stdout).lines();
         let mut url = None;
-        for line in BufReader::new(stdout).lines() {
+        for line in lines.by_ref() {
             let line = line.unwrap();
             if let Some(rest) = line.strip_prefix("counter-server listening on ") {
                 url = Some(rest.trim().to_owned());
                 break;
             }
         }
-        // Keep draining stdout so the server never blocks on a full pipe.
+        // Keep draining stdout: dropping the pipe would make the server's next
+        // println! fail with a broken pipe and kill it.
+        std::thread::spawn(move || for _ in lines.by_ref() {});
         Self {
             child,
             url: url.expect("server did not report its address"),
