@@ -4,7 +4,8 @@
 //! each function becomes an HTTP call, and natively inside the server with the
 //! `axum` feature, where the bodies run.
 
-use rattery::server_fn::codec::{StreamingText, TextStream};
+use rattery::server_fn::codec::{JsonEncoding, StreamingText, TextStream};
+use rattery::server_fn::{BoxedStream, Websocket};
 use rattery::{ServerFnError, server};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,24 @@ pub async fn live_feed() -> Result<TextStream, ServerFnError> {
         }
     });
     Ok(TextStream::from(ticks.boxed()))
+}
+
+/// A websocket server function: every message the app sends comes back
+/// answered, for as long as the connection lives.
+#[server(protocol = Websocket<JsonEncoding, JsonEncoding>)]
+pub async fn chat(
+    input: BoxedStream<String, ServerFnError>,
+) -> Result<BoxedStream<String, ServerFnError>, ServerFnError> {
+    use futures::StreamExt;
+
+    let mut input = input;
+    let replies = futures::stream::poll_fn(move |cx| input.poll_next_unpin(cx)).map(|message| {
+        message.map(|text| match text.strip_prefix("ping ") {
+            Some(n) => format!("pong {n}"),
+            None => format!("echo: {text}"),
+        })
+    });
+    Ok(replies.into())
 }
 
 #[cfg(feature = "ssr")]

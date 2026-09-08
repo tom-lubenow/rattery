@@ -59,6 +59,7 @@ mod loader;
 mod runner;
 mod state;
 mod terminal;
+mod websocket;
 
 use std::path::PathBuf;
 use std::time::Duration;

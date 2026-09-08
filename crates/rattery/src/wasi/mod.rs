@@ -5,6 +5,7 @@ pub mod bindings;
 pub mod client;
 pub mod events;
 pub mod task;
+pub mod websocket;
 
 pub use wstd;
 

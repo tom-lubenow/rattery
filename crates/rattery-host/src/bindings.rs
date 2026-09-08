@@ -5,9 +5,10 @@ wasmtime::component::bindgen!({
     world: "app",
     with: {
         "wasi": wasmtime_wasi::p2::bindings,
+        "rattery:tui/websocket.socket": crate::websocket::WsSocket,
     },
     imports: { default: async | trappable },
     additional_derives: [Clone, PartialEq, Eq],
 });
 
-pub use self::rattery::tui::terminal;
+pub use self::rattery::tui::{terminal, websocket};

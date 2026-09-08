@@ -63,6 +63,7 @@ pub async fn run(app: App) -> Result<Report> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
     bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
+    bindings::websocket::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
 
     let interrupter = Arc::new(Interrupter::new(engine.clone()));
 

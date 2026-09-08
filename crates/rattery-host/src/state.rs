@@ -7,14 +7,18 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::bindings::terminal::{CellUpdate, ClearType, Event, Host, Position, Size, WindowSize};
+use crate::bindings::websocket;
 use crate::http::{CookieJar, OriginHooks, OriginPolicy};
 use crate::terminal::TerminalHost;
+use crate::websocket::WsSocket;
 
 pub struct HostState {
     table: ResourceTable,
     wasi: WasiCtx,
     http: WasiHttpCtx,
     hooks: OriginHooks,
+    policy: OriginPolicy,
+    cookies: Option<CookieJar>,
     term: TerminalHost,
 }
 
@@ -29,7 +33,9 @@ impl HostState {
             table: ResourceTable::new(),
             wasi,
             http: WasiHttpCtx::new(),
-            hooks: OriginHooks::new(policy, cookies),
+            hooks: OriginHooks::new(policy.clone(), cookies.clone()),
+            policy,
+            cookies,
             term,
         }
     }
@@ -122,6 +128,51 @@ impl Host for HostState {
 
     async fn set_title(&mut self, title: String) -> wasmtime::Result<()> {
         self.term.set_title(&title)?;
+        Ok(())
+    }
+}
+
+impl websocket::Host for HostState {}
+
+impl websocket::HostSocket for HostState {
+    async fn connect(&mut self, url: String) -> wasmtime::Result<Resource<WsSocket>> {
+        let socket = WsSocket::connect(&url, &self.policy, self.cookies.as_ref());
+        Ok(self.table.push(socket)?)
+    }
+
+    async fn subscribe(
+        &mut self,
+        this: Resource<WsSocket>,
+    ) -> wasmtime::Result<Resource<Pollable>> {
+        WsSocket::subscribe(&mut self.table, &this)
+    }
+
+    async fn is_open(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<bool> {
+        Ok(self.table.get(&this)?.is_open())
+    }
+
+    async fn receive(
+        &mut self,
+        this: Resource<WsSocket>,
+    ) -> wasmtime::Result<Result<Option<websocket::Message>, websocket::Error>> {
+        Ok(self.table.get(&this)?.receive())
+    }
+
+    async fn send(
+        &mut self,
+        this: Resource<WsSocket>,
+        message: websocket::Message,
+    ) -> wasmtime::Result<Result<(), websocket::Error>> {
+        Ok(self.table.get(&this)?.send(message))
+    }
+
+    async fn close(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<()> {
+        self.table.get(&this)?.close();
+        Ok(())
+    }
+
+    async fn drop(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<()> {
+        self.table.delete(this)?;
         Ok(())
     }
 }

@@ -245,8 +245,54 @@ interface terminal {
     set-title: func(title: string);
 }
 
+/// WebSockets, provided by the host because WASI 0.2 has none. Connections
+/// are subject to the same origin policy and cookie jar as HTTP requests.
+interface websocket {
+    use wasi:io/poll@0.2.12.{pollable};
+
+    variant message {
+        text(string),
+        binary(list<u8>),
+    }
+
+    variant error {
+        /// The origin policy refused the connection.
+        denied,
+        /// Connecting or the handshake failed.
+        connect(string),
+        /// The connection is closed; the payload is the close reason, if any.
+        closed(option<string>),
+        /// A protocol or transport error after the connection opened.
+        protocol(string),
+    }
+
+    resource socket {
+        /// Start connecting to a `ws://`, `wss://`, `http://`, or `https://`
+        /// URL. The handshake completes in the background.
+        connect: static func(url: string) -> socket;
+
+        /// Ready when there is news: the connection opened, a message is
+        /// waiting, or the connection closed or failed.
+        subscribe: func() -> pollable;
+
+        /// True once the handshake succeeded and until the socket closes.
+        is-open: func() -> bool;
+
+        /// The next queued message, or `none` if nothing is waiting yet.
+        /// Once the queue is drained after a close or failure, the error.
+        receive: func() -> result<option<message>, error>;
+
+        /// Queue a message; delivered once the connection is open.
+        send: func(message: message) -> result<_, error>;
+
+        /// Close the connection.
+        close: func();
+    }
+}
+
 /// A rattery app imports the terminal and (through `std`) whatever WASI
 /// interfaces it links. It exports `wasi:cli/run` like any other command.
 world app {
     import terminal;
+    import websocket;
 }

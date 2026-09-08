@@ -111,7 +111,13 @@ impl<E: FromServerFnError> ClientRes<E> for Response {
     }
 }
 
-impl<E: FromServerFnError> Client<E> for ServerFnClient {
+impl<E, InputStreamError, OutputStreamError> Client<E, InputStreamError, OutputStreamError>
+    for ServerFnClient
+where
+    E: FromServerFnError,
+    InputStreamError: FromServerFnError,
+    OutputStreamError: FromServerFnError,
+{
     type Request = Request;
     type Response = Response;
 

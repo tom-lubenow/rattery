@@ -24,7 +24,8 @@ your network, or your other terminals.
 - **One fullstack dev model.** `#[rattery::server]` is `server_fn`'s `#[server]`
   with the client filled in. The same shared crate compiles into the app (calls become
   HTTP) and into the server (bodies run). It is the crate Leptos and Dioxus use, so
-  request/response, streaming responses, and cookie sessions all work as they do there.
+  request/response, streaming responses, websockets, and cookie sessions all work as
+  they do there.
 - **A real sandbox.** The component gets the terminal, a clock, randomness, and HTTP
   to its origin. Nothing else is linked in. Running someone's TUI from a URL is as
   safe as opening a web page.
@@ -48,7 +49,8 @@ your network, or your other terminals.
 - **`wit/rattery.wit`** is the entire contract. It mirrors ratatui's `Backend` trait
   (draw a list of changed cells, cursor, size, flush) plus a crossterm-shaped event
   stream and a `wasi:io` pollable so an app can `await` key presses and server
-  responses at the same time.
+  responses at the same time. A second small interface provides websockets, which
+  WASI 0.2 lacks; the host applies the same origin policy and cookie jar to them.
 - **`crates/rattery`** is what apps depend on: a ratatui `Backend` over the WIT
   interface, the event API, background tasks, the async runtime (`wstd`), and a
   `server_fn` client that speaks `wasi:http`. On native targets it provides only what
@@ -102,6 +104,14 @@ pub async fn adjust_count(delta: i64) -> Result<i64, ServerFnError> {
 pub async fn live_feed() -> Result<TextStream, ServerFnError> {
     Ok(TextStream::from(state::ticks()))
 }
+
+/// A websocket: a stream in, a stream out, for as long as the connection lives.
+#[server(protocol = Websocket<JsonEncoding, JsonEncoding>)]
+pub async fn chat(
+    input: BoxedStream<String, ServerFnError>,
+) -> Result<BoxedStream<String, ServerFnError>, ServerFnError> {
+    Ok(input.map(|m| m.map(|text| format!("echo: {text}"))).into())
+}
 ```
 
 ```toml
@@ -150,8 +160,9 @@ Router::new()
 ```
 
 `examples/counter` is the complete version: background calls with a spinner, a
-streaming live feed, cookie sessions with per-session state, ETags for `--watch`,
-and a CORS opt-in flag.
+streaming live feed, a websocket echo, cookie sessions with per-session state, ETags
+for `--watch`, and a CORS opt-in flag. `rattery::websocket::WebSocket` is also usable
+directly, outside server functions.
 
 Event types mirror crossterm's (`KeyCode::Char('q')`, `KeyModifiers::CONTROL`, ...)
 so existing ratatui code ports by changing an import. `event::next_timeout` drives
@@ -226,12 +237,12 @@ assert!(report.snapshots[0].contains("1"));
 
 ## Status
 
-Working: rendering, keyboard, mouse, paste, focus and resize events; request/response
-and streaming server functions; background tasks; the origin policy with allow lists
-and CORS; a persistent cookie jar; hot reload; the library API; headless mode; a
-kill switch and timeouts; end-to-end tests of all of it. Not yet: websocket server
-functions, multipart bodies, WASI 0.3 async, publishing the crates (the WIT lives at
-the workspace root for now).
+Working: rendering, keyboard, mouse, paste, focus and resize events; request/response,
+streaming, and websocket server functions; background tasks; the origin policy with
+allow lists and CORS; a persistent cookie jar; hot reload; the library API; headless
+mode; a kill switch and timeouts; end-to-end tests of all of it. Not yet: multipart
+bodies, WASI 0.3 async, publishing the crates (the WIT lives at the workspace root
+for now).
 
 ## License
 

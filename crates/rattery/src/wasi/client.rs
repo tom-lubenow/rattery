@@ -14,7 +14,10 @@ use server_fn::request::ClientReq;
 use server_fn::response::ClientRes;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use wstd::http::{Body, Client as HttpClient, Request as HttpRequest};
+
+use super::websocket::{Error as WsError, Message, WebSocket};
 
 /// The client `#[rattery::server]` functions use on `wasm32-wasip2`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -176,7 +179,45 @@ impl<E: FromServerFnError> ClientReq<E> for Request {
     }
 }
 
-impl<E: FromServerFnError> Client<E> for ServerFnClient {
+/// A `Sink` over a `!Send` sink; sound because the guest is single threaded.
+struct SendSink<S>(SendWrapper<S>);
+
+impl<S: Sink<Bytes> + Unpin> Sink<Bytes> for SendSink<S> {
+    type Error = S::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        Pin::new(&mut *self.get_mut().0).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), S::Error> {
+        Pin::new(&mut *self.get_mut().0).start_send(item)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        Pin::new(&mut *self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), S::Error>> {
+        Pin::new(&mut *self.get_mut().0).poll_close(cx)
+    }
+}
+
+impl<E, InputStreamError, OutputStreamError> Client<E, InputStreamError, OutputStreamError>
+    for ServerFnClient
+where
+    E: FromServerFnError,
+    InputStreamError: FromServerFnError,
+    OutputStreamError: FromServerFnError,
+{
     type Request = Request;
     type Response = Response;
 
@@ -222,18 +263,36 @@ impl<E: FromServerFnError> Client<E> for ServerFnClient {
             E,
         >,
     > + Send {
-        let _ = path;
-        async move {
-            Err::<
-                (
-                    futures::stream::Empty<Result<Bytes, Bytes>>,
-                    futures::sink::Drain<Bytes>,
-                ),
-                E,
-            >(request_error(
-                "websocket server functions are not supported by rattery's client yet",
-            ))
-        }
+        let path = path.to_owned();
+        SendWrapper::new(async move {
+            let socket = Rc::new(WebSocket::connect(&path));
+            socket.open().await.map_err(|err| {
+                E::from_server_fn_error(ServerFnErrorErr::Request(err.to_string()))
+            })?;
+
+            let stream = futures::stream::unfold(socket.clone(), |socket| async move {
+                let item = match socket.next().await {
+                    Ok(Message::Text(text)) => Ok(Bytes::from(text)),
+                    Ok(Message::Binary(bytes)) => Ok(Bytes::from(bytes)),
+                    Err(WsError::Closed(_)) => return None,
+                    Err(err) => Err(OutputStreamError::from_server_fn_error(
+                        ServerFnErrorErr::Request(err.to_string()),
+                    )
+                    .ser()),
+                };
+                Some((item, socket))
+            });
+            let stream = SendWrapper::new(Box::pin(stream));
+
+            let sink = futures::sink::unfold(socket, |socket, bytes: Bytes| async move {
+                socket
+                    .send(Message::Binary(bytes.to_vec()))
+                    .map_err(|err| ServerFnErrorErr::Request(err.to_string()))?;
+                Ok::<_, ServerFnErrorErr>(socket)
+            });
+            let sink = SendSink(SendWrapper::new(Box::pin(sink)));
+            Ok((stream, sink))
+        })
     }
 
     fn spawn(future: impl Future<Output = ()> + Send + 'static) {

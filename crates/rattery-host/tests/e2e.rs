@@ -169,7 +169,7 @@ async fn counter_round_trip_and_state_on_server() {
         .unwrap()
         .cookies(CookiePolicy::File(jar.clone()))
         .headless(headless(
-            "sleep 2500\nkey k\nsleep 700\nkey k\nsleep 1000\nsnapshot\nkey q",
+            "sleep 2500\nkey k\nsleep 700\nkey k\nkey w\nsleep 1000\nsnapshot\nkey q",
             20,
         ))
         .run()
@@ -191,6 +191,10 @@ async fn counter_round_trip_and_state_on_server() {
     assert!(
         snap.contains("count 2  up"),
         "feed should reflect the increments\n{text}"
+    );
+    assert!(
+        snap.contains("ws: pong 1"),
+        "websocket reply should arrive\n{text}"
     );
 
     // A second run with the same cookie jar is the same session: the count

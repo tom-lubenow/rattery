@@ -54,7 +54,7 @@ impl CookieJar {
             .map(|dirs| dirs.data_local_dir().join("cookies.json"))
     }
 
-    fn request_header(&self, url: &Url) -> Option<HeaderValue> {
+    pub fn request_header(&self, url: &Url) -> Option<HeaderValue> {
         let store = self.store.lock().unwrap();
         let value = store
             .get_request_values(url)
@@ -68,7 +68,7 @@ impl CookieJar {
         }
     }
 
-    fn store_response(&self, url: &Url, headers: &http::HeaderMap) {
+    pub fn store_response(&self, url: &Url, headers: &http::HeaderMap) {
         let mut stored = false;
         {
             let mut store = self.store.lock().unwrap();
@@ -205,7 +205,7 @@ fn origin_key(scheme: &Scheme, host: &str, port: Option<u16>) -> String {
 }
 
 /// The `Origin` header value for an app origin: no default port, as browsers send it.
-fn origin_header_value(normalized: &str) -> Option<HeaderValue> {
+pub fn origin_header_value(normalized: &str) -> Option<HeaderValue> {
     let (scheme, rest) = normalized.split_once("://")?;
     let (host, port) = rest.rsplit_once(':')?;
     let default_port = if scheme == "https" { "443" } else { "80" };

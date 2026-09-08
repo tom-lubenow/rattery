@@ -4,8 +4,9 @@ use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
 
-use counter_shared::{Snapshot, adjust_count, fetch_snapshot, live_feed, slow_snapshot};
+use counter_shared::{Snapshot, adjust_count, chat, fetch_snapshot, live_feed, slow_snapshot};
 use futures::StreamExt;
+use futures::channel::mpsc;
 use rattery::event;
 use rattery::prelude::*;
 use rattery::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
@@ -28,6 +29,10 @@ struct App {
     feed: Rc<RefCell<VecDeque<String>>>,
     /// The task reading the feed; dropping it closes the stream.
     _feed_task: Option<Task<()>>,
+    /// Outgoing side of the websocket chat, once connected.
+    chat_tx: Option<mpsc::UnboundedSender<Result<String, ServerFnError>>>,
+    _chat_task: Option<Task<()>>,
+    pings: u32,
     quit: bool,
 }
 
@@ -50,6 +55,7 @@ impl App {
                     // can the feed subscribe as the same session.
                     if self._feed_task.is_none() {
                         self.follow_feed();
+                        self.open_chat();
                     }
                 }
                 Err(err) => self.last_error = Some(err.to_string()),
@@ -57,18 +63,54 @@ impl App {
         }
     }
 
-    /// Subscribe to the server's live feed. Each line wakes the event loop so
-    /// the panel redraws as soon as it arrives.
-    fn follow_feed(&mut self) {
+    fn feed_writer(&self) -> impl Fn(String) + Clone + 'static {
         let feed = self.feed.clone();
-        let push = move |line: String| {
+        move |line: String| {
             let mut feed = feed.borrow_mut();
             if feed.len() == FEED_LINES {
                 feed.pop_front();
             }
             feed.push_back(line);
             rattery::task::wake();
-        };
+        }
+    }
+
+    /// Open the websocket chat: messages go out through `chat_tx`, replies
+    /// land in the feed.
+    fn open_chat(&mut self) {
+        let push = self.feed_writer();
+        let (tx, rx) = mpsc::unbounded();
+        self.chat_tx = Some(tx);
+        self._chat_task = Some(rattery::task::spawn(async move {
+            let replies = match chat(rx.into()).await {
+                Ok(replies) => replies,
+                Err(err) => return push(format!("chat error: {err}")),
+            };
+            let mut replies: std::pin::Pin<Box<dyn futures::Stream<Item = _> + Send>> =
+                replies.into();
+            while let Some(reply) = replies.next().await {
+                match reply {
+                    Ok(text) => push(format!("ws: {text}")),
+                    Err(err) => return push(format!("chat error: {err}")),
+                }
+            }
+            push("chat closed".to_owned());
+        }));
+    }
+
+    /// Send a ping over the chat websocket.
+    fn ping(&mut self) {
+        self.pings += 1;
+        let message = format!("ping {}", self.pings);
+        if let Some(tx) = &self.chat_tx {
+            let _ = tx.unbounded_send(Ok(message));
+        }
+    }
+
+    /// Subscribe to the server's live feed. Each line wakes the event loop so
+    /// the panel redraws as soon as it arrives.
+    fn follow_feed(&mut self) {
+        let push = self.feed_writer();
         self._feed_task = Some(rattery::task::spawn(async move {
             let stream = match live_feed().await {
                 Ok(stream) => stream,
@@ -131,6 +173,7 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
                 }
                 KeyCode::Char('r') => app.start(fetch_snapshot()),
                 KeyCode::Char('s') => app.start(slow_snapshot(2000)),
+                KeyCode::Char('w') => app.ping(),
                 _ => {}
             },
             _ => {}
@@ -216,7 +259,7 @@ fn ui(frame: &mut Frame, app: &App) {
         Paragraph::new(feed_lines).block(
             Block::bordered()
                 .padding(Padding::horizontal(1))
-                .title(" live feed (streaming server fn) "),
+                .title(" live feed: streaming + websocket "),
         ),
         feed,
     );
@@ -231,6 +274,8 @@ fn ui(frame: &mut Frame, app: &App) {
             "refresh  ".into(),
             " s ".bold(),
             "slow call (2s)  ".into(),
+            " w ".bold(),
+            "websocket ping  ".into(),
             " q ".bold(),
             "quit".into(),
         ]))

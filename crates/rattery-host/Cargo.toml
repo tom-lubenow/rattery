@@ -27,6 +27,7 @@ http-body-util = "0.1"
 ratatui = { workspace = true, features = ["std", "crossterm_0_29", "underline-color"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 tokio = { workspace = true, features = ["fs", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 wasmtime = "48"
 wasmtime-wasi = "48"
