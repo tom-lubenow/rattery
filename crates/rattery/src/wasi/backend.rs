@@ -29,7 +29,7 @@ impl Backend for RatteryBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        let updates: Vec<t::CellUpdate> = content
+        let updates: Vec<t::CellUpdate<'a>> = content
             .map(|(x, y, cell)| t::CellUpdate {
                 x,
                 y,
@@ -103,9 +103,9 @@ impl Backend for RatteryBackend {
     }
 }
 
-fn to_wit_cell(cell: &Cell) -> t::Cell {
+fn to_wit_cell(cell: &Cell) -> t::Cell<'_> {
     t::Cell {
-        symbol: cell.symbol().to_owned(),
+        symbol: cell.symbol(),
         fg: to_wit_color(cell.fg),
         bg: to_wit_color(cell.bg),
         underline_color: to_wit_color(cell.underline_color),

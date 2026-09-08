@@ -137,7 +137,9 @@ impl terminal::Host for HostState {
 impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
     async fn next_event(store: &Accessor<U, Self>) -> wasmtime::Result<Event> {
         let queue = store.with(|mut view| view.get().term.queue());
-        Ok(queue.next().await)
+        let event = queue.next().await;
+        store.with(|mut view| view.get().term.note_event());
+        Ok(event)
     }
 }
 

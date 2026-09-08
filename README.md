@@ -225,6 +225,10 @@ panics are readable and never corrupt the screen. Ctrl-C three times within 1.5 
 interrupts an unresponsive app, even one spinning in a tight loop. Raw mode and the
 alternate screen are always restored, including on panic.
 
+**Stats.** `--stats` prints phase timings (load, compile, instantiate, first frame) and
+terminal counters after the app exits. `cargo xtask bench` runs a rendering and request
+latency benchmark; see `docs/perf.md` for what it measures and current numbers.
+
 **Headless.** `--headless 80x24 --script keys.txt` runs the app on an in-memory screen,
 feeds it a script (`key k`, `key ctrl-c`, `type hello`, `paste`, `resize`, `sleep`,
 `snapshot`; see `--help-script`), and prints the snapshots. This is how the repository's

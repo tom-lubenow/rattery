@@ -20,7 +20,12 @@ use crate::{App, AppStatus, CookiePolicy, Report, Source, bindings, headless};
 const WATCH_INTERVAL: Duration = Duration::from_millis(750);
 
 pub async fn run(app: App) -> Result<Report> {
+    let run_started = std::time::Instant::now();
     let loaded = loader::load(&app.source).await?;
+    let mut timings = crate::Timings {
+        load: run_started.elapsed(),
+        ..Default::default()
+    };
 
     // The app's origin is where it came from; for bytes or a file, whatever
     // the embedder says it is.
@@ -59,7 +64,9 @@ pub async fn run(app: App) -> Result<Report> {
     let engine = Engine::new(&config)?;
 
     // Compile before touching the terminal so errors print normally.
+    let t = std::time::Instant::now();
     let mut component = compile(&engine, &loaded)?;
+    timings.compile = t.elapsed();
 
     // The standard library links WASI 0.2 (stdio, clocks); HTTP and timers
     // in the guest use WASI 0.3, which is what makes the app fully async.
@@ -130,7 +137,9 @@ pub async fn run(app: App) -> Result<Report> {
     let mut stdout_all = String::new();
     let mut stderr_all = String::new();
 
+    let mut stats;
     let status = loop {
+        term.mark_started();
         let stdout = MemoryOutputPipe::new(1 << 20);
         let stderr = MemoryOutputPipe::new(1 << 20);
         let wasi = wasi_ctx(
@@ -145,7 +154,9 @@ pub async fn run(app: App) -> Result<Report> {
 
         let outcome = {
             let run = async {
+                let t = std::time::Instant::now();
                 let guest = GuestApp::instantiate_async(&mut store, &component, &linker).await?;
+                timings.instantiate = t.elapsed();
                 store
                     .run_concurrent(async move |store| guest.call_run(store).await)
                     .await?
@@ -156,6 +167,7 @@ pub async fn run(app: App) -> Result<Report> {
             }
         };
         term = store.into_data().into_terminal();
+        stats = term.stats();
 
         stdout_all.push_str(&String::from_utf8_lossy(&stdout.contents()));
         stderr_all.push_str(&String::from_utf8_lossy(&stderr.contents()));
@@ -194,12 +206,17 @@ pub async fn run(app: App) -> Result<Report> {
     let final_screen = screen_source.map(|b| Screen::from_backend(&b.lock().unwrap()));
     let snapshots = std::mem::take(&mut *snapshots.lock().unwrap());
 
+    timings.first_draw = stats.first_draw;
+    timings.total = run_started.elapsed();
+
     Ok(Report {
         status,
         stdout: stdout_all,
         stderr: stderr_all,
         snapshots,
         final_screen,
+        timings,
+        stats,
     })
 }
 

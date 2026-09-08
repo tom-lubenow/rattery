@@ -84,6 +84,10 @@ struct Cli {
     /// Print the headless script format and exit.
     #[arg(long)]
     help_script: bool,
+
+    /// After the app exits, print timings and terminal counters to stderr.
+    #[arg(long)]
+    stats: bool,
 }
 
 fn parse_env(s: &str) -> Result<(String, String), String> {
@@ -187,6 +191,36 @@ async fn main() -> Result<()> {
     }
     if !report.stderr.is_empty() {
         eprint!("{}", report.stderr);
+    }
+    if cli.stats {
+        let t = &report.timings;
+        let s = &report.stats;
+        let ms = |d: Duration| {
+            if d < Duration::from_millis(1) {
+                format!("{}µs", d.as_micros())
+            } else {
+                format!("{:.1}ms", d.as_secs_f64() * 1000.0)
+            }
+        };
+        eprintln!(
+            "rattery stats: load {}, compile {}, instantiate {}, first frame {}, total {}",
+            ms(t.load),
+            ms(t.compile),
+            ms(t.instantiate),
+            t.first_draw.map(ms).unwrap_or_else(|| "-".into()),
+            ms(t.total)
+        );
+        let per =
+            |total: Duration, n: u64| ms(total.checked_div(n.max(1) as u32).unwrap_or_default());
+        eprintln!(
+            "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {}",
+            s.draws,
+            s.cells,
+            per(s.draw_time, s.draws),
+            s.flushes,
+            per(s.flush_time, s.flushes),
+            s.events
+        );
     }
     match &report.status {
         AppStatus::Exited(0) => {}

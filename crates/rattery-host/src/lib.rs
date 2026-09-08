@@ -69,7 +69,22 @@ use url::Url;
 
 pub use headless::{Script, ScriptCommand};
 pub use http::{CookieJar, OriginPolicy};
-pub use terminal::Screen;
+pub use terminal::{Screen, Stats};
+
+/// How long the phases before the app ran took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Fetching or reading the component.
+    pub load: Duration,
+    /// Compiling it (near zero on a cache hit).
+    pub compile: Duration,
+    /// Instantiating the component.
+    pub instantiate: Duration,
+    /// From the app starting to its first frame, if it drew one.
+    pub first_draw: Option<Duration>,
+    /// The whole run, load to exit.
+    pub total: Duration,
+}
 
 /// What happens to cookies the app's servers set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -146,6 +161,10 @@ pub struct Report {
     pub snapshots: Vec<Screen>,
     /// The screen when the app ended (headless only).
     pub final_screen: Option<Screen>,
+    /// Phase timings.
+    pub timings: Timings,
+    /// Terminal counters from the last run of the app.
+    pub stats: Stats,
 }
 
 impl Report {

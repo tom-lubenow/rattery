@@ -1,0 +1,19 @@
+[package]
+name = "bench-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Rendering benchmark for rattery; run with `cargo xtask bench`"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rattery = { workspace = true }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+wasip3 = { version = "0.8", features = ["http-compat"] }
+http = { workspace = true }
+http-body-util = "0.1"
+bytes = { workspace = true }

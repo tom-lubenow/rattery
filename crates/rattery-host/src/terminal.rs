@@ -201,6 +201,25 @@ impl EventQueue {
     }
 }
 
+/// Counters the host keeps about the app's use of the terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// `draw` calls.
+    pub draws: u64,
+    /// Cells carried by all `draw` calls together.
+    pub cells: u64,
+    /// Time spent inside `draw` on the host, including terminal output.
+    pub draw_time: Duration,
+    /// `flush` calls.
+    pub flushes: u64,
+    /// Time spent inside `flush` on the host.
+    pub flush_time: Duration,
+    /// Events handed to the app.
+    pub events: u64,
+    /// When the first `draw` arrived, relative to the app starting.
+    pub first_draw: Option<Duration>,
+}
+
 /// The text of a headless screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
@@ -276,6 +295,8 @@ pub struct TerminalHost {
     origin: Option<String>,
     location: Option<String>,
     snapshots: Arc<Mutex<Vec<Screen>>>,
+    stats: Stats,
+    started: Instant,
 }
 
 impl TerminalHost {
@@ -293,6 +314,8 @@ impl TerminalHost {
             origin,
             location,
             snapshots: Arc::default(),
+            stats: Stats::default(),
+            started: Instant::now(),
         }
     }
 
@@ -310,7 +333,20 @@ impl TerminalHost {
             origin,
             location,
             snapshots: Arc::default(),
+            stats: Stats::default(),
+            started: Instant::now(),
         }
+    }
+
+    /// Counters since the terminal was opened.
+    pub fn stats(&self) -> Stats {
+        self.stats.clone()
+    }
+
+    /// Restart the clock behind `Stats::first_draw` (used before each run).
+    pub fn mark_started(&mut self) {
+        self.started = Instant::now();
+        self.stats.first_draw = None;
     }
 
     pub fn queue(&self) -> Arc<EventQueue> {
@@ -338,11 +374,19 @@ impl TerminalHost {
     }
 
     pub fn draw(&mut self, updates: &[CellUpdate]) -> io::Result<()> {
+        let t = Instant::now();
+        if self.stats.first_draw.is_none() {
+            self.stats.first_draw = Some(t.duration_since(self.started));
+        }
         let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = updates
             .iter()
             .map(|u| (u.x, u.y, convert::cell(&u.cell)))
             .collect();
-        with_backend!(self, |b| b.draw(cells.iter().map(|(x, y, c)| (*x, *y, c))))
+        let result = with_backend!(self, |b| b.draw(cells.iter().map(|(x, y, c)| (*x, *y, c))));
+        self.stats.draws += 1;
+        self.stats.cells += updates.len() as u64;
+        self.stats.draw_time += t.elapsed();
+        result
     }
 
     pub fn append_lines(&mut self, n: u16) -> io::Result<()> {
@@ -395,7 +439,11 @@ impl TerminalHost {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        with_backend!(self, |b| Backend::flush(b))
+        let t = Instant::now();
+        let result = with_backend!(self, |b| Backend::flush(b));
+        self.stats.flushes += 1;
+        self.stats.flush_time += t.elapsed();
+        result
     }
 
     /// Wipe the screen between two apps sharing the terminal.
@@ -413,8 +461,15 @@ impl TerminalHost {
         Ok(())
     }
 
-    pub fn drain_events(&self) -> Vec<Event> {
-        self.queue.drain()
+    pub fn drain_events(&mut self) -> Vec<Event> {
+        let events = self.queue.drain();
+        self.stats.events += events.len() as u64;
+        events
+    }
+
+    /// Count an event delivered through `next-event`.
+    pub fn note_event(&mut self) {
+        self.stats.events += 1;
     }
 }
 

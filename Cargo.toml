@@ -8,6 +8,7 @@ members = [
     "examples/counter/app",
     "examples/counter/server",
     "examples/spin",
+    "examples/bench",
     "xtask",
 ]
 
@@ -33,3 +34,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 [profile.release]
 lto = true
 codegen-units = 1
+strip = true
+
+# Dev builds of apps stay unoptimised for fast iteration, but their
+# dependencies (ratatui, the wasm runtime glue) are optimised: that is where
+# the time goes in a frame, and it cuts the debug component's size and
+# compile time as well.
+[profile.dev.package."*"]
+opt-level = 2

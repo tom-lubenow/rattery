@@ -22,6 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
+    /// Build the bench app and the host in release mode and run the
+    /// rendering benchmark matrix headless.
+    Bench {
+        /// Frames per run.
+        #[arg(long, default_value_t = 200)]
+        frames: usize,
+    },
     /// Build, serve, watch, rebuild. Run `rattery --watch <url>` next to it.
     Dev {
         /// The app package to build for wasm32-wasip2.
@@ -39,7 +46,179 @@ enum Task {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Task::Dev { app, server, bind } => dev(&app, &server, &bind),
+        Task::Bench { frames } => bench(frames),
     }
+}
+
+fn bench(frames: usize) -> Result<()> {
+    let root = root();
+    if !cargo(&[
+        "build",
+        "-p",
+        "bench-app",
+        "--target",
+        "wasm32-wasip2",
+        "--release",
+    ])? {
+        bail!("bench-app failed to build");
+    }
+    if !cargo(&["build", "-p", "rattery-host", "--release"])? {
+        bail!("rattery-host failed to build");
+    }
+    let host = root.join("target/release/rattery");
+    let app = root.join("target/wasm32-wasip2/release/bench_app.wasm");
+    println!();
+    println!(
+        "{:<8} {:<8} {:>10} {:>9} {:>9} {:>9} {:>7}   host draw avg / flush avg",
+        "mode", "size", "cells", "avg ms", "p50 ms", "p95 ms", "fps"
+    );
+    for mode in ["full", "sparse", "text"] {
+        for size in ["80x24", "200x50"] {
+            let output = Command::new(&host)
+                .arg("--headless")
+                .arg(size)
+                .arg("--timeout")
+                .arg("120")
+                .arg("--stats")
+                .arg("--no-cookies")
+                .arg("--location")
+                .arg(format!(
+                    "bench://local/bench_app.wasm?frames={frames}&mode={mode}"
+                ))
+                .arg(&app)
+                .output()
+                .context("failed to run rattery")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let Some(line) = stdout.lines().find(|l| l.starts_with("bench ")) else {
+                println!("{mode:<8} {size:<8} failed: {stderr}");
+                continue;
+            };
+            let get = |key: &str| {
+                line.split_whitespace()
+                    .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+                    .unwrap_or("?")
+                    .to_owned()
+            };
+            let host_line = stderr
+                .lines()
+                .find(|l| l.trim_start().starts_with("draws "))
+                .map(|l| {
+                    // "draws N (C cells, Xms avg on host), flushes M (Yms avg), events E"
+                    let field = |marker: &str| {
+                        l.split_once(marker)
+                            .and_then(|(before, _)| before.rsplit([' ', '(']).next())
+                            .unwrap_or("?")
+                            .to_owned()
+                    };
+                    format!("{} / {}", field(" avg on host"), field(" avg)"))
+                })
+                .unwrap_or_else(|| "?".into());
+            println!(
+                "{mode:<8} {size:<8} {:>10} {:>9} {:>9} {:>9} {:>7}   {host_line}",
+                get("screen_cells"),
+                get("avg_ms"),
+                get("p50_ms"),
+                get("p95_ms"),
+                get("fps")
+            );
+        }
+    }
+    // Request latency through wasi:http, against the example server.
+    if cargo(&["build", "-p", "counter-server", "--release"])? {
+        let mut server = Command::new(root.join("target/release/counter-server"))
+            .args(["--bind", "127.0.0.1:0", "--app", "/dev/null"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to start counter-server")?;
+        let mut origin = None;
+        if let Some(stdout) = server.stdout.take() {
+            use std::io::BufRead;
+            let mut lines = std::io::BufReader::new(stdout).lines();
+            for line in lines.by_ref() {
+                let line = line?;
+                if let Some(rest) = line.strip_prefix("counter-server listening on ") {
+                    origin = Some(rest.trim().to_owned());
+                    break;
+                }
+            }
+            thread::spawn(move || for _ in lines.by_ref() {});
+        }
+        if let Some(origin) = origin {
+            let native = native_http_latency(&origin, frames);
+            let output = Command::new(&host)
+                .args([
+                    "--headless",
+                    "80x24",
+                    "--timeout",
+                    "120",
+                    "--stats",
+                    "--no-cookies",
+                ])
+                .arg("--origin")
+                .arg(&origin)
+                .arg("--location")
+                .arg(format!(
+                    "bench://local/bench_app.wasm?frames={frames}&mode=http"
+                ))
+                .arg(&app)
+                .output()
+                .context("failed to run rattery")?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = stdout.lines().find(|l| l.starts_with("bench mode=http")) {
+                let get = |key: &str| {
+                    line.split_whitespace()
+                        .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+                        .unwrap_or("?")
+                        .to_owned()
+                };
+                println!();
+                println!(
+                    "http GET via wasi:http: avg {} ms, p50 {} ms, p95 {} ms  (native std TcpStream: avg {:.3} ms)",
+                    get("avg_ms"),
+                    get("p50_ms"),
+                    get("p95_ms"),
+                    native
+                );
+            } else {
+                println!(
+                    "http bench failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+    }
+
+    let timings = Command::new(&host)
+        .args([
+            "--headless",
+            "80x24",
+            "--timeout",
+            "60",
+            "--stats",
+            "--no-cookies",
+        ])
+        .arg("--location")
+        .arg("bench://local/bench_app.wasm?frames=1&mode=text")
+        .arg(&app)
+        .output()
+        .context("failed to run rattery")?;
+    if let Some(line) = String::from_utf8_lossy(&timings.stderr)
+        .lines()
+        .find(|l| l.starts_with("rattery stats:"))
+    {
+        println!();
+        println!(
+            "startup (warm cache): {}",
+            line.trim_start_matches("rattery stats: ")
+        );
+    }
+    let size = std::fs::metadata(&app).map(|m| m.len()).unwrap_or(0);
+    println!("component size (release): {} KB", size / 1024);
+    Ok(())
 }
 
 fn root() -> PathBuf {
@@ -159,4 +338,22 @@ fn walk(dir: &Path, newest: &mut Option<SystemTime>) {
             *newest = Some(stamp);
         }
     }
+}
+
+/// Sequential HTTP/1.1 GETs with a fresh connection each, like the guest does.
+fn native_http_latency(origin: &str, count: usize) -> f64 {
+    use std::io::{Read, Write};
+    let addr = origin.trim_start_matches("http://");
+    let started = std::time::Instant::now();
+    for _ in 0..count {
+        let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
+            return f64::NAN;
+        };
+        let _ = stream.write_all(
+            format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+    }
+    started.elapsed().as_secs_f64() * 1000.0 / count.max(1) as f64
 }

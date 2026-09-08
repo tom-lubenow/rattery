@@ -6,6 +6,9 @@ wit_bindgen::generate!({
     world: "app",
     pub_export_macro: true,
     default_bindings_module: "rattery::bindings",
+    // Import parameters borrow: a frame's cells reference the buffer's
+    // symbols instead of allocating a String per cell.
+    ownership: Borrowing { duplicate_if_necessary: false },
     additional_derives: [Clone, PartialEq, Eq],
 });
 
