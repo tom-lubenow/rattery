@@ -8,9 +8,10 @@ description = "Server functions shared by the counter app and its server"
 
 [features]
 default = []
-ssr = ["rattery/ssr"]
+ssr = ["rattery/ssr", "dep:tokio"]
 axum = ["ssr", "rattery/axum"]
 
 [dependencies]
 rattery = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true, features = ["time"], optional = true }

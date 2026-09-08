@@ -1,9 +1,14 @@
 use std::error::Error;
+use std::time::Duration;
 
-use counter_shared::{Snapshot, adjust_count, fetch_snapshot};
+use counter_shared::{Snapshot, adjust_count, fetch_snapshot, slow_snapshot};
 use rattery::event;
 use rattery::prelude::*;
 use rattery::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+type Call = Task<Result<Snapshot, ServerFnError>>;
 
 #[derive(Default)]
 struct App {
@@ -11,18 +16,30 @@ struct App {
     last_error: Option<String>,
     origin: Option<String>,
     calls: u32,
+    /// The server call in flight, if any. Starting a new one cancels it.
+    pending: Option<Call>,
+    spinner: usize,
     quit: bool,
 }
 
 impl App {
-    fn apply(&mut self, result: Result<Snapshot, ServerFnError>) {
-        self.calls += 1;
-        match result {
-            Ok(snapshot) => {
-                self.snapshot = Some(snapshot);
-                self.last_error = None;
+    /// Start a server call in the background; the UI keeps running.
+    fn start(&mut self, call: impl Future<Output = Result<Snapshot, ServerFnError>> + 'static) {
+        self.pending = Some(rattery::task::spawn(call));
+    }
+
+    /// Collect the result of a finished call.
+    fn settle(&mut self) {
+        if let Some(result) = self.pending.as_mut().and_then(Task::try_take) {
+            self.pending = None;
+            self.calls += 1;
+            match result {
+                Ok(snapshot) => {
+                    self.snapshot = Some(snapshot);
+                    self.last_error = None;
+                }
+                Err(err) => self.last_error = Some(err.to_string()),
             }
-            Err(err) => self.last_error = Some(err.to_string()),
         }
     }
 }
@@ -33,24 +50,37 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
         origin: rattery::origin(),
         ..App::default()
     };
-    app.apply(fetch_snapshot().await);
+    app.start(fetch_snapshot());
 
     while !app.quit {
         terminal.draw(|frame| ui(frame, &app))?;
 
-        match event::next().await {
+        // Animate the spinner while a call is in flight; otherwise wait for input.
+        let event = if app.pending.is_some() {
+            match event::next_timeout(Duration::from_millis(80)).await {
+                Some(event) => event,
+                None => {
+                    app.spinner = (app.spinner + 1) % SPINNER.len();
+                    continue;
+                }
+            }
+        } else {
+            event::next().await
+        };
+
+        match event {
+            Event::Wake => app.settle(),
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.quit = true
                 }
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('+') => {
-                    app.apply(adjust_count(1).await)
-                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('+') => app.start(adjust_count(1)),
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('-') => {
-                    app.apply(adjust_count(-1).await)
+                    app.start(adjust_count(-1))
                 }
-                KeyCode::Char('r') => app.apply(fetch_snapshot().await),
+                KeyCode::Char('r') => app.start(fetch_snapshot()),
+                KeyCode::Char('s') => app.start(slow_snapshot(2000)),
                 _ => {}
             },
             _ => {}
@@ -71,11 +101,17 @@ fn ui(frame: &mut Frame, app: &App) {
         .origin
         .as_deref()
         .unwrap_or("(no origin: loaded from a file)");
+    let status = if app.pending.is_some() {
+        Span::from(format!("  {} calling server", SPINNER[app.spinner])).yellow()
+    } else {
+        Span::from("  idle").dim()
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             " rattery counter ".bold().reversed(),
             "  served from ".dim(),
             origin.cyan(),
+            status,
         ]))
         .block(Block::new().borders(Borders::BOTTOM)),
         header,
@@ -119,6 +155,8 @@ fn ui(frame: &mut Frame, app: &App) {
             "decrement  ".into(),
             " r ".bold(),
             "refresh  ".into(),
+            " s ".bold(),
+            "slow call (2s)  ".into(),
             " q ".bold(),
             "quit".into(),
         ]))

@@ -5,9 +5,12 @@
 //! presses and server-function responses at the same time.
 
 use super::bindings::terminal as t;
+use super::task;
 use crate::event::*;
+use futures::future::Either;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::time::Duration;
 use wstd::runtime::AsyncPollable;
 
 struct Source {
@@ -34,7 +37,8 @@ fn refill(buffer: &mut VecDeque<Event>) {
     buffer.extend(t::read_events().into_iter().map(Event::from));
 }
 
-/// Wait for the next input event.
+/// Wait for the next event: terminal input, or [`Event::Wake`] when a spawned
+/// [`Task`](crate::task::Task) finishes.
 ///
 /// Must be called from inside [`crate::run`] (or `runtime::block_on`).
 pub async fn next() -> Event {
@@ -42,9 +46,32 @@ pub async fn next() -> Event {
         if let Some(event) = with_source(|s| s.buffer.pop_front()) {
             return event;
         }
+        if task::take_wake() {
+            return Event::Wake;
+        }
         let pollable = with_source(|s| s.pollable.clone());
-        pollable.wait_for().await;
-        with_source(|s| refill(&mut s.buffer));
+        let input = pollable.wait_for();
+        let woken = task::woken();
+        futures::pin_mut!(input);
+        futures::pin_mut!(woken);
+        match futures::future::select(input, woken).await {
+            Either::Left(_) => with_source(|s| refill(&mut s.buffer)),
+            Either::Right(_) => return Event::Wake,
+        }
+    }
+}
+
+/// Like [`next`], but gives up after `timeout` and returns `None`. Useful for
+/// animations and periodic refreshes.
+pub async fn next_timeout(timeout: Duration) -> Option<Event> {
+    let timer = wstd::time::Timer::after(timeout.into());
+    let event = next();
+    let deadline = timer.wait();
+    futures::pin_mut!(event);
+    futures::pin_mut!(deadline);
+    match futures::future::select(event, deadline).await {
+        Either::Left((event, _)) => Some(event),
+        Either::Right(_) => None,
     }
 }
 

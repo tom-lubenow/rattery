@@ -44,7 +44,7 @@ mod wasi;
 #[cfg(target_os = "wasi")]
 pub use wasi::{
     Terminal, backend::RatteryBackend, client::ServerFnClient, origin, run, runtime, set_title,
-    time, wstd,
+    task, time, wstd,
 };
 
 #[cfg(not(target_os = "wasi"))]
@@ -62,5 +62,5 @@ pub mod prelude {
     pub use ratatui::prelude::*;
 
     #[cfg(target_os = "wasi")]
-    pub use crate::Terminal;
+    pub use crate::{Terminal, task::Task};
 }

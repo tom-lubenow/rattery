@@ -27,6 +27,14 @@ pub async fn adjust_count(delta: i64) -> Result<Snapshot, ServerFnError> {
     Ok(state::snapshot())
 }
 
+/// Like [`fetch_snapshot`], but the server takes `delay_ms` to answer. Shows
+/// that the UI stays responsive while a call is in flight.
+#[server]
+pub async fn slow_snapshot(delay_ms: u64) -> Result<Snapshot, ServerFnError> {
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms.min(30_000))).await;
+    Ok(state::snapshot())
+}
+
 #[cfg(feature = "ssr")]
 mod state {
     use super::Snapshot;

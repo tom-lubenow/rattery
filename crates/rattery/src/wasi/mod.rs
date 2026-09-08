@@ -4,6 +4,7 @@ pub mod backend;
 pub mod bindings;
 pub mod client;
 pub mod events;
+pub mod task;
 
 pub use wstd;
 

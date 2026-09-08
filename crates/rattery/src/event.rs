@@ -16,6 +16,10 @@ pub enum Event {
     Paste(String),
     /// The terminal was resized to `(columns, rows)`.
     Resize(u16, u16),
+    /// Something inside the app asked for attention: a [`Task`](crate::task::Task)
+    /// finished, or [`task::wake`](crate::task::wake) was called. Re-render and
+    /// check your task handles.
+    Wake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,4 +165,4 @@ pub enum MouseButton {
 }
 
 #[cfg(target_os = "wasi")]
-pub use crate::wasi::events::{next, poll, stream};
+pub use crate::wasi::events::{next, next_timeout, poll, stream};
