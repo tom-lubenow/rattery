@@ -300,6 +300,18 @@ async fn watch_reloads_when_the_served_component_changes() {
     std::fs::copy(guest("counter-app"), &served).unwrap();
     let server = Server::start_serving(&served);
 
+    // The swap below is on a wall-clock timer, so make sure neither component
+    // needs a cold compile inside the timed window: run each once (cheap when
+    // wasmtime's cache is warm, a few seconds when it is not).
+    for package in ["counter-app", "spin-app"] {
+        App::from_path(guest(package))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("", 1))
+            .run()
+            .await
+            .unwrap();
+    }
+
     let run = tokio::spawn(
         App::from_url(format!("{}/app.wasm", server.url))
             .unwrap()
