@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Proc macros for rattery: the #[rattery::server] attribute"
+keywords = ["ratatui", "server_fn", "proc-macro"]
+categories = ["command-line-interface"]
+description = "Proc macros for rattery-app: the #[rattery_app::server] attribute"
 
 [lib]
 proc-macro = true

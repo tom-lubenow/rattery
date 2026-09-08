@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use rattery_host::{App, AppStatus, CookiePolicy, HeadlessOptions, Report, Script};
+use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Report, Script};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -121,7 +121,7 @@ impl Drop for Server {
 }
 
 /// The big number in the counter box: the first box segment that is only digits.
-fn count_on(screen: &rattery_host::Screen) -> Option<String> {
+fn count_on(screen: &rattery::Screen) -> Option<String> {
     screen
         .lines
         .iter()

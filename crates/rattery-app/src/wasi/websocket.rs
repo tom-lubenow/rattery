@@ -1,5 +1,5 @@
 //! WebSockets, provided by the host and subject to its origin policy and
-//! cookie jar. `#[rattery::server]` functions using the `Websocket` protocol
+//! cookie jar. `#[rattery_app::server]` functions using the `Websocket` protocol
 //! are built on this; it is also usable directly.
 
 use std::fmt;

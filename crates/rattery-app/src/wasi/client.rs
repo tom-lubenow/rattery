@@ -24,7 +24,7 @@ use crate::wasi::websocket::{Error as WsError, Message, WebSocket};
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type OutgoingBody = UnsyncBoxBody<Bytes, BoxError>;
 
-/// The client `#[rattery::server]` functions use on `wasm32-wasip2`.
+/// The client `#[rattery_app::server]` functions use on `wasm32-wasip2`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServerFnClient;
 

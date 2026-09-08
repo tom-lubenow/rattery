@@ -227,7 +227,7 @@ dependencies = [
  "bytes",
  "http",
  "http-body-util",
- "rattery",
+ "rattery-app",
  "wasip3",
 ]
 
@@ -584,7 +584,7 @@ version = "0.1.0"
 dependencies = [
  "counter-shared",
  "futures",
- "rattery",
+ "rattery-app",
 ]
 
 [[package]]
@@ -596,7 +596,7 @@ dependencies = [
  "clap",
  "counter-shared",
  "rand 0.9.5",
- "rattery",
+ "rattery-app",
  "tokio",
 ]
 
@@ -605,7 +605,7 @@ name = "counter-shared"
 version = "0.1.0"
 dependencies = [
  "futures",
- "rattery",
+ "rattery-app",
  "serde",
  "tokio",
 ]
@@ -2706,25 +2706,6 @@ dependencies = [
 name = "rattery"
 version = "0.1.0"
 dependencies = [
- "bitflags 2.13.1",
- "bytes",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "multer",
- "ratatui",
- "rattery-macros",
- "send_wrapper",
- "server_fn",
- "wasip3",
- "wit-bindgen 0.61.1",
-]
-
-[[package]]
-name = "rattery-host"
-version = "0.1.0"
-dependencies = [
  "anyhow",
  "async-trait",
  "clap",
@@ -2742,6 +2723,25 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+]
+
+[[package]]
+name = "rattery-app"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "multer",
+ "ratatui",
+ "rattery-macros",
+ "send_wrapper",
+ "server_fn",
+ "wasip3",
+ "wit-bindgen 0.61.1",
 ]
 
 [[package]]
@@ -3369,7 +3369,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 name = "spin-app"
 version = "0.1.0"
 dependencies = [
- "rattery",
+ "rattery-app",
 ]
 
 [[package]]

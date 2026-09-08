@@ -62,8 +62,8 @@ fn bench(frames: usize) -> Result<()> {
     ])? {
         bail!("bench-app failed to build");
     }
-    if !cargo(&["build", "-p", "rattery-host", "--release"])? {
-        bail!("rattery-host failed to build");
+    if !cargo(&["build", "-p", "rattery", "--release"])? {
+        bail!("rattery failed to build");
     }
     let host = root.join("target/release/rattery");
     let app = root.join("target/wasm32-wasip2/release/bench_app.wasm");
@@ -259,7 +259,7 @@ fn dev(app: &str, server: &str, bind: &str) -> Result<()> {
     let mut sources_stamp = newest_mtime(&watched);
     println!();
     println!("xtask: watching for changes. In another terminal:");
-    println!("    cargo run -p rattery-host -- --watch http://{bind}/app.wasm");
+    println!("    cargo run -p rattery -- --watch http://{bind}/app.wasm");
     println!();
 
     loop {

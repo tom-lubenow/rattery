@@ -12,5 +12,5 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 counter-shared = { path = "../shared", features = ["axum"] }
 rand = "0.9"
-rattery = { workspace = true, features = ["axum"] }
+rattery-app = { workspace = true, features = ["axum"] }
 tokio = { workspace = true, features = ["fs", "net"] }

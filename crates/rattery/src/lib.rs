@@ -1,107 +1,379 @@
 //! # rattery
 //!
-//! Write a [ratatui] app, compile it to a WASI 0.2 component, and let the
-//! `rattery` host run it inside a real terminal, sandboxed like a web page.
-//! Backend calls go through [`server_fn`] exactly as they do in Leptos or
-//! Dioxus fullstack: declare `#[rattery::server]` functions in a crate shared
-//! by the app and the server, call them as plain `async fn`s from the app.
+//! Run a [rattery](https://github.com/tom-lubenow/rattery) app, a ratatui app
+//! compiled to a WASI 0.2 component, inside the current terminal with the
+//! isolation a browser gives a web page. This crate is both the `rattery`
+//! command and a library, so an existing CLI can embed a remote TUI:
 //!
-//! ```ignore
-//! use rattery::prelude::*;
+//! ```no_run
+//! # async fn demo() -> anyhow::Result<()> {
+//! use rattery::App;
 //!
-//! #[rattery::server]
-//! async fn hello(name: String) -> Result<String, ServerFnError> {
-//!     Ok(format!("hello, {name}"))
-//! }
-//!
-//! rattery::app!(run);
-//!
-//! async fn run(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
-//!     let greeting = hello("rattery".into()).await?;
-//!     loop {
-//!         terminal.draw(|frame| frame.render_widget(greeting.as_str(), frame.area()))?;
-//!         if let Event::Key(key) = rattery::event::next().await {
-//!             if key.code == KeyCode::Char('q') { break Ok(()) }
-//!         }
-//!     }
-//! }
+//! let report = App::from_url("https://apps.example.com/dashboard/app.wasm")?
+//!     .allow_origin("https://api.example.com")
+//!     .run()
+//!     .await?;
+//! std::process::exit(report.exit_code());
+//! # }
 //! ```
 //!
-//! On `wasm32-wasip2` this crate provides the terminal backend, the event
-//! stream, background tasks, websockets, and the `wasi:http` server-function
-//! client, all on the component model's async ABI. On native targets it
-//! provides only what the server build of a shared crate needs: the macro,
-//! `server_fn`, and a stub client.
+//! Or ship one specific app against one specific backend, with the component
+//! embedded in your binary:
+//!
+//! ```ignore
+//! use rattery::App;
+//!
+//! let report = App::from_bytes(include_bytes!("../app.wasm").to_vec())
+//!     .origin("https://api.example.com")
+//!     .run_blocking()?;
+//! ```
+//!
+//! ## Origin policy
+//!
+//! An app may make HTTP requests to its own origin: where it was loaded from,
+//! or the [`origin`](App::origin) you give an app loaded from bytes or a file.
+//! [`allow_origin`](App::allow_origin) adds more, [`allow_all_origins`](App::allow_all_origins)
+//! removes the check, and [`cors`](App::cors) lets other origins opt in
+//! themselves with an `Access-Control-Allow-Origin` header, the way browsers
+//! do. Everything else is refused before a connection is opened.
+//!
+//! ## Cookies and sessions
+//!
+//! The host keeps a cookie jar the way a browser does. The app never sees
+//! `Cookie` or `Set-Cookie` headers, so ordinary cookie-based sessions on the
+//! server work unchanged, and `HttpOnly` means what it says. By default the
+//! jar is persisted under the user's local data directory; see
+//! [`CookiePolicy`] for a private-window mode or a jar of your own.
+//!
+//! ## Headless mode
+//!
+//! [`App::headless`] swaps the real terminal for an in-memory one driven by a
+//! [`Script`]. The [`Report`] then carries every [`Screen`] the script
+//! snapshotted, which makes end-to-end tests of an app a few lines long.
 
-pub use ratatui;
-pub use rattery_macros::server;
-pub use server_fn;
-pub use server_fn::ServerFnError;
+mod bindings;
+mod convert;
+mod headless;
+mod http;
+mod loader;
+mod runner;
+mod state;
+mod terminal;
+mod websocket;
 
-pub mod event;
-pub mod multipart;
+use std::path::PathBuf;
+use std::time::Duration;
 
-#[cfg(target_os = "wasi")]
-mod wasi;
-#[cfg(target_os = "wasi")]
-#[doc(hidden)]
-pub use wasi::__run_app;
-#[cfg(target_os = "wasi")]
-pub use wasi::{
-    Terminal, backend::RatteryBackend, bindings, client::ServerFnClient, location, origin, runtime,
-    set_title, task, time, websocket,
-};
+use anyhow::{Context, Result};
+use url::Url;
 
-/// Declare the app's entry point: an `async fn(Terminal) -> Result<(), E>`.
-///
-/// The crate must be a `cdylib` built for `wasm32-wasip2`; this macro exports
-/// the component's async `run` and wires it to your function.
-///
-/// ```ignore
-/// rattery::app!(run);
-///
-/// async fn run(mut terminal: rattery::Terminal) -> Result<(), Box<dyn std::error::Error>> {
-///     // ...
-/// }
-/// ```
-#[cfg(target_os = "wasi")]
-#[macro_export]
-macro_rules! app {
-    ($run:path) => {
-        struct __RatteryApp;
+pub use headless::{Script, ScriptCommand};
+pub use http::{CookieJar, OriginPolicy};
+pub use terminal::{Screen, Stats};
 
-        impl $crate::bindings::Guest for __RatteryApp {
-            async fn run() -> Result<(), String> {
-                $crate::__run_app($run).await
+/// How long the phases before the app ran took.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Fetching or reading the component.
+    pub load: Duration,
+    /// Compiling it (near zero on a cache hit).
+    pub compile: Duration,
+    /// Instantiating the component.
+    pub instantiate: Duration,
+    /// From the app starting to its first frame, if it drew one.
+    pub first_draw: Option<Duration>,
+    /// The whole run, load to exit.
+    pub total: Duration,
+}
+
+/// What happens to cookies the app's servers set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CookiePolicy {
+    /// Keep them in `rattery/cookies.json` under the user's local data
+    /// directory, shared by every app the user runs (the default).
+    #[default]
+    Persistent,
+    /// Keep them in a file of your choosing, for an embedding CLI that wants
+    /// its own sessions.
+    File(PathBuf),
+    /// Keep them in memory for this run only, like a private window.
+    Ephemeral,
+    /// Drop every cookie; the app is never logged in to anything.
+    Disabled,
+}
+
+/// Where the app component comes from.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// Fetched over HTTP; the URL's origin becomes the app's origin.
+    Url(Url),
+    /// Read from disk. The app has no origin unless [`App::origin`] is set.
+    Path(PathBuf),
+    /// Already in memory, for example via `include_bytes!`.
+    Bytes(Vec<u8>),
+}
+
+/// Options for running without a real terminal.
+#[derive(Debug, Clone)]
+pub struct HeadlessOptions {
+    /// Screen size in columns and rows.
+    pub width: u16,
+    pub height: u16,
+    /// Input to feed the app and when to take snapshots.
+    pub script: Script,
+    /// Stop the app after this long, reporting [`AppStatus::TimedOut`].
+    pub timeout: Option<Duration>,
+}
+
+impl Default for HeadlessOptions {
+    fn default() -> Self {
+        Self {
+            width: 80,
+            height: 24,
+            script: Script::default(),
+            timeout: None,
+        }
+    }
+}
+
+/// How the app ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppStatus {
+    /// The app returned or called `exit` with this code.
+    Exited(i32),
+    /// The app trapped (a panic, an out-of-bounds access, ...).
+    Trapped(String),
+    /// The user pressed Ctrl-C three times in a row.
+    Killed,
+    /// The headless timeout elapsed.
+    TimedOut,
+}
+
+/// What happened while the app ran.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub status: AppStatus,
+    /// Whatever the app wrote to its stdout.
+    pub stdout: String,
+    /// Whatever the app wrote to its stderr, panics included.
+    pub stderr: String,
+    /// Screens captured by `snapshot` script commands (headless only).
+    pub snapshots: Vec<Screen>,
+    /// The screen when the app ended (headless only).
+    pub final_screen: Option<Screen>,
+    /// Phase timings.
+    pub timings: Timings,
+    /// Terminal counters from the last run of the app.
+    pub stats: Stats,
+}
+
+impl Report {
+    /// A process exit code that reflects [`Report::status`].
+    pub fn exit_code(&self) -> i32 {
+        match &self.status {
+            AppStatus::Exited(code) => *code,
+            AppStatus::Trapped(_) => 101,
+            AppStatus::Killed => 130,
+            AppStatus::TimedOut => 124,
+        }
+    }
+}
+
+/// A rattery app, ready to run. Build one with [`App::from_url`],
+/// [`App::from_path`], or [`App::from_bytes`], adjust the policy, then
+/// [`run`](App::run) it.
+#[derive(Debug, Clone)]
+pub struct App {
+    pub(crate) source: Source,
+    pub(crate) origin: Option<String>,
+    pub(crate) allow_origins: Vec<String>,
+    pub(crate) allow_all_origins: bool,
+    pub(crate) cors: bool,
+    pub(crate) mouse: bool,
+    pub(crate) cache: bool,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) location: Option<String>,
+    pub(crate) cookies: CookiePolicy,
+    pub(crate) watch: bool,
+    pub(crate) headless: Option<HeadlessOptions>,
+}
+
+impl App {
+    fn new(source: Source) -> Self {
+        Self {
+            source,
+            origin: None,
+            allow_origins: Vec::new(),
+            allow_all_origins: false,
+            cors: false,
+            mouse: true,
+            cache: true,
+            env: Vec::new(),
+            location: None,
+            cookies: CookiePolicy::Persistent,
+            watch: false,
+            headless: None,
+        }
+    }
+
+    /// An app served over HTTP. Its origin is the URL's origin.
+    pub fn from_url(url: impl AsRef<str>) -> Result<Self> {
+        let url =
+            Url::parse(url.as_ref()).with_context(|| format!("invalid URL {:?}", url.as_ref()))?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "unsupported URL scheme {:?}, expected http or https",
+            url.scheme()
+        );
+        Ok(Self::new(Source::Url(url)))
+    }
+
+    /// An app component on disk.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        Self::new(Source::Path(path.into()))
+    }
+
+    /// An app component already in memory.
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::new(Source::Bytes(bytes.into()))
+    }
+
+    /// A URL if `source` parses as an http(s) URL, otherwise a path. This is
+    /// what the `rattery` command does with its argument.
+    pub fn from_source(source: &str) -> Result<Self> {
+        match Url::parse(source) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => Self::from_url(source),
+            _ => Ok(Self::from_path(source)),
+        }
+    }
+
+    /// Where server functions are sent, as `scheme://host[:port]`.
+    ///
+    /// For an app loaded from a URL this overrides the URL's origin, and the
+    /// calls become cross-origin requests subject to the policy. For an app
+    /// loaded from bytes or a file it *is* the app's origin.
+    pub fn origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
+    }
+
+    /// Let the app reach one more origin over HTTP.
+    pub fn allow_origin(mut self, origin: impl Into<String>) -> Self {
+        self.allow_origins.push(origin.into());
+        self
+    }
+
+    /// Let the app reach any origin over HTTP.
+    pub fn allow_all_origins(mut self, yes: bool) -> Self {
+        self.allow_all_origins = yes;
+        self
+    }
+
+    /// Browser-style CORS: a request to an origin that is not allowed is still
+    /// sent, carrying an `Origin` header, and the response is delivered only if
+    /// it answers with a matching `Access-Control-Allow-Origin`.
+    pub fn cors(mut self, yes: bool) -> Self {
+        self.cors = yes;
+        self
+    }
+
+    /// Report mouse events to the app (default: yes).
+    pub fn mouse(mut self, yes: bool) -> Self {
+        self.mouse = yes;
+        self
+    }
+
+    /// Cache compiled components on disk (default: yes).
+    pub fn cache(mut self, yes: bool) -> Self {
+        self.cache = yes;
+        self
+    }
+
+    /// Set an environment variable the app can read. Apps see nothing else
+    /// from your environment.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// The URL the app believes it was loaded from, query string included:
+    /// what `rattery::location()` returns. Defaults to the source URL. Set it
+    /// to pass parameters to an app loaded from bytes or a file.
+    pub fn location(mut self, url: impl Into<String>) -> Self {
+        self.location = Some(url.into());
+        self
+    }
+
+    /// How cookies are stored between requests and runs (default: persistent).
+    pub fn cookies(mut self, policy: CookiePolicy) -> Self {
+        self.cookies = policy;
+        self
+    }
+
+    /// For an app loaded from a URL: poll the server and restart the app in
+    /// place whenever a new component is published. This is the dev loop.
+    pub fn watch(mut self, yes: bool) -> Self {
+        self.watch = yes;
+        self
+    }
+
+    /// Run without touching the real terminal; see [`HeadlessOptions`].
+    pub fn headless(mut self, options: HeadlessOptions) -> Self {
+        self.headless = Some(options);
+        self
+    }
+
+    /// Fetch, compile, and run the app to completion.
+    ///
+    /// Needs a multi-threaded tokio runtime: input is read on a separate task
+    /// so an unresponsive app can still be interrupted.
+    pub async fn run(self) -> Result<Report> {
+        runner::run(self).await
+    }
+
+    /// [`run`](App::run) on a runtime of its own, for programs without one.
+    pub fn run_blocking(self) -> Result<Report> {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to start a tokio runtime")?
+            .block_on(self.run())
+    }
+}
+
+#[cfg(test)]
+mod wit_sync {
+    /// `crates/rattery/wit` is a copy of `crates/rattery-app/wit` so both
+    /// crates are publishable on their own; this keeps them identical.
+    #[test]
+    fn wit_matches_the_app_crate() {
+        let ours = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("wit");
+        let theirs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rattery-app/wit");
+        if !theirs.exists() {
+            return; // published copy: nothing to compare against
+        }
+        for entry in walk(&theirs) {
+            let rel = entry.strip_prefix(&theirs).unwrap();
+            let a = std::fs::read(&entry).unwrap();
+            let b = std::fs::read(ours.join(rel)).unwrap_or_default();
+            assert!(
+                a == b,
+                "wit/{} differs from crates/rattery-app/wit; copy it over",
+                rel.display()
+            );
+        }
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path))
+            } else {
+                out.push(path)
             }
         }
-
-        $crate::bindings::export!(__RatteryApp with_types_in $crate::bindings);
-    };
-}
-
-/// On native targets there is nothing to export; the macro expands to nothing
-/// so a shared crate can still compile the app module if it wants to.
-#[cfg(not(target_os = "wasi"))]
-#[macro_export]
-macro_rules! app {
-    ($run:path) => {};
-}
-
-#[cfg(not(target_os = "wasi"))]
-mod native;
-#[cfg(not(target_os = "wasi"))]
-pub use native::client::ServerFnClient;
-
-/// The usual imports for writing an app.
-pub mod prelude {
-    pub use crate::event::{
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    };
-    pub use crate::{ServerFnError, server};
-    pub use ratatui::prelude::*;
-
-    #[cfg(target_os = "wasi")]
-    pub use crate::{Terminal, task::Task};
+        out
+    }
 }

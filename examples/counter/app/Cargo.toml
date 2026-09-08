@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 [dependencies]
 counter-shared = { path = "../shared" }
 futures = { workspace = true }
-rattery = { workspace = true }
+rattery-app = { workspace = true }

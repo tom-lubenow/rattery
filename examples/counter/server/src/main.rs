@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         .route("/app.wasm", get(serve_app))
         .route(
             "/api/{*rest}",
-            any(rattery::server_fn::axum::handle_server_fn),
+            any(rattery_app::server_fn::axum::handle_server_fn),
         )
         .layer(middleware::from_fn(session))
         .layer(middleware::from_fn_with_state(state.clone(), cors))

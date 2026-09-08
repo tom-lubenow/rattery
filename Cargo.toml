@@ -2,8 +2,8 @@
 resolver = "3"
 members = [
     "crates/rattery",
+    "crates/rattery-app",
     "crates/rattery-macros",
-    "crates/rattery-host",
     "examples/counter/shared",
     "examples/counter/app",
     "examples/counter/server",
@@ -19,7 +19,7 @@ license = "MIT"
 repository = "https://github.com/tom-lubenow/rattery"
 
 [workspace.dependencies]
-rattery = { path = "crates/rattery", version = "0.1.0" }
+rattery-app = { path = "crates/rattery-app", version = "0.1.0" }
 rattery-macros = { path = "crates/rattery-macros", version = "0.1.0" }
 ratatui = { version = "0.30", default-features = false }
 server_fn = { version = "0.8", default-features = false }

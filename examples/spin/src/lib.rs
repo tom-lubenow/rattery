@@ -3,10 +3,10 @@
 //! something to interrupt.
 
 #[cfg(target_os = "wasi")]
-rattery::app!(run);
+rattery_app::app!(run);
 
 #[cfg(target_os = "wasi")]
-async fn run(mut terminal: rattery::Terminal) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(mut terminal: rattery_app::Terminal) -> Result<(), Box<dyn std::error::Error>> {
     terminal.draw(|frame| {
         frame.render_widget("spinning forever; press Ctrl-C three times", frame.area());
     })?;

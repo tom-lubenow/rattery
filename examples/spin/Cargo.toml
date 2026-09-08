@@ -10,4 +10,4 @@ description = "A deliberately unresponsive rattery app, used to test the kill sw
 crate-type = ["cdylib"]
 
 [dependencies]
-rattery = { workspace = true }
+rattery-app = { workspace = true }

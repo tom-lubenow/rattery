@@ -10,15 +10,15 @@
 //!   to measure request latency through the host (needs `--origin`).
 
 #[cfg(target_os = "wasi")]
-rattery::app!(run);
+rattery_app::app!(run);
 
 #[cfg(target_os = "wasi")]
 mod bench {
     use std::time::Instant;
 
-    use rattery::prelude::*;
-    use rattery::ratatui::buffer::Buffer;
-    use rattery::ratatui::widgets::{Block, Paragraph, Widget, Wrap};
+    use rattery_app::prelude::*;
+    use rattery_app::ratatui::buffer::Buffer;
+    use rattery_app::ratatui::widgets::{Block, Paragraph, Widget, Wrap};
 
     struct Params {
         frames: usize,
@@ -30,7 +30,7 @@ mod bench {
             frames: 100,
             mode: "full".into(),
         };
-        if let Some(location) = rattery::location()
+        if let Some(location) = rattery_app::location()
             && let Some((_, query)) = location.split_once('?')
         {
             for pair in query.split('&') {
@@ -81,7 +81,7 @@ mod bench {
 
     async fn http_bench(frames: usize) -> Result<(), Box<dyn std::error::Error>> {
         use http_body_util::BodyExt;
-        let origin = rattery::origin().ok_or("http mode needs --origin")?;
+        let origin = rattery_app::origin().ok_or("http mode needs --origin")?;
         let mut durations = Vec::with_capacity(frames);
         let started = Instant::now();
         for _ in 0..frames {

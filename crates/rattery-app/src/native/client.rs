@@ -1,6 +1,6 @@
 //! A stub client for native builds.
 //!
-//! The `#[rattery::server]` macro names `rattery::ServerFnClient` in generated
+//! The `#[rattery_app::server]` macro names `rattery_app::ServerFnClient` in generated
 //! code on every target. On the server the function body runs directly and the
 //! client is never used, so this implementation only needs to exist, and to
 //! fail loudly if something does call it.
@@ -15,7 +15,7 @@ use server_fn::response::ClientRes;
 use std::convert::Infallible;
 use std::future::Future;
 
-/// The client `#[rattery::server]` functions name on native targets.
+/// The client `#[rattery_app::server]` functions name on native targets.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServerFnClient;
 
@@ -31,7 +31,7 @@ pub struct FormData;
 
 fn unavailable<E: FromServerFnError>() -> E {
     ServerFnErrorErr::Request(
-        "rattery::ServerFnClient only sends requests from inside the rattery host \
+        "rattery_app::ServerFnClient only sends requests from inside the rattery host \
          (target wasm32-wasip2); on native targets call the server function body directly"
             .into(),
     )

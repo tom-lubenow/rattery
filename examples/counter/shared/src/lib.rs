@@ -4,10 +4,10 @@
 //! each function becomes an HTTP call, and natively inside the server with the
 //! `axum` feature, where the bodies run.
 
-use rattery::multipart::{MultipartData, MultipartFormData};
-use rattery::server_fn::codec::{JsonEncoding, StreamingText, TextStream};
-use rattery::server_fn::{BoxedStream, Websocket};
-use rattery::{ServerFnError, server};
+use rattery_app::multipart::{MultipartData, MultipartFormData};
+use rattery_app::server_fn::codec::{JsonEncoding, StreamingText, TextStream};
+use rattery_app::server_fn::{BoxedStream, Websocket};
+use rattery_app::{ServerFnError, server};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

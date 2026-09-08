@@ -1,0 +1,36 @@
+[package]
+name = "rattery-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["ratatui", "tui", "wasm", "wasi", "server_fn"]
+categories = ["command-line-interface", "wasm"]
+description = "Write ratatui apps that run sandboxed inside the rattery host and call the backend with server_fn: the app-side crate"
+
+[features]
+default = []
+# Enable on the server build of your shared crate: server function bodies are compiled in.
+ssr = ["rattery-macros/ssr", "server_fn/ssr"]
+# Enable on the server build when the backend is axum.
+axum = ["ssr", "rattery-macros/axum", "server_fn/axum"]
+
+[dependencies]
+rattery-macros = { workspace = true }
+server_fn = { workspace = true }
+ratatui = { workspace = true, features = ["std", "all-widgets", "underline-color", "macros"] }
+bitflags = "2"
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+multer = "3"
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+# Must be the exact wit-bindgen version `wasip3` uses: spawned tasks only work
+# when the export executor and the spawner share one runtime.
+wit-bindgen = { version = "0.61", features = ["async", "async-spawn"] }
+wasip3 = { version = "0.8", features = ["http-compat"] }
+send_wrapper = { version = "0.6", features = ["futures"] }
+http-body = "1"
+http-body-util = "0.1"

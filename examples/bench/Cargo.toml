@@ -10,7 +10,7 @@ description = "Rendering benchmark for rattery; run with `cargo xtask bench`"
 crate-type = ["cdylib"]
 
 [dependencies]
-rattery = { workspace = true }
+rattery-app = { workspace = true }
 
 [target.'cfg(target_os = "wasi")'.dependencies]
 wasip3 = { version = "0.8", features = ["http-compat"] }

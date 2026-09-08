@@ -6,9 +6,9 @@
 //! is how an app builds one.
 //!
 //! ```ignore
-//! use rattery::multipart::{FormData, MultipartData, MultipartFormData};
+//! use rattery_app::multipart::{FormData, MultipartData, MultipartFormData};
 //!
-//! #[rattery::server(input = MultipartFormData)]
+//! #[rattery_app::server(input = MultipartFormData)]
 //! pub async fn upload(data: MultipartData) -> Result<String, ServerFnError> {
 //!     let mut multipart = data.into_inner().expect("server side");
 //!     while let Some(field) = multipart.next_field().await? {
@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The server function must take exactly one argument of type
-//! [`MultipartData`]; `#[rattery::server]` generates the request plumbing.
+//! [`MultipartData`]; `#[rattery_app::server]` generates the request plumbing.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -38,7 +38,7 @@ use server_fn::codec::Encoding;
 use server_fn::error::{FromServerFnError, IntoAppError, ServerFnErrorErr, ServerFnErrorWrapper};
 use server_fn::request::{ClientReq, Req};
 
-/// The `multipart/form-data` encoding for `#[rattery::server(input = MultipartFormData)]`.
+/// The `multipart/form-data` encoding for `#[rattery_app::server(input = MultipartFormData)]`.
 pub struct MultipartFormData;
 
 impl ContentType for MultipartFormData {
@@ -196,7 +196,7 @@ impl From<FormData> for MultipartData {
     }
 }
 
-/// Used by `#[rattery::server]`: build the request for a form.
+/// Used by `#[rattery_app::server]`: build the request for a form.
 #[doc(hidden)]
 pub fn into_req<Request, E>(data: MultipartData, path: &str, accepts: &str) -> Result<Request, E>
 where
@@ -212,7 +212,7 @@ where
     Request::try_new_post_bytes(path, &content_type, accepts, body)
 }
 
-/// Used by `#[rattery::server]`: parse the request on the server.
+/// Used by `#[rattery_app::server]`: parse the request on the server.
 #[doc(hidden)]
 pub async fn from_req<Request, E>(req: Request) -> Result<MultipartData, E>
 where

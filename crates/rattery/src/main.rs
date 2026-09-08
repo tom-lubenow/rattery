@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rattery_host::{App, AppStatus, CookiePolicy, HeadlessOptions, Script};
+use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Script};
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
 #[derive(Debug, Parser)]

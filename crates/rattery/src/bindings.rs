@@ -1,7 +1,7 @@
 //! Host-side bindings for the `rattery:tui/app` world.
 
 wasmtime::component::bindgen!({
-    path: "../../wit",
+    path: "wit",
     world: "app",
     with: {
         "rattery:tui/websocket.socket": crate::websocket::WsSocket,

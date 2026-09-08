@@ -7,10 +7,10 @@
 //! so the app re-renders and picks up the result.
 //!
 //! ```ignore
-//! let mut pending = Some(rattery::task::spawn(fetch_snapshot()));
+//! let mut pending = Some(rattery_app::task::spawn(fetch_snapshot()));
 //! loop {
 //!     terminal.draw(|f| ui(f, pending.is_some()))?;
-//!     match rattery::event::next().await {
+//!     match rattery_app::event::next().await {
 //!         Event::Wake => {
 //!             if let Some(result) = pending.as_mut().and_then(Task::try_take) {
 //!                 pending = None;
@@ -117,7 +117,7 @@ impl<T> Future for Task<T> {
         }
         assert!(
             !self.slot.done.get(),
-            "rattery::task::Task polled after its value was taken"
+            "rattery_app::task::Task polled after its value was taken"
         );
         *self.slot.waker.borrow_mut() = Some(cx.waker().clone());
         Poll::Pending

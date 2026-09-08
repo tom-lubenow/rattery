@@ -9,10 +9,10 @@ use counter_shared::{
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
-use rattery::event;
-use rattery::multipart::FormData;
-use rattery::prelude::*;
-use rattery::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use rattery_app::event;
+use rattery_app::multipart::FormData;
+use rattery_app::prelude::*;
+use rattery_app::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const FEED_LINES: usize = 50;
@@ -44,7 +44,7 @@ struct App {
 impl App {
     /// Start a server call in the background; the UI keeps running.
     fn start(&mut self, call: impl Future<Output = Result<Snapshot, ServerFnError>> + 'static) {
-        self.pending = Some(rattery::task::spawn(call));
+        self.pending = Some(rattery_app::task::spawn(call));
     }
 
     /// Collect the result of a finished call.
@@ -76,7 +76,7 @@ impl App {
                 feed.pop_front();
             }
             feed.push_back(line);
-            rattery::task::wake();
+            rattery_app::task::wake();
         }
     }
 
@@ -86,7 +86,7 @@ impl App {
         let push = self.feed_writer();
         let (tx, rx) = mpsc::unbounded();
         self.chat_tx = Some(tx);
-        self._chat_task = Some(rattery::task::spawn(async move {
+        self._chat_task = Some(rattery_app::task::spawn(async move {
             let replies = match chat(rx.into()).await {
                 Ok(replies) => replies,
                 Err(err) => return push(format!("chat error: {err}")),
@@ -120,7 +120,7 @@ impl App {
                 "text/plain",
                 b"hello from the terminal\n".to_vec(),
             );
-        rattery::task::spawn(async move {
+        rattery_app::task::spawn(async move {
             match upload(form.into()).await {
                 Ok(summary) => summary
                     .lines()
@@ -144,7 +144,7 @@ impl App {
     /// the panel redraws as soon as it arrives.
     fn follow_feed(&mut self) {
         let push = self.feed_writer();
-        self._feed_task = Some(rattery::task::spawn(async move {
+        self._feed_task = Some(rattery_app::task::spawn(async move {
             let stream = match live_feed().await {
                 Ok(stream) => stream,
                 Err(err) => return push(format!("feed error: {err}")),
@@ -170,8 +170,8 @@ impl App {
 }
 
 pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
-    rattery::set_title("rattery counter");
-    let title = rattery::location()
+    rattery_app::set_title("rattery counter");
+    let title = rattery_app::location()
         .and_then(|location| {
             let (_, query) = location.split_once('?')?;
             query
@@ -180,7 +180,7 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
         })
         .unwrap_or_else(|| "rattery counter".to_owned());
     let mut app = App {
-        origin: rattery::origin(),
+        origin: rattery_app::origin(),
         title,
         ..App::default()
     };
