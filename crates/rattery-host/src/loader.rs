@@ -1,54 +1,104 @@
 //! Fetching the app component, from a URL like a browser would or from disk.
 
 use anyhow::{Context, Result};
+use reqwest::StatusCode;
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use url::Url;
+
+use crate::Source;
 
 pub struct Loaded {
     pub bytes: Vec<u8>,
-    /// Where server functions go: the URL's origin, or `--origin`.
+    /// The app's own origin, if it has one.
     pub origin: Option<String>,
     pub description: String,
+    /// Validators from the HTTP response, used to poll for new versions.
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
 
-pub async fn load(source: &str, origin_override: Option<&str>) -> Result<Loaded> {
-    if let Some(url) = parse_http_url(source) {
-        let bytes = fetch(&url).await?;
-        let origin = origin_override
-            .map(str::to_owned)
-            .or_else(|| Some(origin_of(&url)));
-        return Ok(Loaded {
-            bytes,
-            origin,
-            description: url.to_string(),
-        });
+pub async fn load(source: &Source) -> Result<Loaded> {
+    match source {
+        Source::Url(url) => {
+            let client = reqwest::Client::new();
+            let fetched = fetch_if_changed(&client, url, None, None, None)
+                .await?
+                .expect("an unconditional fetch always yields a body");
+            Ok(Loaded {
+                origin: Some(origin_of(url)),
+                description: url.to_string(),
+                ..fetched
+            })
+        }
+        Source::Path(path) => Ok(Loaded {
+            bytes: tokio::fs::read(path)
+                .await
+                .with_context(|| format!("failed to read {}", path.display()))?,
+            origin: None,
+            description: path.display().to_string(),
+            etag: None,
+            last_modified: None,
+        }),
+        Source::Bytes(bytes) => Ok(Loaded {
+            bytes: bytes.clone(),
+            origin: None,
+            description: format!("{} bytes in memory", bytes.len()),
+            etag: None,
+            last_modified: None,
+        }),
     }
-
-    let bytes = tokio::fs::read(source)
-        .await
-        .with_context(|| format!("failed to read {source}"))?;
-    Ok(Loaded {
-        bytes,
-        origin: origin_override.map(str::to_owned),
-        description: source.to_owned(),
-    })
-}
-
-fn parse_http_url(source: &str) -> Option<Url> {
-    let url = Url::parse(source).ok()?;
-    matches!(url.scheme(), "http" | "https").then_some(url)
 }
 
 pub fn origin_of(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
-async fn fetch(url: &Url) -> Result<Vec<u8>> {
-    let response = reqwest::get(url.clone())
+/// Fetch `url` unless the server says it is unchanged. `previous` lets us
+/// detect changes even from servers that send no validators.
+pub async fn fetch_if_changed(
+    client: &reqwest::Client,
+    url: &Url,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    previous: Option<&[u8]>,
+) -> Result<Option<Loaded>> {
+    let mut request = client.get(url.clone());
+    if let Some(etag) = etag {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    if let Some(last_modified) = last_modified {
+        request = request.header(IF_MODIFIED_SINCE, last_modified);
+    }
+    let response = request
+        .send()
         .await
-        .with_context(|| format!("failed to fetch {url}"))?
+        .with_context(|| format!("failed to fetch {url}"))?;
+    if response.status() == StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    let response = response
         .error_for_status()
         .with_context(|| format!("failed to fetch {url}"))?;
-    Ok(response.bytes().await?.to_vec())
+    let header = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let etag = header(ETAG);
+    let last_modified = header(LAST_MODIFIED);
+    let bytes = response.bytes().await?.to_vec();
+    if previous.is_some_and(|previous| previous == bytes.as_slice()) {
+        return Ok(None);
+    }
+    Ok(Some(Loaded {
+        bytes,
+        origin: Some(origin_of(url)),
+        description: url.to_string(),
+        etag,
+        last_modified,
+    }))
 }
 
 #[cfg(test)]
@@ -64,11 +114,24 @@ mod tests {
     }
 
     #[test]
-    fn only_http_urls_are_fetched() {
-        assert!(parse_http_url("http://x/app.wasm").is_some());
-        assert!(parse_http_url("https://x/app.wasm").is_some());
-        assert!(parse_http_url("file:///tmp/app.wasm").is_none());
-        assert!(parse_http_url("target/app.wasm").is_none());
-        assert!(parse_http_url("./app.wasm").is_none());
+    fn from_source_picks_url_or_path() {
+        use crate::App;
+        assert!(matches!(
+            App::from_source("http://x/app.wasm").unwrap().source,
+            Source::Url(_)
+        ));
+        assert!(matches!(
+            App::from_source("https://x/app.wasm").unwrap().source,
+            Source::Url(_)
+        ));
+        assert!(matches!(
+            App::from_source("file:///tmp/app.wasm").unwrap().source,
+            Source::Path(_)
+        ));
+        assert!(matches!(
+            App::from_source("target/app.wasm").unwrap().source,
+            Source::Path(_)
+        ));
+        assert!(App::from_url("ftp://x/app.wasm").is_err());
     }
 }

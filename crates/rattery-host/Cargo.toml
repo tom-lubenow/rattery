@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "rattery: a sandboxed terminal host that runs ratatui apps delivered over HTTP"
+description = "rattery: a sandboxed terminal host that runs ratatui apps delivered over HTTP, as a CLI and as a library"
+
+[lib]
+name = "rattery_host"
+path = "src/lib.rs"
 
 [[bin]]
 name = "rattery"
@@ -25,3 +29,6 @@ url = "2"
 wasmtime = "48"
 wasmtime-wasi = "48"
 wasmtime-wasi-http = "48"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process", "io-util"] }

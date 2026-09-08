@@ -1,0 +1,10 @@
+[package]
+name = "spin-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A deliberately unresponsive rattery app, used to test the kill switch"
+
+[dependencies]
+rattery = { workspace = true }

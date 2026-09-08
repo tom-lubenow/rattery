@@ -7,6 +7,7 @@ wasmtime::component::bindgen!({
         "wasi": wasmtime_wasi::p2::bindings,
     },
     imports: { default: async | trappable },
+    additional_derives: [Clone, PartialEq, Eq],
 });
 
 pub use self::rattery::tui::terminal;

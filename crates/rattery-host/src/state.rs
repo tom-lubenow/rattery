@@ -6,9 +6,7 @@ use wasmtime_wasi::p2::bindings::io::poll::Pollable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
-use crate::bindings::terminal::{
-    self, CellUpdate, ClearType, Event, Host, Position, Size, WindowSize,
-};
+use crate::bindings::terminal::{CellUpdate, ClearType, Event, Host, Position, Size, WindowSize};
 use crate::http::{OriginHooks, OriginPolicy};
 use crate::terminal::TerminalHost;
 
@@ -29,6 +27,12 @@ impl HostState {
             hooks: OriginHooks::new(policy),
             term,
         }
+    }
+}
+
+impl HostState {
+    pub fn into_terminal(self) -> TerminalHost {
+        self.term
     }
 }
 
@@ -115,10 +119,4 @@ impl Host for HostState {
         self.term.set_title(&title)?;
         Ok(())
     }
-}
-
-// Keep the module path referenced so the generated linker glue is obviously in use.
-#[allow(dead_code)]
-fn _uses_terminal_module() -> Option<terminal::Color> {
-    None
 }

@@ -1,22 +1,12 @@
 //! `rattery`: run a ratatui app packaged as a WASI 0.2 component inside the
 //! current terminal, with the same isolation a browser gives a web page.
 
-mod bindings;
-mod convert;
-mod http;
-mod loader;
-mod state;
-mod terminal;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
-use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Cache, Config, Engine, Store};
-use wasmtime_wasi::p2::bindings::Command;
-use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
-use wasmtime_wasi::{I32Exit, WasiCtxBuilder};
-
-use crate::state::HostState;
+use rattery_host::{App, AppStatus, HeadlessOptions, Script};
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
 #[derive(Debug, Parser)]
@@ -26,7 +16,8 @@ struct Cli {
     source: String,
 
     /// Origin the app's server functions are sent to. Defaults to the origin
-    /// of SOURCE when it is a URL; required for server calls from a local file.
+    /// of SOURCE when it is a URL; an app loaded from a file has no origin
+    /// without this.
     #[arg(long, value_name = "URL")]
     origin: Option<String>,
 
@@ -38,6 +29,20 @@ struct Cli {
     #[arg(long)]
     allow_all_origins: bool,
 
+    /// Browser-style CORS: other origins may opt in per response with
+    /// Access-Control-Allow-Origin.
+    #[arg(long)]
+    cors: bool,
+
+    /// Environment variable to expose to the app (repeatable).
+    #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env)]
+    env: Vec<(String, String)>,
+
+    /// Poll the server for a new component and restart the app in place
+    /// when one is published (URL sources only).
+    #[arg(long)]
+    watch: bool,
+
     /// Do not report mouse events to the app.
     #[arg(long)]
     no_mouse: bool,
@@ -45,104 +50,121 @@ struct Cli {
     /// Skip the on-disk cache of compiled components.
     #[arg(long)]
     no_cache: bool,
+
+    /// Run without a terminal, on an in-memory screen of this size, and print
+    /// the snapshots the script takes plus the final screen.
+    #[arg(long, value_name = "COLSxROWS", value_parser = parse_size)]
+    headless: Option<(u16, u16)>,
+
+    /// Script of input to feed a headless run (see `rattery --help-script`).
+    #[arg(long, value_name = "FILE", requires = "headless")]
+    script: Option<PathBuf>,
+
+    /// Stop a headless run after this many seconds.
+    #[arg(long, value_name = "SECS", requires = "headless")]
+    timeout: Option<f64>,
+
+    /// Print the headless script format and exit.
+    #[arg(long)]
+    help_script: bool,
 }
+
+fn parse_env(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .ok_or_else(|| format!("expected KEY=VALUE, got {s:?}"))
+}
+
+fn parse_size(s: &str) -> Result<(u16, u16), String> {
+    let (w, h) = s
+        .split_once('x')
+        .ok_or_else(|| format!("expected COLSxROWS, got {s:?}"))?;
+    Ok((
+        w.parse().map_err(|e| format!("bad width: {e}"))?,
+        h.parse().map_err(|e| format!("bad height: {e}"))?,
+    ))
+}
+
+const SCRIPT_HELP: &str = "\
+Headless scripts are one command per line; blank lines and # comments are ignored.
+
+  sleep 500          milliseconds
+  key k              a single character
+  key ctrl-c         modifiers: ctrl, alt, shift, super, meta
+  key enter          enter esc up down left right tab backtab backspace delete
+                     insert home end pageup pagedown space f1..f24
+  type hello world   one key event per character
+  paste some text    a bracketed paste
+  resize 100 30      columns rows; the app receives a resize event
+  snapshot           capture the screen; printed when the app ends
+";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let loaded = loader::load(&cli.source, cli.origin.as_deref()).await?;
-    let policy = http::OriginPolicy::new(
-        loaded.origin.as_deref(),
-        &cli.allow_origins,
-        cli.allow_all_origins,
-    )?;
-
-    let mut config = Config::new();
-    config.epoch_interruption(true);
-    if !cli.no_cache {
-        let cache = Cache::from_file(None)
-            .map_err(anyhow::Error::from)
-            .context("failed to configure the compile cache")?;
-        config.cache(Some(cache));
-    }
-    let engine = Engine::new(&config)?;
-
-    // Compile before touching the terminal so errors print normally.
-    let component = Component::new(&engine, &loaded.bytes)
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("{} is not a valid component", loaded.description))?;
-
-    let mut linker: Linker<HostState> = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)?;
-    bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
-
-    // The guest gets no filesystem, no sockets, no inherited stdio: only the
-    // terminal interface, the clock, randomness, and HTTP to allowed origins.
-    let stdout = MemoryOutputPipe::new(1 << 20);
-    let stderr = MemoryOutputPipe::new(1 << 20);
-    let mut wasi = WasiCtxBuilder::new();
-    wasi.stdout(stdout.clone())
-        .stderr(stderr.clone())
-        .arg("app");
-    if let Some(origin) = &loaded.origin {
-        wasi.env("RATTERY_ORIGIN", origin);
-    }
-    let wasi = wasi.build();
-
-    let session = terminal::Session::enter(!cli.no_mouse)?;
-    let (term, kill_switch) = terminal::TerminalHost::start(loaded.origin.clone());
-
-    // Escape hatch for an unresponsive app: Ctrl-C three times in a row
-    // interrupts the guest through wasmtime's epoch mechanism.
-    let killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    tokio::spawn({
-        let engine = engine.clone();
-        let killed = killed.clone();
-        async move {
-            if kill_switch.await.is_ok() {
-                killed.store(true, std::sync::atomic::Ordering::SeqCst);
-                engine.increment_epoch();
-            }
-        }
-    });
-
-    let mut store = Store::new(&engine, HostState::new(wasi, policy, term));
-    store.set_epoch_deadline(1);
-
-    let outcome = async {
-        let command = Command::instantiate_async(&mut store, &component, &linker).await?;
-        command.wasi_cli_run().call_run(&mut store).await
-    }
-    .await;
-
-    drop(store);
-    drop(session);
-
-    let guest_stderr = stderr.contents();
-    if !guest_stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&guest_stderr));
-    }
-    let guest_stdout = stdout.contents();
-    if !guest_stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&guest_stdout));
+    if cli.help_script {
+        print!("{SCRIPT_HELP}");
+        return Ok(());
     }
 
-    match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(())) => bail!("app exited with an error"),
-        Err(err) => {
-            if let Some(exit) = err.downcast_ref::<I32Exit>() {
-                if exit.0 == 0 {
-                    return Ok(());
-                }
-                bail!("app exited with status {}", exit.0);
-            }
-            if killed.load(std::sync::atomic::Ordering::SeqCst) {
-                bail!("app terminated by rattery (Ctrl-C pressed three times)");
-            }
-            Err(anyhow::Error::from(err).context("app trapped"))
-        }
+    let mut app = App::from_source(&cli.source)?
+        .allow_all_origins(cli.allow_all_origins)
+        .cors(cli.cors)
+        .mouse(!cli.no_mouse)
+        .cache(!cli.no_cache)
+        .watch(cli.watch);
+    if let Some(origin) = cli.origin {
+        app = app.origin(origin);
     }
+    for origin in cli.allow_origins {
+        app = app.allow_origin(origin);
+    }
+    for (key, value) in cli.env {
+        app = app.env(key, value);
+    }
+    if let Some((width, height)) = cli.headless {
+        let script = match &cli.script {
+            Some(path) => Script::parse(
+                &std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?,
+            )?,
+            None => Script::default(),
+        };
+        app = app.headless(HeadlessOptions {
+            width,
+            height,
+            script,
+            timeout: cli.timeout.map(Duration::from_secs_f64),
+        });
+    }
+
+    let report = app.run().await?;
+
+    for (index, screen) in report.snapshots.iter().enumerate() {
+        println!(
+            "--- snapshot {} ({}x{}) ---",
+            index + 1,
+            screen.width,
+            screen.height
+        );
+        print!("{screen}");
+    }
+    if let Some(screen) = &report.final_screen {
+        println!("--- final screen ({}x{}) ---", screen.width, screen.height);
+        print!("{screen}");
+    }
+    if !report.stdout.is_empty() {
+        print!("{}", report.stdout);
+    }
+    if !report.stderr.is_empty() {
+        eprint!("{}", report.stderr);
+    }
+    match &report.status {
+        AppStatus::Exited(0) => {}
+        AppStatus::Exited(code) => eprintln!("app exited with status {code}"),
+        AppStatus::Trapped(message) => eprintln!("app trapped: {message}"),
+        AppStatus::Killed => eprintln!("app terminated by rattery (Ctrl-C pressed three times)"),
+        AppStatus::TimedOut => eprintln!("app stopped: headless timeout elapsed"),
+    }
+    std::process::exit(report.exit_code());
 }
