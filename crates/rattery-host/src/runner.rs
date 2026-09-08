@@ -11,11 +11,11 @@ use wasmtime_wasi::p2::bindings::Command;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder};
 
-use crate::http::OriginPolicy;
+use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::HostState;
 use crate::terminal::{Interrupt, Interrupter, Screen, Session, TerminalHost};
-use crate::{App, AppStatus, Report, Source, bindings, headless};
+use crate::{App, AppStatus, CookiePolicy, Report, Source, bindings, headless};
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(750);
 
@@ -35,6 +35,16 @@ pub async fn run(app: App) -> Result<Report> {
         app.allow_all_origins,
         app.cors,
     )?;
+
+    let cookies = match &app.cookies {
+        CookiePolicy::Persistent => Some(match CookieJar::default_path() {
+            Some(path) => CookieJar::at(path),
+            None => CookieJar::ephemeral(),
+        }),
+        CookiePolicy::File(path) => Some(CookieJar::at(path.clone())),
+        CookiePolicy::Ephemeral => Some(CookieJar::ephemeral()),
+        CookiePolicy::Disabled => None,
+    };
 
     let mut config = Config::new();
     config.epoch_interruption(true);
@@ -118,7 +128,8 @@ pub async fn run(app: App) -> Result<Report> {
             stdout.clone(),
             stderr.clone(),
         );
-        let mut store = Store::new(&engine, HostState::new(wasi, policy.clone(), term));
+        let state = HostState::new(wasi, policy.clone(), cookies.clone(), term);
+        let mut store = Store::new(&engine, state);
         store.set_epoch_deadline(1);
 
         let outcome = {

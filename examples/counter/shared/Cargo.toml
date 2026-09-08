@@ -14,4 +14,4 @@ axum = ["ssr", "rattery/axum"]
 [dependencies]
 rattery = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["time"], optional = true }
+tokio = { workspace = true, features = ["time", "rt"], optional = true }

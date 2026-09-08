@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use rattery_host::{App, AppStatus, HeadlessOptions, Report, Script};
+use rattery_host::{App, AppStatus, CookiePolicy, HeadlessOptions, Report, Script};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -114,6 +114,15 @@ impl Drop for Server {
     }
 }
 
+fn count_on(screen: &rattery_host::Screen) -> Option<String> {
+    screen
+        .lines
+        .iter()
+        .map(|l| l.trim_matches(|c| c == '│' || c == ' '))
+        .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        .map(str::to_owned)
+}
+
 fn headless(script: &str, timeout_secs: u64) -> HeadlessOptions {
     HeadlessOptions {
         width: 80,
@@ -149,9 +158,11 @@ macro_rules! require_wasip2 {
 async fn counter_round_trip_and_state_on_server() {
     require_wasip2!();
     let server = Server::start(&[]);
+    let jar = std::env::temp_dir().join(format!("rattery-e2e-jar-{}.json", std::process::id()));
 
     let report = App::from_url(format!("{}/app.wasm", server.url))
         .unwrap()
+        .cookies(CookiePolicy::File(jar.clone()))
         .headless(headless(
             "sleep 1500\nkey k\nsleep 700\nkey k\nsleep 700\nsnapshot\nkey q",
             20,
@@ -163,30 +174,42 @@ async fn counter_round_trip_and_state_on_server() {
     assert_eq!(report.status, AppStatus::Exited(0), "{text}");
     let snap = &report.snapshots[0];
     assert!(snap.contains("served from http://127.0.0.1:"), "{text}");
-    assert!(
-        snap.lines
-            .iter()
-            .any(|l| l.trim_matches(|c| c == '│' || c == ' ') == "2"),
-        "{text}"
-    );
+    assert_eq!(count_on(snap).as_deref(), Some("2"), "{text}");
     assert!(snap.contains("3 calls"), "{text}");
+    assert!(snap.contains("session "), "{text}");
 
-    // A second session sees the count the first one left behind.
+    // A second run with the same cookie jar is the same session: the count
+    // it sees is the one the first run left behind.
     let report = App::from_url(format!("{}/app.wasm", server.url))
         .unwrap()
+        .cookies(CookiePolicy::File(jar.clone()))
         .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
     let text = dump(&report);
     assert_eq!(report.status, AppStatus::Exited(0), "{text}");
-    assert!(
-        report.snapshots[0]
-            .lines
-            .iter()
-            .any(|l| l.trim_matches(|c| c == '│' || c == ' ') == "2"),
+    assert_eq!(
+        count_on(&report.snapshots[0]).as_deref(),
+        Some("2"),
         "{text}"
     );
+
+    // A private-window run gets a fresh session and starts from zero.
+    let report = App::from_url(format!("{}/app.wasm", server.url))
+        .unwrap()
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert_eq!(
+        count_on(&report.snapshots[0]).as_deref(),
+        Some("0"),
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&jar);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -214,6 +237,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .unwrap()
         .origin(&api_closed.url)
         .cors(true)
+        .cookies(CookiePolicy::Ephemeral)
         .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
         .run()
         .await
@@ -228,6 +252,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .unwrap()
         .origin(&api_open.url)
         .cors(true)
+        .cookies(CookiePolicy::Ephemeral)
         .headless(headless(
             "sleep 1500\nkey k\nsleep 700\nsnapshot\nkey q",
             20,
@@ -245,6 +270,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .unwrap()
         .origin(&api_closed.url)
         .allow_origin(&api_closed.url)
+        .cookies(CookiePolicy::Ephemeral)
         .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
         .run()
         .await
@@ -266,6 +292,7 @@ async fn watch_reloads_when_the_served_component_changes() {
         App::from_url(format!("{}/app.wasm", server.url))
             .unwrap()
             .watch(true)
+            .cookies(CookiePolicy::Ephemeral)
             .headless(headless("sleep 1500\nsnapshot", 12))
             .run(),
     );

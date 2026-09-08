@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// This session's count. Sessions are cookies the server sets; the host
+    /// keeps them like a browser would, so a session survives restarts.
     pub count: i64,
+    pub session: String,
     pub server_pid: u32,
     pub uptime_secs: u64,
 }
@@ -38,20 +41,34 @@ pub async fn slow_snapshot(delay_ms: u64) -> Result<Snapshot, ServerFnError> {
 #[cfg(feature = "ssr")]
 mod state {
     use super::Snapshot;
-    use std::sync::LazyLock;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
     use std::time::Instant;
 
-    static COUNT: AtomicI64 = AtomicI64::new(0);
+    tokio::task_local! {
+        /// The session id of the request being handled, set by the server's
+        /// session middleware before a server function body runs.
+        pub static SESSION: String;
+    }
+
+    static COUNTS: LazyLock<Mutex<HashMap<String, i64>>> = LazyLock::new(Mutex::default);
     static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+    fn session() -> String {
+        SESSION
+            .try_with(Clone::clone)
+            .unwrap_or_else(|_| "anonymous".to_owned())
+    }
+
     pub fn adjust(delta: i64) {
-        COUNT.fetch_add(delta, Ordering::SeqCst);
+        *COUNTS.lock().unwrap().entry(session()).or_default() += delta;
     }
 
     pub fn snapshot() -> Snapshot {
+        let session = session();
         Snapshot {
-            count: COUNT.load(Ordering::SeqCst),
+            count: COUNTS.lock().unwrap().get(&session).copied().unwrap_or(0),
+            session,
             server_pid: std::process::id(),
             uptime_secs: STARTED.elapsed().as_secs(),
         }
@@ -64,4 +81,4 @@ mod state {
 }
 
 #[cfg(feature = "ssr")]
-pub use state::init;
+pub use state::{SESSION, init};

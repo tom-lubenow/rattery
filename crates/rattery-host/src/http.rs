@@ -6,13 +6,108 @@
 //! refused before a socket is opened.
 
 use std::future::Future;
+use std::io::{BufReader, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use http::header::{HeaderValue, ORIGIN};
+use cookie_store::CookieStore;
+use http::header::{COOKIE, HeaderValue, ORIGIN, SET_COOKIE};
 use http::uri::Scheme;
 use http_body_util::BodyExt;
 use url::Url;
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks, default_send_request};
+
+/// Cookies the app's servers set, kept the way a browser keeps them: the app
+/// never sees `Cookie` or `Set-Cookie` headers, the host attaches and records
+/// them. Optionally persisted to a JSON file between runs.
+#[derive(Clone)]
+pub struct CookieJar {
+    store: Arc<Mutex<CookieStore>>,
+    path: Option<PathBuf>,
+}
+
+impl CookieJar {
+    /// An in-memory jar that is forgotten when the app ends.
+    pub fn ephemeral() -> Self {
+        Self {
+            store: Arc::new(Mutex::new(CookieStore::new())),
+            path: None,
+        }
+    }
+
+    /// A jar loaded from and saved to `path` (created on first save).
+    pub fn at(path: PathBuf) -> Self {
+        let store = std::fs::File::open(&path)
+            .ok()
+            .and_then(|file| cookie_store::serde::json::load_all(BufReader::new(file)).ok())
+            .unwrap_or_default();
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            path: Some(path),
+        }
+    }
+
+    /// The default location: `rattery/cookies.json` in the user's local data dir.
+    pub fn default_path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("", "", "rattery")
+            .map(|dirs| dirs.data_local_dir().join("cookies.json"))
+    }
+
+    fn request_header(&self, url: &Url) -> Option<HeaderValue> {
+        let store = self.store.lock().unwrap();
+        let value = store
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if value.is_empty() {
+            None
+        } else {
+            HeaderValue::from_str(&value).ok()
+        }
+    }
+
+    fn store_response(&self, url: &Url, headers: &http::HeaderMap) {
+        let mut stored = false;
+        {
+            let mut store = self.store.lock().unwrap();
+            for value in headers.get_all(SET_COOKIE) {
+                if let Ok(text) = value.to_str() {
+                    stored |= store.parse(text, url).is_ok();
+                }
+            }
+        }
+        if stored {
+            self.save();
+        }
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        let result: std::io::Result<()> = (|| {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            let mut file = std::fs::File::create(&tmp)?;
+            // Session cookies too: a CLI session should survive a restart.
+            cookie_store::serde::json::save_incl_expired_and_nonpersistent(
+                &self.store.lock().unwrap(),
+                &mut file,
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            file.flush()?;
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(err) = result {
+            eprintln!(
+                "rattery: could not save cookies to {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
 
 /// Which origins an app may reach over HTTP.
 #[derive(Debug, Clone, Default)]
@@ -139,12 +234,17 @@ fn cors_permits(headers: &http::HeaderMap, app_origin: &str) -> bool {
 
 pub struct OriginHooks {
     policy: OriginPolicy,
+    cookies: Option<CookieJar>,
 }
 
 impl OriginHooks {
-    pub fn new(policy: OriginPolicy) -> Self {
-        Self { policy }
+    pub fn new(policy: OriginPolicy, cookies: Option<CookieJar>) -> Self {
+        Self { policy, cookies }
     }
+}
+
+fn url_of(uri: &http::Uri) -> Option<Url> {
+    Url::parse(&uri.to_string()).ok()
 }
 
 type SendFuture = Box<
@@ -174,8 +274,17 @@ impl WasiHttpHooks for OriginHooks {
         if let Some(value) = app_origin.as_deref().and_then(origin_header_value) {
             request.headers_mut().insert(ORIGIN, value);
         }
+        // Like a browser: the app cannot forge cookies, the jar supplies them.
+        request.headers_mut().remove(COOKIE);
+        let url = url_of(request.uri());
+        let cookies = self.cookies.clone();
+        if let (Some(jar), Some(url)) = (&cookies, &url)
+            && let Some(value) = jar.request_header(url)
+        {
+            request.headers_mut().insert(COOKIE, value);
+        }
         Box::new(async move {
-            let (response, io) = default_send_request(request, options).await?;
+            let (mut response, io) = default_send_request(request, options).await?;
             if decision == Decision::Cors {
                 let permitted = app_origin
                     .as_deref()
@@ -184,6 +293,11 @@ impl WasiHttpHooks for OriginHooks {
                     return Err(Error::HttpRequestDenied);
                 }
             }
+            if let (Some(jar), Some(url)) = (&cookies, &url) {
+                jar.store_response(url, response.headers());
+            }
+            // The app never sees Set-Cookie, so HttpOnly means what it says.
+            response.headers_mut().remove(SET_COOKIE);
             Ok((
                 response.map(BodyExt::boxed_unsync),
                 Box::new(io) as Box<dyn Future<Output = Result<(), Error>> + Send>,
@@ -269,6 +383,38 @@ mod tests {
             origin_header_value("http://localhost:3000").unwrap(),
             "http://localhost:3000"
         );
+    }
+
+    #[test]
+    fn cookie_jar_round_trips_and_persists() {
+        let dir = std::env::temp_dir().join(format!("rattery-jar-{}", std::process::id()));
+        let path = dir.join("cookies.json");
+        let url = Url::parse("http://localhost:3000/api/x").unwrap();
+
+        let jar = CookieJar::at(path.clone());
+        assert!(jar.request_header(&url).is_none());
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("session=abc; Path=/; HttpOnly"),
+        );
+        headers.append(SET_COOKIE, HeaderValue::from_static("theme=dark; Path=/"));
+        jar.store_response(&url, &headers);
+        let sent = jar.request_header(&url).unwrap();
+        let sent = sent.to_str().unwrap();
+        assert!(
+            sent.contains("session=abc") && sent.contains("theme=dark"),
+            "{sent}"
+        );
+        assert!(
+            jar.request_header(&Url::parse("http://other:3000/").unwrap())
+                .is_none()
+        );
+
+        // A new jar at the same path sees the saved cookies.
+        let reloaded = CookieJar::at(path);
+        assert!(reloaded.request_header(&url).is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

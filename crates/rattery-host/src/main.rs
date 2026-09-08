@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rattery_host::{App, AppStatus, HeadlessOptions, Script};
+use rattery_host::{App, AppStatus, CookiePolicy, HeadlessOptions, Script};
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
 #[derive(Debug, Parser)]
@@ -37,6 +37,18 @@ struct Cli {
     /// Environment variable to expose to the app (repeatable).
     #[arg(long, value_name = "KEY=VALUE", value_parser = parse_env)]
     env: Vec<(String, String)>,
+
+    /// Keep cookies for this run only, like a private browser window.
+    #[arg(long, conflicts_with_all = ["no_cookies", "cookie_jar"])]
+    incognito: bool,
+
+    /// Never send or store cookies.
+    #[arg(long, conflicts_with = "cookie_jar")]
+    no_cookies: bool,
+
+    /// Store cookies in this file instead of the default jar.
+    #[arg(long, value_name = "FILE")]
+    cookie_jar: Option<PathBuf>,
 
     /// Poll the server for a new component and restart the app in place
     /// when one is published (URL sources only).
@@ -112,6 +124,15 @@ async fn main() -> Result<()> {
         .cors(cli.cors)
         .mouse(!cli.no_mouse)
         .cache(!cli.no_cache)
+        .cookies(if cli.no_cookies {
+            CookiePolicy::Disabled
+        } else if cli.incognito {
+            CookiePolicy::Ephemeral
+        } else if let Some(path) = cli.cookie_jar {
+            CookiePolicy::File(path)
+        } else {
+            CookiePolicy::Persistent
+        })
         .watch(cli.watch);
     if let Some(origin) = cli.origin {
         app = app.origin(origin);

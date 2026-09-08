@@ -37,6 +37,14 @@
 //! themselves with an `Access-Control-Allow-Origin` header, the way browsers
 //! do. Everything else is refused before a connection is opened.
 //!
+//! ## Cookies and sessions
+//!
+//! The host keeps a cookie jar the way a browser does. The app never sees
+//! `Cookie` or `Set-Cookie` headers, so ordinary cookie-based sessions on the
+//! server work unchanged, and `HttpOnly` means what it says. By default the
+//! jar is persisted under the user's local data directory; see
+//! [`CookiePolicy`] for a private-window mode or a jar of your own.
+//!
 //! ## Headless mode
 //!
 //! [`App::headless`] swaps the real terminal for an in-memory one driven by a
@@ -59,8 +67,24 @@ use anyhow::{Context, Result};
 use url::Url;
 
 pub use headless::{Script, ScriptCommand};
-pub use http::OriginPolicy;
+pub use http::{CookieJar, OriginPolicy};
 pub use terminal::Screen;
+
+/// What happens to cookies the app's servers set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CookiePolicy {
+    /// Keep them in `rattery/cookies.json` under the user's local data
+    /// directory, shared by every app the user runs (the default).
+    #[default]
+    Persistent,
+    /// Keep them in a file of your choosing, for an embedding CLI that wants
+    /// its own sessions.
+    File(PathBuf),
+    /// Keep them in memory for this run only, like a private window.
+    Ephemeral,
+    /// Drop every cookie; the app is never logged in to anything.
+    Disabled,
+}
 
 /// Where the app component comes from.
 #[derive(Debug, Clone)]
@@ -148,6 +172,7 @@ pub struct App {
     pub(crate) mouse: bool,
     pub(crate) cache: bool,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) cookies: CookiePolicy,
     pub(crate) watch: bool,
     pub(crate) headless: Option<HeadlessOptions>,
 }
@@ -163,6 +188,7 @@ impl App {
             mouse: true,
             cache: true,
             env: Vec::new(),
+            cookies: CookiePolicy::Persistent,
             watch: false,
             headless: None,
         }
@@ -245,6 +271,12 @@ impl App {
     /// from your environment.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// How cookies are stored between requests and runs (default: persistent).
+    pub fn cookies(mut self, policy: CookiePolicy) -> Self {
+        self.cookies = policy;
         self
     }
 

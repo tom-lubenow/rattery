@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
             "/api/{*rest}",
             any(rattery::server_fn::axum::handle_server_fn),
         )
+        .layer(middleware::from_fn(session))
         .layer(middleware::from_fn_with_state(state.clone(), cors))
         .with_state(state);
 
@@ -125,6 +126,32 @@ fn app_missing(state: &AppState, err: std::io::Error) -> Response {
             ),
         )
             .into_response()
+}
+
+/// Give every client a session cookie and expose it to server functions.
+/// The rattery host keeps the cookie like a browser, so the same session
+/// comes back on the next run.
+async fn session(request: Request, next: Next) -> Response {
+    let existing = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|pair| pair.trim().strip_prefix("session=").map(str::to_owned))
+        });
+    let (id, is_new) = match existing {
+        Some(id) if !id.is_empty() => (id, false),
+        _ => (format!("{:032x}", rand::random::<u128>()), true),
+    };
+    let mut response = counter_shared::SESSION
+        .scope(id.clone(), next.run(request))
+        .await;
+    if is_new && let Ok(value) = HeaderValue::from_str(&format!("session={id}; Path=/; HttpOnly")) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
 }
 
 /// Answer requests from allowed origins with Access-Control-Allow-Origin.

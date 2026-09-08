@@ -142,7 +142,7 @@ fn ui(frame: &mut Frame, app: &App) {
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::bordered()
                 .padding(Padding::horizontal(1))
-                .title(" count lives on the server "),
+                .title(" count lives on the server, per session "),
         ),
         body,
     );

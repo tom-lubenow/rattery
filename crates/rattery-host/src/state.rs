@@ -7,7 +7,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::bindings::terminal::{CellUpdate, ClearType, Event, Host, Position, Size, WindowSize};
-use crate::http::{OriginHooks, OriginPolicy};
+use crate::http::{CookieJar, OriginHooks, OriginPolicy};
 use crate::terminal::TerminalHost;
 
 pub struct HostState {
@@ -19,12 +19,17 @@ pub struct HostState {
 }
 
 impl HostState {
-    pub fn new(wasi: WasiCtx, policy: OriginPolicy, term: TerminalHost) -> Self {
+    pub fn new(
+        wasi: WasiCtx,
+        policy: OriginPolicy,
+        cookies: Option<CookieJar>,
+        term: TerminalHost,
+    ) -> Self {
         Self {
             table: ResourceTable::new(),
             wasi,
             http: WasiHttpCtx::new(),
-            hooks: OriginHooks::new(policy),
+            hooks: OriginHooks::new(policy, cookies),
             term,
         }
     }
