@@ -18,12 +18,12 @@
 //! ```
 //!
 //! Or ship one specific app against one specific backend, with the component
-//! embedded in your binary:
+//! embedded in your binary (`rattery-build` compiles it in `build.rs`):
 //!
 //! ```ignore
 //! use rattery::App;
 //!
-//! let report = App::from_bytes(include_bytes!("../app.wasm").to_vec())
+//! let report = App::from_bytes(rattery::embed!().to_vec())
 //!     .origin("https://api.example.com")
 //!     .run_blocking()?;
 //! ```
@@ -66,6 +66,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use url::Url;
+
+/// The bytes of the app that `rattery-build` compiled in `build.rs`:
+/// `include_bytes!(env!("RATTERY_APP_WASM"))`. Pass a variable name for an
+/// app built with a custom [`env`](https://docs.rs/rattery-build).
+#[macro_export]
+macro_rules! embed {
+    () => {
+        include_bytes!(env!("RATTERY_APP_WASM"))
+    };
+    ($env:literal) => {
+        include_bytes!(env!($env))
+    };
+}
 
 pub use headless::{Script, ScriptCommand};
 pub use http::{CookieJar, OriginPolicy};

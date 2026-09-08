@@ -2,7 +2,6 @@
 //! host's kill switch (Ctrl-C three times) and headless timeout have
 //! something to interrupt.
 
-#[cfg(target_os = "wasi")]
 rattery_app::app!(run);
 
 #[cfg(target_os = "wasi")]

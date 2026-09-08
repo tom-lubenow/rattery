@@ -54,8 +54,11 @@ pub use wasi::{
 
 /// Declare the app's entry point: an `async fn(Terminal) -> Result<(), E>`.
 ///
-/// The crate must be a `cdylib` built for `wasm32-wasip2`; this macro exports
-/// the component's async `run` and wires it to your function.
+/// Put this at the root of an ordinary binary crate built for
+/// `wasm32-wasip2`. It exports the component's async `run`, wired to your
+/// function, and supplies the `main` a binary crate needs. The host never
+/// calls that `main`: the app is a component-model async task, and a
+/// synchronous `main` could not await anything.
 ///
 /// ```ignore
 /// rattery_app::app!(run);
@@ -77,15 +80,28 @@ macro_rules! app {
         }
 
         $crate::bindings::export!(__RatteryApp with_types_in $crate::bindings);
+
+        #[allow(dead_code)]
+        fn main() {
+            eprintln!("this is a rattery app; it runs inside a rattery host");
+            std::process::exit(2);
+        }
     };
 }
 
-/// On native targets there is nothing to export; the macro expands to nothing
-/// so a shared crate can still compile the app module if it wants to.
+/// On native targets there is nothing to export; the macro only supplies a
+/// `main` that says how to build the app, so a native `cargo build` of the
+/// workspace still succeeds.
 #[cfg(not(target_os = "wasi"))]
 #[macro_export]
 macro_rules! app {
-    ($run:path) => {};
+    ($run:path) => {
+        #[allow(dead_code)]
+        fn main() {
+            eprintln!("this is a rattery app; build it with `cargo build --target wasm32-wasip2`");
+            std::process::exit(2);
+        }
+    };
 }
 
 #[cfg(not(target_os = "wasi"))]

@@ -6,8 +6,6 @@ license.workspace = true
 publish = false
 description = "Rendering benchmark for rattery; run with `cargo xtask bench`"
 
-[lib]
-crate-type = ["cdylib"]
 
 [dependencies]
 rattery-app = { workspace = true }

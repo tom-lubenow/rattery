@@ -27,7 +27,7 @@ struct Args {
     #[arg(
         long,
         env = "COUNTER_APP_WASM",
-        default_value = "target/wasm32-wasip2/debug/counter_app.wasm"
+        default_value = "target/wasm32-wasip2/debug/counter-app.wasm"
     )]
     app: PathBuf,
 

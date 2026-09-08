@@ -1,0 +1,17 @@
+[package]
+name = "rattery-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A general-purpose rattery host command: the reference for what a shim looks like, and the runner behind the dev loop and benchmark"
+
+[[bin]]
+name = "rattery"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+rattery = { workspace = true }
+tokio = { workspace = true }

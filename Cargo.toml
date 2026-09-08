@@ -3,24 +3,28 @@ resolver = "3"
 members = [
     "crates/rattery",
     "crates/rattery-app",
+    "crates/rattery-build",
     "crates/rattery-macros",
     "examples/counter/shared",
     "examples/counter/app",
     "examples/counter/server",
     "examples/spin",
     "examples/bench",
+    "examples/rattery-cli",
     "xtask",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tom-lubenow/rattery"
 
 [workspace.dependencies]
-rattery-app = { path = "crates/rattery-app", version = "0.1.0" }
-rattery-macros = { path = "crates/rattery-macros", version = "0.1.0" }
+rattery = { path = "crates/rattery", version = "0.2.0" }
+rattery-app = { path = "crates/rattery-app", version = "0.2.0" }
+rattery-build = { path = "crates/rattery-build", version = "0.2.0" }
+rattery-macros = { path = "crates/rattery-macros", version = "0.2.0" }
 ratatui = { version = "0.30", default-features = false }
 server_fn = { version = "0.8", default-features = false }
 server_fn_macro = { version = "0.8", default-features = false }

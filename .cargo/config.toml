@@ -1,2 +1,3 @@
 [alias]
 xtask = "run -q -p xtask --"
+rattery = "run -q -p rattery-cli --"

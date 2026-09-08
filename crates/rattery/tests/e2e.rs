@@ -59,10 +59,7 @@ fn guest(package: &str) -> PathBuf {
             "wasm32-wasip2",
         ])
     });
-    workspace_root().join(format!(
-        "target/wasm32-wasip2/debug/{}.wasm",
-        package.replace('-', "_")
-    ))
+    workspace_root().join(format!("target/wasm32-wasip2/debug/{package}.wasm"))
 }
 
 struct Server {

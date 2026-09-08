@@ -6,8 +6,6 @@ license.workspace = true
 publish = false
 description = "A deliberately unresponsive rattery app, used to test the kill switch"
 
-[lib]
-crate-type = ["cdylib"]
 
 [dependencies]
 rattery-app = { workspace = true }

@@ -6,8 +6,6 @@ license.workspace = true
 publish = false
 description = "The counter example app; build with --target wasm32-wasip2"
 
-[lib]
-crate-type = ["cdylib"]
 
 [dependencies]
 counter-shared = { path = "../shared" }

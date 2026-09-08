@@ -25,3 +25,4 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p counter-app -p spin-app --target wasm32-wasip2 -- -D warnings
       - run: cargo test --workspace
+      - run: cargo build --manifest-path examples/counter/shim/Cargo.toml

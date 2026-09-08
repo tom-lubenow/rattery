@@ -9,7 +9,6 @@
 //! - `http`: `frames` sequential GETs of the app's origin over `wasi:http`,
 //!   to measure request latency through the host (needs `--origin`).
 
-#[cfg(target_os = "wasi")]
 rattery_app::app!(run);
 
 #[cfg(target_os = "wasi")]

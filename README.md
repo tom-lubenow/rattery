@@ -1,49 +1,60 @@
 # rattery
 
-**A sandboxed terminal host for [ratatui](https://ratatui.rs) apps delivered over HTTP.**
+**Ship a [ratatui](https://ratatui.rs) app as a thin binary that runs it sandboxed and talks
+to your server.**
 
-Write a ratatui app. Declare your backend calls as `#[rattery_app::server]` functions,
-Leptos / Dioxus fullstack style. Compile the app to a WASI 0.2 component. Serve it
-from your axum server next to the server functions. Users run it with:
+Write the app with ratatui. Declare its backend calls as `#[rattery_app::server]`
+functions, Leptos / Dioxus fullstack style. The app compiles to a WASI component; a
+few lines of `build.rs` build it and a few lines of `main.rs` embed it, so `cargo
+build` of your CLI produces one binary with the app inside, pointed at your API:
 
-```sh
-rattery https://apps.example.com/app.wasm
+```rust
+// build.rs
+rattery_build::App::new("../app").build();
+
+// main.rs
+let report = rattery::App::from_bytes(rattery::embed!().to_vec())
+    .origin("https://api.example.com")
+    .run_blocking()?;
+std::process::exit(report.exit_code());
 ```
 
-The `rattery` binary is to terminal apps what a browser is to web apps: it fetches the
-component, runs it in a [wasmtime](https://wasmtime.dev) sandbox, hands it the terminal
+The host inside that binary is to the app what a browser is to a web page: it runs
+the component in a [wasmtime](https://wasmtime.dev) sandbox, hands it the terminal
 through a small WIT interface, keeps its cookies, and lets it make HTTP requests to
-**its own origin only** unless you or the other server say otherwise. A *rattery* is an
-enclosure for rats. This one keeps a ratatui app where it can't touch your filesystem,
-your network, or your other terminals.
+**its own origin only** unless you or the other server say otherwise. The same host can
+just as well fetch the component from a URL at startup, so an app can be deployed by
+replacing one file on the server. A *rattery* is an enclosure for rats. This one keeps a
+ratatui app where it can't touch your filesystem, your network, or your other
+terminals.
 
 ## Why
 
-- **Deploy by URL.** Ship a new version by replacing one file on the server. No
-  installers, no `curl | sh`, no stale clients. With `--watch`, running apps reload.
 - **One fullstack dev model.** `#[rattery_app::server]` is `server_fn`'s `#[server]`
   with the client filled in. The same shared crate compiles into the app (calls become
   HTTP) and into the server (bodies run). It is the crate Leptos and Dioxus use, so
-  request/response, streaming responses, websockets, and cookie sessions all work as
-  they do there.
+  request/response, streaming responses, websockets, multipart uploads, and cookie
+  sessions all work as they do there.
 - **A real sandbox.** The component gets the terminal, a clock, randomness, and HTTP
-  to its origin. Nothing else is linked in. Running someone's TUI from a URL is as
-  safe as opening a web page.
-- **Embeddable.** The `rattery` crate is a library too. Put a remote TUI behind a subcommand
-  of an existing CLI, or ship one app against one endpoint with the component embedded
-  in your binary.
+  to its origin. Nothing else is linked in. Embedding someone else's TUI, or loading
+  one from a URL, is as safe as opening a web page.
+- **Embeddable first.** `rattery::App` is the product: a builder your CLI calls. There
+  is no daemon and no required command; `examples/rattery-cli` shows a general-purpose
+  runner in 150 lines if you want one.
+- **Deploy by URL, optionally.** `App::from_url` fetches the component like a browser
+  would; with `.watch(true)` a running app reloads when the server publishes a new one.
 - **Thick client.** UI state stays local, the server only answers RPC. Compare with
   SSH-app frameworks, which run the whole UI server-side and stream frames.
 
 ## How it works
 
 ```
- ┌───────────── your terminal ─────────────┐
- │ rattery (host)                          │      HTTP        ┌────────────────────┐
- │  crossterm ⇄ rattery:tui/terminal ⇄ app │ ───────────────▶ │ axum server        │
- │                (WIT)          (wasm)    │  GET /app.wasm   │  /app.wasm         │
- │  wasi:http ── origin policy, cookies ───┼────────────────▶ │  /api/* server fns │
- └─────────────────────────────────────────┘  POST /api/...   └────────────────────┘
+ ┌────────── your terminal ──────────┐
+ │ your CLI (rattery::App inside)    │      HTTP        ┌────────────────────┐
+ │  crossterm ⇄ terminal (WIT) ⇄ app │ ───────────────▶ │ axum server        │
+ │  wasi:http ── origin policy ──────┼────────────────▶ │  /api/* server fns │
+ │               cookies             │  POST /api/...   │  (/app.wasm, opt.) │
+ └───────────────────────────────────┘                  └────────────────────┘
 ```
 
 - **`crates/rattery-app/wit/rattery.wit`** is the entire contract. It mirrors ratatui's `Backend` trait
@@ -51,15 +62,19 @@ your network, or your other terminals.
   stream and a `wasi:io` pollable so an app can `await` key presses and server
   responses at the same time. A second small interface provides websockets, which
   WASI 0.2 lacks; the host applies the same origin policy and cookie jar to them.
-- **`crates/rattery`** is the `rattery` library and command: wasmtime +
-  `wasmtime-wasi` + `wasmtime-wasi-http`, crossterm behind the terminal interface, a
-  loader, the origin policy, the cookie jar, and a headless mode. `cargo install
-  rattery` gives you the command; `rattery::App` embeds it in your own CLI.
+- **`crates/rattery`** is the host library: wasmtime + `wasmtime-wasi` +
+  `wasmtime-wasi-http`, crossterm behind the terminal interface, a loader, the origin
+  policy, the cookie jar, and a headless mode. `rattery::App` is the entry point.
+- **`crates/rattery-build`** builds an app to a component from `build.rs` so a shim can
+  embed it with `rattery::embed!()`.
 - **`crates/rattery-app`** is what apps depend on: a ratatui `Backend` over the WIT
   interface, the event API, background tasks, timers, websockets, and a `server_fn`
   client that speaks `wasi:http@0.3`. On native targets it provides only what the
   server build of a shared crate needs.
 - **`crates/rattery-macros`** provides `#[rattery_app::server]`.
+- **`examples/rattery-cli`** is a general-purpose runner built on the library, used by
+  the dev loop and the benchmark, and the reference for a shim that takes everything
+  as flags. It is not published.
 
 Diffing happens inside ratatui's `Terminal` in the guest, so a frame is one `draw` call
 carrying only the cells that changed, and one `flush`.
@@ -138,14 +153,11 @@ ssr = ["rattery/ssr"]
 axum = ["ssr", "rattery/axum"]
 ```
 
-The app is a `cdylib` crate built for `wasm32-wasip2`; `rattery_app::app!` exports the
-component's entry point. Server calls run as background tasks so the UI never blocks;
-a finished task surfaces as `Event::Wake`:
-
-```toml
-[lib]
-crate-type = ["cdylib"]
-```
+The app is an ordinary binary crate built for `wasm32-wasip2`; `rattery_app::app!`
+exports the component's entry point (and supplies the placeholder `main` a binary
+needs; the host never calls it, because a synchronous `main` could not await). Server
+calls run as background tasks so the UI never blocks; a finished task surfaces as
+`Event::Wake`:
 
 ```rust
 use rattery_app::prelude::*;
@@ -197,6 +209,9 @@ a redraw, which is how the example renders a streaming response line by line.
 
 ## The host
 
+Everything below is a method on `rattery::App`; `examples/rattery-cli` exposes each as
+a flag, shown here because it reads well:
+
 ```
 rattery <URL or path>
         [--origin URL] [--allow-origin URL]... [--allow-all-origins] [--cors]
@@ -226,9 +241,9 @@ panics are readable and never corrupt the screen. Ctrl-C three times within 1.5 
 interrupts an unresponsive app, even one spinning in a tight loop. Raw mode and the
 alternate screen are always restored, including on panic.
 
-**Stats.** `--stats` prints phase timings (load, compile, instantiate, first frame) and
-terminal counters after the app exits. `cargo xtask bench` runs a rendering and request
-latency benchmark; see `docs/perf.md` for what it measures and current numbers.
+**Stats.** `Report::timings` and `Report::stats` (the `--stats` flag prints them) carry
+phase timings (load, compile, instantiate, first frame) and terminal counters. `cargo
+xtask bench` runs a rendering and request latency benchmark; see `docs/perf.md`.
 
 **Headless.** `--headless 80x24 --script keys.txt` runs the app on an in-memory screen,
 feeds it a script (`key k`, `key ctrl-c`, `type hello`, `paste`, `resize`, `sleep`,
@@ -240,19 +255,26 @@ end-to-end tests work, and it is a ready-made test harness for your own app.
 ```rust
 use rattery::{App, CookiePolicy};
 
-// A subcommand of an existing CLI that opens a remote TUI.
-let report = App::from_url("https://apps.example.com/dashboard/app.wasm")?
-    .allow_origin("https://api.example.com")
-    .cookies(CookiePolicy::File(config_dir.join("cookies.json")))
-    .run()
-    .await?;
-
-// One specific app against one specific backend, embedded in the binary.
-let report = App::from_bytes(include_bytes!("app.wasm").to_vec())
+// One specific app against one specific backend, embedded in the binary
+// (rattery-build compiled it in build.rs).
+let report = App::from_bytes(rattery::embed!().to_vec())
     .origin("https://api.example.com")
+    .cookies(CookiePolicy::File(config_dir.join("cookies.json")))
     .run_blocking()?;
 std::process::exit(report.exit_code());
+
+// A subcommand of an existing async CLI that opens a remote TUI.
+let report = App::from_url("https://apps.example.com/dashboard/app.wasm")?
+    .allow_origin("https://api.example.com")
+    .run()
+    .await?;
 ```
+
+`rattery_build::App` takes the app crate's path (and optionally a package name,
+features, or the dev profile), compiles it for `wasm32-wasip2` into a target directory
+under `OUT_DIR`, and exports the component's path as `RATTERY_APP_WASM`; changes under
+the app's `src` rebuild it. The nested build needs the target installed
+(`rustup target add wasm32-wasip2`).
 
 `App::headless` returns the snapshots in the `Report`, so an app's integration tests
 can be a few lines:

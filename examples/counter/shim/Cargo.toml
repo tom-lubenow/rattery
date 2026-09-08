@@ -1,0 +1,19 @@
+# A thin shim: one binary, the counter app inside it, pointed at one server.
+# Its own workspace, like a real shim living outside this repository would be.
+[package]
+name = "counter-shim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rattery = { path = "../../../crates/rattery" }
+
+[build-dependencies]
+rattery-build = { path = "../../../crates/rattery-build" }
+
+[workspace]
+
+# Keep the shim's own build fast; the app inside is built in release by rattery-build.
+[profile.dev.package."*"]
+opt-level = 2

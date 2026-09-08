@@ -1,5 +1,6 @@
-//! `rattery`: run a ratatui app packaged as a WASI 0.2 component inside the
-//! current terminal, with the same isolation a browser gives a web page.
+//! A general-purpose rattery host: run any app component from a URL or a
+//! file. This is what a shim looks like when it takes everything as flags;
+//! your own shim will hardcode most of it (see `examples/counter/shim`).
 
 use std::path::PathBuf;
 use std::time::Duration;
