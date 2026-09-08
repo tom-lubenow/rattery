@@ -114,12 +114,14 @@ impl Drop for Server {
     }
 }
 
+/// The big number in the counter box: the first box segment that is only digits.
 fn count_on(screen: &rattery_host::Screen) -> Option<String> {
     screen
         .lines
         .iter()
-        .map(|l| l.trim_matches(|c| c == '│' || c == ' '))
-        .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        .flat_map(|l| l.split('│'))
+        .map(str::trim)
+        .find(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit() || c == '-'))
         .map(str::to_owned)
 }
 
@@ -164,7 +166,7 @@ async fn counter_round_trip_and_state_on_server() {
         .unwrap()
         .cookies(CookiePolicy::File(jar.clone()))
         .headless(headless(
-            "sleep 1500\nkey k\nsleep 700\nkey k\nsleep 700\nsnapshot\nkey q",
+            "sleep 2500\nkey k\nsleep 700\nkey k\nsleep 1000\nsnapshot\nkey q",
             20,
         ))
         .run()
@@ -177,13 +179,23 @@ async fn counter_round_trip_and_state_on_server() {
     assert_eq!(count_on(snap).as_deref(), Some("2"), "{text}");
     assert!(snap.contains("3 calls"), "{text}");
     assert!(snap.contains("session "), "{text}");
+    // The streaming server function has been pushing a line every 500ms.
+    let ticks = snap.lines.iter().filter(|l| l.contains("tick ")).count();
+    assert!(
+        ticks >= 3,
+        "expected streamed feed lines, got {ticks}\n{text}"
+    );
+    assert!(
+        snap.contains("count 2  up"),
+        "feed should reflect the increments\n{text}"
+    );
 
     // A second run with the same cookie jar is the same session: the count
     // it sees is the one the first run left behind.
     let report = App::from_url(format!("{}/app.wasm", server.url))
         .unwrap()
         .cookies(CookiePolicy::File(jar.clone()))
-        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
@@ -199,7 +211,7 @@ async fn counter_round_trip_and_state_on_server() {
     let report = App::from_url(format!("{}/app.wasm", server.url))
         .unwrap()
         .cookies(CookiePolicy::Ephemeral)
-        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
@@ -216,7 +228,7 @@ async fn counter_round_trip_and_state_on_server() {
 async fn file_without_origin_fails_cleanly() {
     require_wasip2!();
     let report = App::from_path(guest("counter-app"))
-        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
@@ -238,7 +250,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .origin(&api_closed.url)
         .cors(true)
         .cookies(CookiePolicy::Ephemeral)
-        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
@@ -254,7 +266,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .cors(true)
         .cookies(CookiePolicy::Ephemeral)
         .headless(headless(
-            "sleep 1500\nkey k\nsleep 700\nsnapshot\nkey q",
+            "sleep 2500\nkey k\nsleep 700\nsnapshot\nkey q",
             20,
         ))
         .run()
@@ -271,7 +283,7 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .origin(&api_closed.url)
         .allow_origin(&api_closed.url)
         .cookies(CookiePolicy::Ephemeral)
-        .headless(headless("sleep 1500\nsnapshot\nkey q", 20))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
         .unwrap();
@@ -293,10 +305,10 @@ async fn watch_reloads_when_the_served_component_changes() {
             .unwrap()
             .watch(true)
             .cookies(CookiePolicy::Ephemeral)
-            .headless(headless("sleep 1500\nsnapshot", 12))
+            .headless(headless("sleep 2500\nsnapshot", 16))
             .run(),
     );
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     // Publish a different app; the running one is replaced in place.
     std::fs::copy(guest("spin-app"), &served).unwrap();
 

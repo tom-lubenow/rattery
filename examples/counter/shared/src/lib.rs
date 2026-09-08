@@ -4,6 +4,7 @@
 //! each function becomes an HTTP call, and natively inside the server with the
 //! `axum` feature, where the bodies run.
 
+use rattery::server_fn::codec::{StreamingText, TextStream};
 use rattery::{ServerFnError, server};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +39,33 @@ pub async fn slow_snapshot(delay_ms: u64) -> Result<Snapshot, ServerFnError> {
     Ok(state::snapshot())
 }
 
+/// A stream of lines from the server, one every half second, for as long as
+/// the app keeps reading. Shows that a server function can push updates.
+#[server(output = StreamingText)]
+pub async fn live_feed() -> Result<TextStream, ServerFnError> {
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    // The task-local session is only set while this handler runs; capture it
+    // before the stream outlives the request.
+    let session = state::session_id();
+    let ticks = futures::stream::unfold(0u64, move |tick| {
+        let session = session.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let snapshot = state::snapshot_for(&session);
+            let line = format!(
+                "tick {}  count {}  up {}s\n",
+                tick + 1,
+                snapshot.count,
+                snapshot.uptime_secs
+            );
+            Some((line, tick + 1))
+        }
+    });
+    Ok(TextStream::from(ticks.boxed()))
+}
+
 #[cfg(feature = "ssr")]
 mod state {
     use super::Snapshot;
@@ -54,21 +82,24 @@ mod state {
     static COUNTS: LazyLock<Mutex<HashMap<String, i64>>> = LazyLock::new(Mutex::default);
     static STARTED: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-    fn session() -> String {
+    pub fn session_id() -> String {
         SESSION
             .try_with(Clone::clone)
             .unwrap_or_else(|_| "anonymous".to_owned())
     }
 
     pub fn adjust(delta: i64) {
-        *COUNTS.lock().unwrap().entry(session()).or_default() += delta;
+        *COUNTS.lock().unwrap().entry(session_id()).or_default() += delta;
     }
 
     pub fn snapshot() -> Snapshot {
-        let session = session();
+        snapshot_for(&session_id())
+    }
+
+    pub fn snapshot_for(session: &str) -> Snapshot {
         Snapshot {
-            count: COUNTS.lock().unwrap().get(&session).copied().unwrap_or(0),
-            session,
+            count: COUNTS.lock().unwrap().get(session).copied().unwrap_or(0),
+            session: session.to_owned(),
             server_pid: std::process::id(),
             uptime_secs: STARTED.elapsed().as_secs(),
         }

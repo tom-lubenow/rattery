@@ -1,12 +1,17 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::error::Error;
+use std::rc::Rc;
 use std::time::Duration;
 
-use counter_shared::{Snapshot, adjust_count, fetch_snapshot, slow_snapshot};
+use counter_shared::{Snapshot, adjust_count, fetch_snapshot, live_feed, slow_snapshot};
+use futures::StreamExt;
 use rattery::event;
 use rattery::prelude::*;
 use rattery::ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const FEED_LINES: usize = 50;
 
 type Call = Task<Result<Snapshot, ServerFnError>>;
 
@@ -19,6 +24,10 @@ struct App {
     /// The server call in flight, if any. Starting a new one cancels it.
     pending: Option<Call>,
     spinner: usize,
+    /// Lines pushed by the server over a streaming server function.
+    feed: Rc<RefCell<VecDeque<String>>>,
+    /// The task reading the feed; dropping it closes the stream.
+    _feed_task: Option<Task<()>>,
     quit: bool,
 }
 
@@ -37,10 +46,51 @@ impl App {
                 Ok(snapshot) => {
                     self.snapshot = Some(snapshot);
                     self.last_error = None;
+                    // The first reply established our session cookie; only now
+                    // can the feed subscribe as the same session.
+                    if self._feed_task.is_none() {
+                        self.follow_feed();
+                    }
                 }
                 Err(err) => self.last_error = Some(err.to_string()),
             }
         }
+    }
+
+    /// Subscribe to the server's live feed. Each line wakes the event loop so
+    /// the panel redraws as soon as it arrives.
+    fn follow_feed(&mut self) {
+        let feed = self.feed.clone();
+        let push = move |line: String| {
+            let mut feed = feed.borrow_mut();
+            if feed.len() == FEED_LINES {
+                feed.pop_front();
+            }
+            feed.push_back(line);
+            rattery::task::wake();
+        };
+        self._feed_task = Some(rattery::task::spawn(async move {
+            let stream = match live_feed().await {
+                Ok(stream) => stream,
+                Err(err) => return push(format!("feed error: {err}")),
+            };
+            let mut stream = stream.into_inner();
+            let mut partial = String::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(text) => {
+                        partial.push_str(&text);
+                        while let Some(end) = partial.find('\n') {
+                            let line = partial[..end].to_owned();
+                            partial.drain(..=end);
+                            push(line);
+                        }
+                    }
+                    Err(err) => return push(format!("feed error: {err}")),
+                }
+            }
+            push("feed ended".to_owned());
+        }));
     }
 }
 
@@ -96,6 +146,8 @@ fn ui(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
     ])
     .areas(frame.area());
+    let [counter, feed] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body);
 
     let origin = app
         .origin
@@ -123,8 +175,11 @@ fn ui(frame: &mut Frame, app: &App) {
     };
     let detail = match &app.snapshot {
         Some(s) => format!(
-            "server pid {}  ·  up {}s  ·  {} calls",
-            s.server_pid, s.uptime_secs, app.calls
+            "session {}  ·  server pid {}  ·  up {}s  ·  {} calls",
+            &s.session[..8.min(s.session.len())],
+            s.server_pid,
+            s.uptime_secs,
+            app.calls
         ),
         None => format!("{} calls", app.calls),
     };
@@ -142,9 +197,28 @@ fn ui(frame: &mut Frame, app: &App) {
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::bordered()
                 .padding(Padding::horizontal(1))
-                .title(" count lives on the server, per session "),
+                .title(" count, per session "),
         ),
-        body,
+        counter,
+    );
+
+    let feed_height = feed.height.saturating_sub(2) as usize;
+    let feed_lines: Vec<Line> = app
+        .feed
+        .borrow()
+        .iter()
+        .rev()
+        .take(feed_height)
+        .rev()
+        .map(|line| Line::from(line.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(feed_lines).block(
+            Block::bordered()
+                .padding(Padding::horizontal(1))
+                .title(" live feed (streaming server fn) "),
+        ),
+        feed,
     );
 
     frame.render_widget(

@@ -12,6 +12,7 @@ ssr = ["rattery/ssr", "dep:tokio"]
 axum = ["ssr", "rattery/axum"]
 
 [dependencies]
+futures = { workspace = true }
 rattery = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["time", "rt"], optional = true }

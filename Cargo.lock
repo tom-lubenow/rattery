@@ -563,6 +563,7 @@ name = "counter-app"
 version = "0.1.0"
 dependencies = [
  "counter-shared",
+ "futures",
  "rattery",
 ]
 
@@ -583,6 +584,7 @@ dependencies = [
 name = "counter-shared"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "rattery",
  "serde",
  "tokio",

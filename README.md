@@ -12,20 +12,25 @@ rattery https://apps.example.com/app.wasm
 
 The `rattery` binary is to terminal apps what a browser is to web apps: it fetches the
 component, runs it in a [wasmtime](https://wasmtime.dev) sandbox, hands it the terminal
-through a small WIT interface, and lets it make HTTP requests to **its own origin only**.
-A *rattery* is an enclosure for rats. This one keeps a ratatui app where it can't
-touch your filesystem, your network, or your other terminals.
+through a small WIT interface, keeps its cookies, and lets it make HTTP requests to
+**its own origin only** unless you or the other server say otherwise. A *rattery* is an
+enclosure for rats. This one keeps a ratatui app where it can't touch your filesystem,
+your network, or your other terminals.
 
 ## Why
 
 - **Deploy by URL.** Ship a new version by replacing one file on the server. No
-  installers, no `curl | sh`, no stale clients.
+  installers, no `curl | sh`, no stale clients. With `--watch`, running apps reload.
 - **One fullstack dev model.** `#[rattery::server]` is `server_fn`'s `#[server]`
   with the client filled in. The same shared crate compiles into the app (calls become
-  HTTP) and into the server (bodies run). It is the crate Leptos and Dioxus use.
+  HTTP) and into the server (bodies run). It is the crate Leptos and Dioxus use, so
+  request/response, streaming responses, and cookie sessions all work as they do there.
 - **A real sandbox.** The component gets the terminal, a clock, randomness, and HTTP
-  to the origin it was loaded from. Nothing else is linked in. Running someone's TUI
-  from a URL is as safe as opening a web page.
+  to its origin. Nothing else is linked in. Running someone's TUI from a URL is as
+  safe as opening a web page.
+- **Embeddable.** `rattery-host` is a library too. Put a remote TUI behind a subcommand
+  of an existing CLI, or ship one app against one endpoint with the component embedded
+  in your binary.
 - **Thick client.** UI state stays local, the server only answers RPC. Compare with
   SSH-app frameworks, which run the whole UI server-side and stream frames.
 
@@ -36,7 +41,7 @@ touch your filesystem, your network, or your other terminals.
  │ rattery (host)                          │      HTTP        ┌────────────────────┐
  │  crossterm ⇄ rattery:tui/terminal ⇄ app │ ───────────────▶ │ axum server        │
  │                (WIT)          (wasm)    │  GET /app.wasm   │  /app.wasm         │
- │  wasi:http ──── same-origin policy ─────┼────────────────▶ │  /api/* server fns │
+ │  wasi:http ── origin policy, cookies ───┼────────────────▶ │  /api/* server fns │
  └─────────────────────────────────────────┘  POST /api/...   └────────────────────┘
 ```
 
@@ -45,12 +50,12 @@ touch your filesystem, your network, or your other terminals.
   stream and a `wasi:io` pollable so an app can `await` key presses and server
   responses at the same time.
 - **`crates/rattery`** is what apps depend on: a ratatui `Backend` over the WIT
-  interface, an event API, the async runtime (`wstd`), and a `server_fn` client that
-  speaks `wasi:http`. On native targets it provides only what the server build of a
-  shared crate needs.
-- **`crates/rattery-host`** is the `rattery` binary: wasmtime + `wasmtime-wasi` +
-  `wasmtime-wasi-http`, crossterm behind the terminal interface, a loader, and the
-  origin policy.
+  interface, the event API, background tasks, the async runtime (`wstd`), and a
+  `server_fn` client that speaks `wasi:http`. On native targets it provides only what
+  the server build of a shared crate needs.
+- **`crates/rattery-host`** is the `rattery` binary and the `rattery_host` library:
+  wasmtime + `wasmtime-wasi` + `wasmtime-wasi-http`, crossterm behind the terminal
+  interface, a loader, the origin policy, the cookie jar, and a headless mode.
 - **`crates/rattery-macros`** provides `#[rattery::server]`.
 
 Diffing happens inside ratatui's `Terminal` in the guest, so a frame is one `draw` call
@@ -62,19 +67,21 @@ Everything is in the nix dev shell (`direnv allow` or `nix develop`): stable Rus
 with the `wasm32-wasip2` target, `wasm-tools`, and the `wasmtime` CLI.
 
 ```sh
-# 1. build the app component
-cargo build -p counter-app --target wasm32-wasip2
+# the dev loop: build the app and the server, serve, rebuild on change
+cargo xtask dev
 
-# 2. run the server (serves /app.wasm and /api/*)
-cargo run -p counter-server
-
-# 3. in another terminal, run the app like a browser would
-cargo run -p rattery-host -- http://127.0.0.1:3000/app.wasm
+# in another terminal, run the app like a browser would; --watch reloads it
+# in place every time the component is rebuilt
+cargo run -p rattery-host -- --watch http://127.0.0.1:3000/app.wasm
 ```
 
-Rebuild the component and restart `rattery`; the server picks up the new file on the
-next request. Compiled components are cached by wasmtime, so a second start is
-instant.
+Or by hand:
+
+```sh
+cargo build -p counter-app --target wasm32-wasip2
+cargo run -p counter-server
+cargo run -p rattery-host -- http://127.0.0.1:3000/app.wasm
+```
 
 ## Writing an app
 
@@ -82,11 +89,18 @@ A shared crate holds the server functions and any types they exchange:
 
 ```rust
 // counter-shared/src/lib.rs
+use rattery::server_fn::codec::{StreamingText, TextStream};
 use rattery::{server, ServerFnError};
 
 #[server]
 pub async fn adjust_count(delta: i64) -> Result<i64, ServerFnError> {
     Ok(state::adjust(delta)) // only compiled with the `ssr` feature
+}
+
+/// A streaming response: the server pushes lines for as long as the app reads.
+#[server(output = StreamingText)]
+pub async fn live_feed() -> Result<TextStream, ServerFnError> {
+    Ok(TextStream::from(state::ticks()))
 }
 ```
 
@@ -96,23 +110,31 @@ ssr = ["rattery/ssr"]
 axum = ["ssr", "rattery/axum"]
 ```
 
-The app is an ordinary binary crate built for `wasm32-wasip2`:
+The app is an ordinary binary crate built for `wasm32-wasip2`. Server calls run as
+background tasks so the UI never blocks; a finished task surfaces as `Event::Wake`:
 
 ```rust
 use rattery::prelude::*;
-use rattery::event;
+use rattery::{event, task};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     rattery::run(app)
 }
 
 async fn app(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
-    let mut count = adjust_count(0).await?;
+    let mut count = 0;
+    let mut pending: Option<Task<Result<i64, ServerFnError>>> = Some(task::spawn(adjust_count(0)));
     loop {
         terminal.draw(|frame| frame.render_widget(count.to_string(), frame.area()))?;
         match event::next().await {
+            Event::Wake => {
+                if let Some(result) = pending.as_mut().and_then(Task::try_take) {
+                    pending = None;
+                    count = result?;
+                }
+            }
             Event::Key(key) if key.code == KeyCode::Char('q') => break Ok(()),
-            Event::Key(key) if key.code == KeyCode::Up => count = adjust_count(1).await?,
+            Event::Key(key) if key.code == KeyCode::Up => pending = Some(task::spawn(adjust_count(1))),
             _ => {}
         }
     }
@@ -127,36 +149,89 @@ Router::new()
     .route("/api/{*rest}", any(rattery::server_fn::axum::handle_server_fn))
 ```
 
-`examples/counter` is the complete version of this.
+`examples/counter` is the complete version: background calls with a spinner, a
+streaming live feed, cookie sessions with per-session state, ETags for `--watch`,
+and a CORS opt-in flag.
 
 Event types mirror crossterm's (`KeyCode::Char('q')`, `KeyModifiers::CONTROL`, ...)
-so existing ratatui code ports by changing an import. Because the app is single
-threaded and async, long server calls can run in a spawned task
-(`rattery::runtime::spawn`) while the UI keeps handling input.
+so existing ratatui code ports by changing an import. `event::next_timeout` drives
+animations; `task::wake` lets a long-running task ask for a redraw, which is how the
+example renders a streaming response line by line.
 
 ## The host
 
 ```
-rattery <URL or path> [--origin URL] [--allow-origin URL]... [--allow-all-origins]
-                      [--no-mouse] [--no-cache]
+rattery <URL or path>
+        [--origin URL] [--allow-origin URL]... [--allow-all-origins] [--cors]
+        [--incognito | --no-cookies | --cookie-jar FILE]
+        [--watch] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
+        [--headless COLSxROWS [--script FILE] [--timeout SECS]]
 ```
 
-- Loaded from a URL, the app may reach that URL's origin. `--allow-origin` adds
-  more; `--allow-all-origins` disables the check.
-- Loaded from a file, the app has no origin and server calls fail unless you pass
-  `--origin`.
-- The guest's stdout and stderr are captured and printed after it exits, so panics
-  are readable and never corrupt the screen.
-- Ctrl-C three times within 1.5 seconds interrupts an unresponsive app.
-- Raw mode and the alternate screen are always restored, including on panic.
+**Origin policy.** An app may reach its own origin: where it was loaded from, or
+`--origin` for an app loaded from a file. `--allow-origin` adds more,
+`--allow-all-origins` disables the check, and `--cors` lets other origins opt in
+themselves with `Access-Control-Allow-Origin`, the way they do for browsers. Every
+request carries an `Origin` header. Everything else is refused before a connection
+is opened.
+
+**Cookies.** The host keeps a jar the way a browser does: the app never sees `Cookie`
+or `Set-Cookie`, so ordinary cookie sessions on the server work unchanged and
+`HttpOnly` means what it says. The jar persists under the user's local data directory;
+`--incognito` keeps it in memory, `--no-cookies` drops everything, `--cookie-jar` picks
+a file.
+
+**Reload.** `--watch` polls the URL with `If-None-Match` and restarts the app in place
+when the server publishes a new component.
+
+**Safety.** The guest's stdout and stderr are captured and printed after it exits, so
+panics are readable and never corrupt the screen. Ctrl-C three times within 1.5 seconds
+interrupts an unresponsive app, even one spinning in a tight loop. Raw mode and the
+alternate screen are always restored, including on panic.
+
+**Headless.** `--headless 80x24 --script keys.txt` runs the app on an in-memory screen,
+feeds it a script (`key k`, `key ctrl-c`, `type hello`, `paste`, `resize`, `sleep`,
+`snapshot`; see `--help-script`), and prints the snapshots. This is how the repository's
+end-to-end tests work, and it is a ready-made test harness for your own app.
+
+## Embedding the host
+
+```rust
+use rattery_host::{App, CookiePolicy};
+
+// A subcommand of an existing CLI that opens a remote TUI.
+let report = App::from_url("https://apps.example.com/dashboard/app.wasm")?
+    .allow_origin("https://api.example.com")
+    .cookies(CookiePolicy::File(config_dir.join("cookies.json")))
+    .run()
+    .await?;
+
+// One specific app against one specific backend, embedded in the binary.
+let report = App::from_bytes(include_bytes!("app.wasm").to_vec())
+    .origin("https://api.example.com")
+    .run_blocking()?;
+std::process::exit(report.exit_code());
+```
+
+`App::headless` returns the snapshots in the `Report`, so an app's integration tests
+can be a few lines:
+
+```rust
+let report = App::from_url(&url)?
+    .headless(HeadlessOptions { script: Script::parse("sleep 1000\nkey k\nsnapshot\nkey q")?, ..Default::default() })
+    .run()
+    .await?;
+assert!(report.snapshots[0].contains("1"));
+```
 
 ## Status
 
-v0.1.0 is a working vertical slice: rendering, keyboard, mouse, paste, focus and
-resize events, request/response server functions, streaming responses, the origin
-policy, the loader and cache. Not yet supported: websocket server functions,
-multipart bodies, WASI 0.3 async, and publishing the crates (the WIT lives at the
-workspace root for now).
+Working: rendering, keyboard, mouse, paste, focus and resize events; request/response
+and streaming server functions; background tasks; the origin policy with allow lists
+and CORS; a persistent cookie jar; hot reload; the library API; headless mode; a
+kill switch and timeouts; end-to-end tests of all of it. Not yet: websocket server
+functions, multipart bodies, WASI 0.3 async, publishing the crates (the WIT lives at
+the workspace root for now).
 
 ## License
 
