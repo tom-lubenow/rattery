@@ -82,6 +82,7 @@ mod loader;
 mod runner;
 pub mod sanitize;
 mod state;
+mod storage;
 mod terminal;
 mod websocket;
 
@@ -100,6 +101,7 @@ pub use headless::{Script, ScriptCommand};
 pub use http::{
     CookieJar, OriginPolicy, PolicyError, PolicyGuard, RequestInfo, RequestKind, RequestPolicy,
 };
+pub use runner::precompile;
 pub use state::HostState;
 pub use terminal::{Screen, Stats};
 
@@ -117,6 +119,18 @@ pub const ABI: &str = "rattery:tui@0.2.0;cm-async;wasi:http@0.3.0";
 macro_rules! embed {
     () => {
         include_bytes!(env!("RATTERY_APP_WASM"))
+    };
+    ($env:literal) => {
+        include_bytes!(env!($env))
+    };
+}
+
+/// The precompiled app `rattery_build::App::precompile(true)` produced, for
+/// [`App::from_precompiled`]: `include_bytes!(env!("RATTERY_APP_CWASM"))`.
+#[macro_export]
+macro_rules! embed_precompiled {
+    () => {
+        include_bytes!(env!("RATTERY_APP_CWASM"))
     };
     ($env:literal) => {
         include_bytes!(env!($env))
@@ -215,6 +229,9 @@ pub enum Source {
     Path(PathBuf),
     /// Already in memory, for example via `include_bytes!`.
     Bytes(Vec<u8>),
+    /// Native code from [`precompile`], already in memory. Trusted: see
+    /// [`App::from_precompiled`].
+    Precompiled(Vec<u8>),
     /// Produced by the embedder's [`Resolver`].
     Resolver(Arc<dyn Resolver>),
 }
@@ -225,6 +242,7 @@ impl std::fmt::Debug for Source {
             Source::Url(url) => f.debug_tuple("Url").field(url).finish(),
             Source::Path(path) => f.debug_tuple("Path").field(path).finish(),
             Source::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            Source::Precompiled(bytes) => f.debug_tuple("Precompiled").field(&bytes.len()).finish(),
             Source::Resolver(_) => f.debug_tuple("Resolver").finish(),
         }
     }
@@ -274,6 +292,16 @@ pub struct Limits {
     /// Host resources (streams, requests, sockets, bodies) the app may hold
     /// at once.
     pub resources: usize,
+    /// Origin-scoped storage: total bytes of keys and values per origin.
+    pub storage_bytes: usize,
+    /// Entries per origin.
+    pub storage_entries: usize,
+    /// Longest storage key.
+    pub storage_key_bytes: usize,
+    /// Largest storage value.
+    pub storage_value_bytes: usize,
+    /// Log records accepted per second; the rest are counted and dropped.
+    pub logs_per_second: usize,
     /// wasmtime store limits: tables, table elements, memories, instances.
     pub tables: usize,
     pub table_elements: usize,
@@ -301,6 +329,11 @@ impl Default for Limits {
             paste_bytes: 1 << 20,
             message_bytes: 16 << 10,
             resources: 4096,
+            storage_bytes: 5 << 20,
+            storage_entries: 1024,
+            storage_key_bytes: 256,
+            storage_value_bytes: 1 << 20,
+            logs_per_second: 1000,
             tables: 32,
             table_elements: 1 << 20,
             memories: 8,
@@ -334,6 +367,11 @@ impl Limits {
             ("guest_output_bytes", self.guest_output_bytes),
             ("message_bytes", self.message_bytes),
             ("resources", self.resources),
+            ("storage_bytes", self.storage_bytes),
+            ("storage_entries", self.storage_entries),
+            ("storage_key_bytes", self.storage_key_bytes),
+            ("storage_value_bytes", self.storage_value_bytes),
+            ("logs_per_second", self.logs_per_second),
             ("instances", self.instances),
         ] {
             anyhow::ensure!(value > 0, "Limits::{name} must be greater than zero");
@@ -358,10 +396,55 @@ pub enum Phase {
     AppReady,
     /// A request was refused by the origin policy, the request policy, or a limit.
     RequestDenied { url: String, reason: String },
+    /// The app logged a record. `target` and `message` are already sanitised
+    /// (no control characters) and bounded by [`Limits::message_bytes`].
+    Log {
+        level: LogLevel,
+        target: String,
+        message: String,
+    },
     /// A new component is being loaded in place.
     Reloading,
     /// The app ended.
     Exited(AppStatus),
+}
+
+/// Severity of a [`Phase::Log`] record, matching the `log` crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LogLevel::Trace => "TRACE",
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+        })
+    }
+}
+
+/// Where the app's origin-scoped key-value storage lives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StoragePolicy {
+    /// One private file per origin under `rattery/storage` in the user's
+    /// local data directory (the default). An app without an origin gets
+    /// ephemeral storage.
+    #[default]
+    Persistent,
+    /// One private file per origin under this directory.
+    Dir(PathBuf),
+    /// Kept in memory for this run only.
+    Ephemeral,
+    /// Every write fails with `disabled`.
+    Disabled,
 }
 
 /// Options for running without a real terminal.
@@ -485,6 +568,7 @@ pub struct App {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) location: Option<String>,
     pub(crate) cookies: CookiePolicy,
+    pub(crate) storage: StoragePolicy,
     pub(crate) watch: bool,
     pub(crate) headless: Option<HeadlessOptions>,
     pub(crate) limits: Limits,
@@ -506,6 +590,7 @@ impl App {
             env: Vec::new(),
             location: None,
             cookies: CookiePolicy::Persistent,
+            storage: StoragePolicy::Persistent,
             watch: false,
             headless: None,
             limits: Limits::default(),
@@ -538,6 +623,21 @@ impl App {
     /// bytes with [`inspect`] first if you want a diagnosis before running.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self::new(Source::Bytes(bytes.into()))
+    }
+
+    /// A component already compiled to native code by [`precompile`] (or
+    /// `rattery_build::App::precompile`), so startup skips compilation.
+    ///
+    /// # Safety
+    ///
+    /// The bytes are executed as native code. They must come from
+    /// [`precompile`] of the same rattery version and target, and must not
+    /// have been tampered with since; wasmtime checks the header, engine
+    /// settings, and target, but cannot verify the code itself. Embed them at
+    /// build time (`embed_precompiled!`) rather than loading them from
+    /// anywhere an attacker could write.
+    pub unsafe fn from_precompiled(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::new(Source::Precompiled(bytes.into()))
     }
 
     /// An app component the embedder retrieves itself; with
@@ -607,6 +707,12 @@ impl App {
     /// How cookies are stored between requests and runs (default: persistent).
     pub fn cookies(mut self, policy: CookiePolicy) -> Self {
         self.cookies = policy;
+        self
+    }
+
+    /// Where the app's key-value storage lives (default: persistent, per origin).
+    pub fn storage(mut self, policy: StoragePolicy) -> Self {
+        self.storage = policy;
         self
     }
 

@@ -334,6 +334,10 @@ pub struct Stats {
     pub first_draw: Option<Duration>,
     /// The most linear memory the app had in use at once, in bytes.
     pub memory_peak: usize,
+    /// Log records delivered to the embedder.
+    pub logs: u64,
+    /// Log records dropped by the rate limit.
+    pub logs_dropped: u64,
 }
 
 /// The text of a headless screen.
@@ -417,6 +421,8 @@ pub struct TerminalHost {
     started: Instant,
     on_phase: Option<PhaseHook>,
     ready_reported: bool,
+    /// Sliding one-second window for the log rate limit.
+    log_window: (Instant, usize),
 }
 
 impl TerminalHost {
@@ -441,6 +447,7 @@ impl TerminalHost {
             started: Instant::now(),
             on_phase: None,
             ready_reported: false,
+            log_window: (Instant::now(), 0),
         }
     }
 
@@ -464,6 +471,7 @@ impl TerminalHost {
             started: Instant::now(),
             on_phase: None,
             ready_reported: false,
+            log_window: (Instant::now(), 0),
         }
     }
 
@@ -642,6 +650,45 @@ impl TerminalHost {
     /// Count an event delivered through `next-event`.
     pub fn note_event(&mut self) {
         self.stats.events += 1;
+    }
+
+    /// A log record from the app: sanitised, bounded, rate limited, and
+    /// handed to the embedder.
+    pub fn log(
+        &mut self,
+        level: crate::LogLevel,
+        target: &str,
+        message: &str,
+        limits: &crate::Limits,
+    ) {
+        let now = Instant::now();
+        if now.duration_since(self.log_window.0) >= Duration::from_secs(1) {
+            self.log_window = (now, 0);
+        }
+        if self.log_window.1 >= limits.logs_per_second {
+            self.stats.logs_dropped += 1;
+            return;
+        }
+        self.log_window.1 += 1;
+        self.stats.logs += 1;
+        if let Some(hook) = &self.on_phase {
+            let bound = |s: &str| {
+                let mut text = sanitize::text(s);
+                if text.len() > limits.message_bytes {
+                    let mut cut = limits.message_bytes;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text.truncate(cut);
+                }
+                text
+            };
+            hook(Phase::Log {
+                level,
+                target: bound(target),
+                message: bound(message),
+            });
+        }
     }
 
     /// The app declared itself ready.

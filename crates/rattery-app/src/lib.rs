@@ -33,6 +33,7 @@
 //! provides only what the server build of a shared crate needs: the macro,
 //! `server_fn`, and a stub client.
 
+pub use log;
 pub use ratatui;
 pub use rattery_macros::server;
 pub use server_fn;
@@ -53,7 +54,7 @@ pub use wasi::__run_app;
 #[cfg(target_os = "wasi")]
 pub use wasi::{
     Terminal, backend::RatteryBackend, bindings, client::ServerFnClient, location, origin, ready,
-    runtime, set_title, task, time, websocket,
+    runtime, set_title, storage, task, time, websocket,
 };
 
 /// Declare the app's entry point: an `async fn(Terminal) -> Result<(), E>`.

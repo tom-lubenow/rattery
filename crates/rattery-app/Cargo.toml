@@ -22,6 +22,7 @@ rattery-macros = { workspace = true }
 server_fn = { workspace = true }
 ratatui = { workspace = true, features = ["std", "all-widgets", "underline-color", "macros"] }
 bitflags = "2"
+log = "0.4"
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }

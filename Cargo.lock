@@ -2718,6 +2718,8 @@ dependencies = [
  "http-body-util",
  "ratatui",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
@@ -2739,6 +2741,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "log",
  "multer",
  "ratatui",
  "rattery-macros",
@@ -2751,6 +2754,9 @@ dependencies = [
 [[package]]
 name = "rattery-build"
 version = "0.2.0"
+dependencies = [
+ "rattery",
+]
 
 [[package]]
 name = "rattery-cli"

@@ -10,6 +10,9 @@
 //!   to measure request latency through the host (needs `--origin`).
 //! - `evil`: tries to inject escape sequences through cells, the title, and
 //!   stdout, then exits; the host must contain all of it.
+//! - `storage`: exercises origin-scoped storage and logging: bumps a run
+//!   counter, tries to exceed the quota, logs a record with an escape sequence
+//!   in it, then floods the log to hit the rate limit.
 
 rattery_app::app!(run);
 
@@ -123,6 +126,31 @@ mod bench {
         let Params { frames, mode } = params();
         if mode == "http" {
             return http_bench(frames).await;
+        }
+        if mode == "storage" {
+            use rattery_app::storage;
+            let runs = storage::get_string("runs")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0)
+                + 1;
+            storage::set_string("runs", &runs.to_string())?;
+            let (used, quota) = storage::usage();
+            let big = storage::set("big", &vec![0; quota as usize + 1]);
+            let many = (0..10_000)
+                .map(|i| storage::set(&format!("k{i}"), &[]))
+                .find(Result::is_err);
+            rattery_app::log::warn!("escape \u{1b}]0;pwned\u{7} in a log line");
+            for i in 0..3000 {
+                rattery_app::log::trace!("flood {i}");
+            }
+            println!(
+                "storage runs={runs} used={used} quota={quota} big={big:?} many={many:?} keys={}",
+                storage::keys().len()
+            );
+            storage::clear();
+            storage::set_string("runs", &runs.to_string())?;
+            drop(terminal);
+            return Ok(());
         }
         if mode == "evil" {
             // A hostile app skips ratatui (whose buffer refuses such symbols)

@@ -352,7 +352,7 @@ fn load_store(path: &Path) -> Result<CookieStore> {
 
 /// Run `f` holding the jar's lock file exclusively: one lock for readers and
 /// writers, so a load-modify-save is a transaction.
-fn with_jar_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn with_jar_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let parent = path
         .parent()
         .context("cookie jar has no parent directory")?;
@@ -371,14 +371,14 @@ fn with_jar_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     result
 }
 
-fn is_symlink(path: &Path) -> bool {
+pub(crate) fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
 }
 
 /// Open for reading without following a symbolic link at the final component.
-fn open_no_follow(path: &Path) -> Option<std::fs::File> {
+pub(crate) fn open_no_follow(path: &Path) -> Option<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -406,7 +406,7 @@ fn libc_o_nofollow() -> i32 {
 /// Write `path` privately and atomically: owner-only file, a temporary file
 /// synced and renamed into place, and the directory synced afterwards. The
 /// caller holds the jar lock.
-fn save_private(
+pub(crate) fn save_private(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {

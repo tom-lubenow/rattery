@@ -14,6 +14,8 @@ use crate::{Limits, Resolved, Resolver, Source};
 
 pub struct Loaded {
     pub bytes: Vec<u8>,
+    /// `bytes` is native code from [`crate::precompile`], not a component.
+    pub precompiled: bool,
     /// The app's own origin, if it has one. For a URL, the origin of the
     /// final URL after redirects, not the one requested.
     pub origin: Option<String>,
@@ -46,6 +48,7 @@ pub async fn load(source: &Source, limits: &Limits) -> Result<Loaded> {
             check_size(bytes.len() as u64, limits, &path.display().to_string())?;
             Ok(Loaded {
                 bytes,
+                precompiled: false,
                 origin: None,
                 location: None,
                 description: path.display().to_string(),
@@ -53,10 +56,11 @@ pub async fn load(source: &Source, limits: &Limits) -> Result<Loaded> {
                 last_modified: None,
             })
         }
-        Source::Bytes(bytes) => {
+        Source::Bytes(bytes) | Source::Precompiled(bytes) => {
             check_size(bytes.len() as u64, limits, "the embedded component")?;
             Ok(Loaded {
                 bytes: bytes.clone(),
+                precompiled: matches!(source, Source::Precompiled(_)),
                 origin: None,
                 location: None,
                 description: format!("{} bytes in memory", bytes.len()),
@@ -82,6 +86,7 @@ pub fn from_resolved(resolved: Resolved, limits: &Limits) -> Result<Loaded> {
         "the resolved component",
     )?;
     Ok(Loaded {
+        precompiled: false,
         bytes: resolved.bytes,
         origin: resolved.origin,
         location: resolved.location,
@@ -182,6 +187,7 @@ pub async fn fetch_if_changed(
         return Ok(None);
     }
     Ok(Some(Loaded {
+        precompiled: false,
         bytes,
         origin: Some(origin_of(&final_url)),
         location: Some(final_url.to_string()),

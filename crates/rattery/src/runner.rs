@@ -13,8 +13,11 @@ use crate::bindings::App as GuestApp;
 use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::{HostState, HostStateConfig};
+use crate::storage::Storage;
 use crate::terminal::{Interrupt, Interrupter, Screen, Session, Tasks, TerminalHost};
-use crate::{App, AppStatus, CookiePolicy, Phase, Report, Source, bindings, headless};
+use crate::{
+    App, AppStatus, CookiePolicy, Phase, Report, Source, StoragePolicy, bindings, headless,
+};
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(750);
 
@@ -87,11 +90,8 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         CookiePolicy::Disabled => None,
     };
 
-    let mut config = Config::new();
-    config
-        .epoch_interruption(true)
-        .wasm_component_model_async(true);
-    if app.cache {
+    let mut config = engine_config();
+    if app.cache && !loaded.precompiled {
         let cache = Cache::from_file(None)
             .map_err(anyhow::Error::from)
             .context("failed to configure the compile cache")?;
@@ -114,6 +114,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     bindings::terminal::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
     bindings::websocket::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
+    bindings::storage::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;
     for extension in app.extensions {
         extension(&mut linker).context("a host extension failed to register")?;
     }
@@ -206,6 +207,17 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         }
     }
 
+    // Storage is keyed by the app's origin; without one it cannot persist.
+    let mut storage = match (&app.storage, &app_origin) {
+        (StoragePolicy::Disabled, _) => Storage::disabled(),
+        (StoragePolicy::Ephemeral, _) | (_, None) => Storage::ephemeral(&limits),
+        (StoragePolicy::Dir(dir), Some(origin)) => Storage::persistent(dir, origin, &limits)?,
+        (StoragePolicy::Persistent, Some(origin)) => match storage_dir() {
+            Some(dir) => Storage::persistent(&dir, origin, &limits)?,
+            None => Storage::ephemeral(&limits),
+        },
+    };
+
     let mut stdout_all = String::new();
     let mut stderr_all = String::new();
     let mut stats;
@@ -227,6 +239,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             cookies: cookies.clone(),
             request_policy: app.request_policy.clone(),
             term,
+            storage,
             limits: limits.clone(),
             interrupter: interrupter.clone(),
             on_phase: on_phase.clone(),
@@ -259,6 +272,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         // Nothing else keeps extension state; it stays with us across reloads.
         let parts = state.into_parts();
         term = parts.term;
+        storage = parts.storage;
         ext = parts.ext;
         stats = term.stats();
         stats.memory_peak = parts.memory_peak;
@@ -340,6 +354,10 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     })
 }
 
+fn storage_dir() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "rattery").map(|d| d.data_local_dir().join("storage"))
+}
+
 /// Append to a text kept within `max` bytes in total: the oldest output goes.
 fn append_bounded(kept: &mut String, more: &str, max: usize) {
     kept.push_str(more);
@@ -376,7 +394,49 @@ fn truncate(mut text: String, max: usize) -> String {
     text
 }
 
+/// The engine settings every rattery host uses; precompiled components must
+/// come from the same settings, so [`precompile`] shares them.
+pub(crate) fn engine_config() -> Config {
+    let mut config = Config::new();
+    config
+        .epoch_interruption(true)
+        .wasm_component_model_async(true);
+    config
+}
+
+/// Compile a component to native code for `target` (the host when `None`),
+/// for [`crate::App::from_precompiled`]. When a target is named, the host's
+/// CPU features are not assumed, so the output runs on any machine of that
+/// triple.
+pub fn precompile(component: &[u8], target: Option<&str>) -> Result<Vec<u8>> {
+    let mut config = engine_config();
+    if let Some(target) = target {
+        config
+            .target(target)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("cannot compile for target {target}"))?;
+    }
+    let engine = Engine::new(&config)?;
+    engine
+        .precompile_component(component)
+        .map_err(anyhow::Error::from)
+        .context("the bytes are not a valid component")
+}
+
 fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {
+    if loaded.precompiled {
+        // SAFETY: the embedder vouched for these bytes by using
+        // `App::from_precompiled`; wasmtime still checks the header, the
+        // engine settings, and the target before trusting the code inside.
+        return unsafe { Component::deserialize(engine, &loaded.bytes) }
+            .map_err(anyhow::Error::from)
+            .with_context(|| {
+                format!(
+                    "{} is not a component precompiled for this host and rattery version",
+                    loaded.description
+                )
+            });
+    }
     Component::new(engine, &loaded.bytes)
         .map_err(anyhow::Error::from)
         .with_context(|| format!("{} is not a valid component", loaded.description))

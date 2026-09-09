@@ -8,7 +8,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Report, Script};
+use rattery::{
+    App, AppStatus, CookiePolicy, HeadlessOptions, LogLevel, Phase, Report, Script, StoragePolicy,
+};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -555,4 +557,207 @@ async fn timeout_stops_an_app_waiting_for_input() {
         .await
         .unwrap();
     assert_eq!(report.status, AppStatus::TimedOut, "{}", dump(&report));
+}
+
+type Logs = std::sync::Arc<Mutex<Vec<(LogLevel, String, String)>>>;
+
+/// Collect the app's log records through the phase hook.
+fn log_sink() -> (Logs, impl Fn(Phase) + Send + Sync + 'static) {
+    let logs = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    (logs, move |phase| {
+        if let Phase::Log {
+            level,
+            target,
+            message,
+        } = phase
+        {
+            sink.lock().unwrap().push((level, target, message));
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_is_per_origin_and_persists_across_runs() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let dir = std::env::temp_dir().join(format!("rattery-e2e-storage-{}", std::process::id()));
+    let launch = |snap: &rattery::Screen| -> Option<u64> {
+        let line = snap.lines.iter().find(|l| l.contains("launch "))?;
+        let rest = line.split("launch ").nth(1)?;
+        rest.split_whitespace().next()?.parse().ok()
+    };
+
+    for expected in [1, 2] {
+        let (logs, sink) = log_sink();
+        let report = App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .cookies(CookiePolicy::Ephemeral)
+            .storage(StoragePolicy::Dir(dir.clone()))
+            .on_phase(sink)
+            .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
+            .run()
+            .await
+            .unwrap();
+        let text = dump(&report);
+        assert_eq!(report.status, AppStatus::Exited(0), "{text}");
+        assert_eq!(launch(&report.snapshots[0]), Some(expected), "{text}");
+        let logs = logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|(level, target, message)| *level == LogLevel::Info
+                    && target == "counter_app::app"
+                    && *message == format!("launch {expected} from Some({:?})", server.url)),
+            "{logs:?}\n{text}"
+        );
+        assert!(
+            logs.iter().any(|(_, _, m)| m.starts_with("count is ")),
+            "{logs:?}"
+        );
+        assert_eq!(report.stats.logs, logs.len() as u64, "{text}");
+        assert_eq!(report.stats.logs_dropped, 0, "{text}");
+    }
+
+    // Ephemeral storage starts empty every run; a different origin is a
+    // different store even under the same directory.
+    let report = App::from_url(format!("{}/app.wasm", server.url))
+        .unwrap()
+        .cookies(CookiePolicy::Ephemeral)
+        .storage(StoragePolicy::Ephemeral)
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(launch(&report.snapshots[0]), Some(1), "{}", dump(&report));
+    let report = App::from_path(guest("counter-app"))
+        .origin(&server.url)
+        .cookies(CookiePolicy::Ephemeral)
+        .storage(StoragePolicy::Dir(dir.clone()))
+        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(
+        launch(&report.snapshots[0]),
+        Some(3),
+        "same origin, same store\n{}",
+        dump(&report)
+    );
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    let files: Vec<_> = files
+        .into_iter()
+        .filter(|f| f.to_string_lossy().ends_with(".json"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_quotas_and_log_limits_hold() {
+    require_wasip2!();
+    let (logs, sink) = log_sink();
+    let limits = rattery::Limits {
+        storage_bytes: 4096,
+        storage_entries: 64,
+        logs_per_second: 100,
+        ..rattery::Limits::default()
+    };
+    let run = |storage: StoragePolicy| {
+        App::from_path(guest("bench-app"))
+            .origin("http://storage.test")
+            .location("http://storage.test/app.wasm?mode=storage")
+            .cookies(CookiePolicy::Ephemeral)
+            .storage(storage)
+            .limits(limits.clone())
+    };
+    let report = run(StoragePolicy::Ephemeral)
+        .on_phase(sink)
+        .headless(headless("sleep 3000", 10))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::Exited(0), "{text}");
+    assert!(
+        report.stdout.contains("storage runs=1 used=5 quota=4096 big=Err(QuotaExceeded) many=Some(Err(QuotaExceeded)) keys=64"),
+        "{text}"
+    );
+    let logs = std::mem::take(&mut *logs.lock().unwrap());
+    let warn = logs
+        .iter()
+        .find(|(level, _, _)| *level == LogLevel::Warn)
+        .unwrap();
+    assert_eq!(warn.1, "bench_app::bench");
+    assert!(
+        !warn.2.contains('\u{1b}') && warn.2.contains("\\u{1b}]0;pwned"),
+        "{warn:?}"
+    );
+    assert_eq!(logs.len(), 100, "rate limit\n{text}");
+    assert_eq!(report.stats.logs_dropped, 2901, "{text}");
+
+    // Disabled storage refuses writes, so the app's `?` fails it.
+    let report = run(StoragePolicy::Disabled)
+        .headless(headless("sleep 3000", 10))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::Exited(1), "{text}");
+    assert!(report.stderr.contains("storage is disabled"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn precompiled_components_skip_compilation() {
+    require_wasip2!();
+    let wasm = std::fs::read(guest("bench-app")).unwrap();
+    let native = rattery::precompile(&wasm, None).unwrap();
+    let run = |app: App| async move {
+        app.location("bench://local/app.wasm?mode=sparse&frames=5")
+            .cookies(CookiePolicy::Ephemeral)
+            .cache(false)
+            .headless(headless("sleep 2000", 10))
+            .run()
+            .await
+            .unwrap()
+    };
+    // SAFETY: produced a few lines up by `precompile`.
+    let fast = run(unsafe { App::from_precompiled(native.clone()) }).await;
+    let slow = run(App::from_bytes(wasm.clone())).await;
+    eprintln!(
+        "compile: {:?} precompiled vs {:?} from source",
+        fast.timings.compile, slow.timings.compile
+    );
+    assert_eq!(fast.status, AppStatus::Exited(0), "{}", dump(&fast));
+    assert!(
+        fast.stdout.contains("bench mode=sparse frames=5"),
+        "{}",
+        dump(&fast)
+    );
+    assert!(
+        fast.timings.compile * 10 < slow.timings.compile,
+        "deserialising should be much cheaper than compiling: {:?} vs {:?}",
+        fast.timings.compile,
+        slow.timings.compile
+    );
+
+    // Mixing the two up fails cleanly before anything runs.
+    let err = run_err(App::from_bytes(native.clone())).await;
+    assert!(err.contains("not a valid component"), "{err}");
+    // SAFETY: a wasm binary is refused by the header check; nothing executes.
+    let err = run_err(unsafe { App::from_precompiled(wasm) }).await;
+    assert!(err.contains("not a component precompiled"), "{err}");
+}
+
+async fn run_err(app: App) -> String {
+    let err = app
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless("sleep 100", 5))
+        .run()
+        .await
+        .expect_err("should fail");
+    format!("{err:#}")
 }

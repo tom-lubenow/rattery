@@ -38,7 +38,24 @@ struct App {
     pings: u32,
     /// From `?title=` in the URL the app was loaded from.
     title: String,
+    /// How many times this app has been launched from this origin, kept in
+    /// the host's origin-scoped storage.
+    launches: u64,
     quit: bool,
+}
+
+/// Bump the launch counter in storage; the count survives runs like
+/// `localStorage` does in a browser.
+fn count_launch() -> u64 {
+    use rattery_app::storage;
+    let launches = storage::get_string("launches")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    if let Err(err) = storage::set_string("launches", &launches.to_string()) {
+        rattery_app::log::warn!("could not store the launch count: {err:?}");
+    }
+    launches
 }
 
 impl App {
@@ -54,6 +71,11 @@ impl App {
             self.calls += 1;
             match result {
                 Ok(snapshot) => {
+                    rattery_app::log::info!(
+                        "count is {} after {} calls",
+                        snapshot.count,
+                        self.calls
+                    );
                     self.snapshot = Some(snapshot);
                     self.last_error = None;
                     // The first reply established our session cookie; only now
@@ -63,7 +85,10 @@ impl App {
                         self.open_chat();
                     }
                 }
-                Err(err) => self.last_error = Some(err.to_string()),
+                Err(err) => {
+                    rattery_app::log::error!("server call failed: {err}");
+                    self.last_error = Some(err.to_string());
+                }
             }
         }
     }
@@ -182,8 +207,10 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
     let mut app = App {
         origin: rattery_app::origin(),
         title,
+        launches: count_launch(),
         ..App::default()
     };
+    rattery_app::log::info!("launch {} from {:?}", app.launches, app.origin);
     app.start(fetch_snapshot());
 
     while !app.quit {
@@ -261,13 +288,14 @@ fn ui(frame: &mut Frame, app: &App) {
     };
     let detail = match &app.snapshot {
         Some(s) => format!(
-            "session {}  ·  server pid {}  ·  up {}s  ·  {} calls",
+            "session {}  ·  server pid {}  ·  up {}s  ·  {} calls  ·  launch {}",
             &s.session[..8.min(s.session.len())],
             s.server_pid,
             s.uptime_secs,
-            app.calls
+            app.calls,
+            app.launches
         ),
-        None => format!("{} calls", app.calls),
+        None => format!("{} calls  ·  launch {}", app.calls, app.launches),
     };
     let mut lines = vec![
         Line::from(""),

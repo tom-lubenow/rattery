@@ -16,9 +16,11 @@ use wasmtime::component::{Accessor, HasSelf, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
+use crate::bindings::storage::{self, StorageError};
 use crate::bindings::terminal::{self, CellUpdate, ClearType, Event, Position, Size, WindowSize};
 use crate::bindings::websocket;
 use crate::http::{CookieJar, OriginHooks, OriginPolicy, RequestPolicy};
+use crate::storage::Storage;
 use crate::terminal::{Interrupt, Interrupter, PhaseHook, TerminalHost};
 use crate::websocket::WsSocket;
 use crate::{Limits, Phase};
@@ -26,6 +28,7 @@ use crate::{Limits, Phase};
 /// What survives a run of the store.
 pub struct RunParts {
     pub term: TerminalHost,
+    pub storage: Storage,
     pub ext: HashMap<TypeId, Box<dyn Any + Send>>,
     pub memory_peak: usize,
     /// Reaps finished connection tasks continuously; `close` + `wait` it.
@@ -134,6 +137,7 @@ pub struct HostState {
     cookies: Option<CookieJar>,
     request_policy: Option<Arc<dyn RequestPolicy>>,
     term: TerminalHost,
+    storage: Storage,
     limits: Limits,
     limiter: AggregateLimiter,
     cpu: CpuBudget,
@@ -153,6 +157,7 @@ pub struct HostStateConfig {
     pub cookies: Option<CookieJar>,
     pub request_policy: Option<Arc<dyn RequestPolicy>>,
     pub term: TerminalHost,
+    pub storage: Storage,
     pub limits: Limits,
     pub interrupter: Arc<Interrupter>,
     pub on_phase: Option<PhaseHook>,
@@ -167,6 +172,7 @@ impl HostState {
             cookies,
             request_policy,
             term,
+            storage,
             limits,
             interrupter,
             on_phase,
@@ -194,6 +200,7 @@ impl HostState {
             cookies,
             request_policy,
             term,
+            storage,
             limits,
             limiter,
             cpu: CpuBudget {
@@ -218,6 +225,7 @@ impl HostState {
         let websocket_tasks = self.websocket_tasks;
         RunParts {
             term: self.term,
+            storage: self.storage,
             ext: self.ext,
             memory_peak: self.limiter.memory_peak(),
             websocket_tasks,
@@ -367,6 +375,55 @@ impl terminal::Host for HostState {
     async fn ready(&mut self) -> wasmtime::Result<()> {
         self.term.app_ready();
         Ok(())
+    }
+
+    async fn log(
+        &mut self,
+        level: terminal::LogLevel,
+        target: String,
+        message: String,
+    ) -> wasmtime::Result<()> {
+        let level = match level {
+            terminal::LogLevel::Trace => crate::LogLevel::Trace,
+            terminal::LogLevel::Debug => crate::LogLevel::Debug,
+            terminal::LogLevel::Info => crate::LogLevel::Info,
+            terminal::LogLevel::Warn => crate::LogLevel::Warn,
+            terminal::LogLevel::Error => crate::LogLevel::Error,
+        };
+        self.term.log(level, &target, &message, &self.limits);
+        Ok(())
+    }
+}
+
+impl storage::Host for HostState {
+    async fn get(&mut self, key: String) -> wasmtime::Result<Option<Vec<u8>>> {
+        Ok(self.storage.get(&key))
+    }
+
+    async fn set(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> wasmtime::Result<Result<(), StorageError>> {
+        Ok(self.storage.set(key, value))
+    }
+
+    async fn remove(&mut self, key: String) -> wasmtime::Result<()> {
+        self.storage.remove(&key);
+        Ok(())
+    }
+
+    async fn keys(&mut self) -> wasmtime::Result<Vec<String>> {
+        Ok(self.storage.keys())
+    }
+
+    async fn clear(&mut self) -> wasmtime::Result<()> {
+        self.storage.clear();
+        Ok(())
+    }
+
+    async fn usage(&mut self) -> wasmtime::Result<(u64, u64)> {
+        Ok(self.storage.usage())
     }
 }
 

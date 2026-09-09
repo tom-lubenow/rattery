@@ -10,7 +10,7 @@ publish = false
 rattery = { path = "../../../crates/rattery" }
 
 [build-dependencies]
-rattery-build = { path = "../../../crates/rattery-build" }
+rattery-build = { path = "../../../crates/rattery-build", features = ["precompile"] }
 
 [workspace]
 

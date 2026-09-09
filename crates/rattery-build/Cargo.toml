@@ -9,4 +9,10 @@ description = "Build a rattery app to a WASI component from build.rs, so a shim 
 keywords = ["ratatui", "wasm", "wasi", "build-dependencies"]
 categories = ["development-tools::build-utils"]
 
+[features]
+## Compile the app to native code at build time as well, for
+## `rattery::App::from_precompiled` (pulls in `rattery`, i.e. wasmtime).
+precompile = ["dep:rattery"]
+
 [dependencies]
+rattery = { workspace = true, optional = true }

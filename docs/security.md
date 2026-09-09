@@ -72,6 +72,8 @@ ordinary TUI and can be tightened for untrusted apps.
 | request body | 64 MiB | `Limited` body |
 | response body | 64 MiB | `Limited` body |
 | guest stdout / stderr | 1 MiB each, in total across reloads | bounded pipe, oldest output dropped |
+| storage per origin | 5 MiB, 1024 entries, 256 B keys, 1 MiB values | `set` returns `quota-exceeded` / `too-large` |
+| log records | 1000 per second | the rest are dropped and counted in `Stats::logs_dropped`; target and message are sanitised and cut at `message_bytes` |
 | error and trap messages | 16 KiB | truncated |
 | `append-lines` | one screen | clamped to the screen height |
 | tables, memories, instances | 32, 8, 16 | wasmtime store limiter |
@@ -80,6 +82,28 @@ The epoch ticks continuously from a host task, not only when the host has
 something to say, so a tight loop in the guest is interrupted within a tick,
 and every tick yields to the host so input, timeouts, the kill switch
 (Ctrl-C three times), and reloads stay responsive.
+
+## Storage
+
+Origin-scoped storage is the terminal's `localStorage`. The host keys it on
+the app's normalised origin, so two apps served from the same origin share a
+store and nothing else can read it; an app without an origin (a file run
+without `--origin`) gets memory that is forgotten when it exits. On disk it
+is one JSON file per origin under `rattery/storage` in the user's local data
+directory (or the directory `StoragePolicy::Dir` names), created with mode
+0600, written atomically through a temporary file, serialised with the same
+lock file discipline as the cookie jar, and never followed through a symlink.
+Values are bytes; the app decides what they mean. `StoragePolicy::Disabled`
+makes every write fail with `disabled` while reads return nothing.
+
+## Logs
+
+`rattery_app` installs a `log` backend that hands records to the host, which
+sanitises the target and message (control characters are shown escaped),
+bounds them by `message_bytes`, rate-limits them, and delivers them to the
+embedder as `Phase::Log`. The host writes nothing itself: on a real terminal
+the embedder should send them to a file, a socket, or a pane of its own, never
+to the screen the app is drawing on.
 
 ## Process hygiene
 
@@ -103,7 +127,11 @@ arrives as `Phase::AppReady`.
 version, the component-model async ABI, and the WASI HTTP version. Record it
 in release metadata, and run `rattery::inspect` on externally obtained bytes
 before shipping them; it reports imports, exports, extension imports the host
-must provide, and whether the component targets this ABI. The async component
+must provide, and whether the component targets this ABI. A precompiled
+component (`rattery::precompile`, `App::from_precompiled`) is native code and
+is trusted as such: wasmtime checks its header, engine settings, and target
+triple, not its contents, so precompile at build time and embed the result;
+never deserialise bytes fetched at run time. The async component
 ABI and `wasi:http@0.3` are still experimental in wasmtime; rattery pins the
 wasmtime major version and tracks it. Minimum supported Rust is 1.95.
 

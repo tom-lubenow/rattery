@@ -193,9 +193,16 @@ Router::new()
     .route("/api/{*rest}", any(rattery_app::server_fn::axum::handle_server_fn))
 ```
 
+Two more things a browser gives a page, the host gives an app. `rattery_app::storage`
+is `localStorage`: a small key-value store scoped to the app's origin that survives
+runs, with a quota (`get`, `set`, `remove`, `keys`, `clear`, `usage`, plus
+`get_string`/`set_string`). The `log` facade is wired to the host, so `log::info!`
+and friends leave the sandbox as records the embedder can write wherever it likes,
+instead of scribbling on the terminal.
+
 `examples/counter` is the complete version: background calls with a spinner, a
 streaming live feed, a websocket echo, a multipart upload, cookie sessions with
-per-session state, and ETags for `--watch`. `rattery_app::websocket::WebSocket` is also usable
+per-session state, a launch counter in storage, and ETags for `--watch`. `rattery_app::websocket::WebSocket` is also usable
 directly, outside server functions.
 
 `rattery_app::location()` returns the URL the app was loaded from, query string included,
@@ -216,6 +223,7 @@ a flag, shown here because it reads well:
 rattery <URL or path>
         [--origin URL] [--allow-origin URL]... [--allow-all-origins]
         [--incognito | --no-cookies | --cookie-jar FILE]
+        [--storage-dir DIR | --no-storage] [--log-file FILE]
         [--watch] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
         [--headless COLSxROWS [--script FILE] [--timeout SECS]]
 ```
@@ -233,6 +241,17 @@ or `Set-Cookie`, so ordinary cookie sessions on the server work unchanged and
 `HttpOnly` means what it says. The jar persists under the user's local data directory;
 `--incognito` keeps it in memory, `--no-cookies` drops everything, `--cookie-jar` picks
 a file.
+
+**Storage.** Each origin gets a private key-value file under the local data directory
+(`StoragePolicy::Persistent`), bounded by `Limits::storage_bytes` and
+`storage_entries`; `--incognito` keeps it in memory, `--no-storage` refuses writes,
+`--storage-dir` picks the directory. An app loaded from a file without `--origin`
+has no origin and so gets ephemeral storage.
+
+**Logs.** Records from the app's `log` macros arrive as `Phase::Log` on the
+`on_phase` hook, sanitised, size-capped, and rate-limited (`Limits::logs_per_second`).
+`--log-file` appends them to a file you can `tail -f` in another terminal while the
+app has the screen.
 
 **Reload.** `--watch` polls the URL with `If-None-Match` and restarts the app in place
 when the server publishes a new component.
@@ -280,6 +299,14 @@ features, or the dev profile), compiles it for `wasm32-wasip2` into a target dir
 under `OUT_DIR`, and exports the component's path as `RATTERY_APP_WASM`; changes under
 the app's `src` rebuild it. The nested build needs the target installed
 (`rustup target add wasm32-wasip2`).
+
+**Precompiled components.** With the `precompile` feature of `rattery-build`,
+`.precompile(true)` also compiles the component to native code for the shim's target
+and exports `RATTERY_APP_CWASM`; `unsafe { App::from_precompiled(embed_precompiled!().to_vec()) }`
+then starts without a compile step or a compile cache (the `unsafe` is wasmtime's:
+the bytes run as native code, so only embed what your own build produced).
+`rattery::precompile` is the same step for your own pipeline. `examples/counter/shim`
+does this.
 
 Production controls on the builder: `limits` (see `docs/security.md`), `on_phase`
 (loaded, compiled, ready, denied requests, reload, exit), `request_policy` (route

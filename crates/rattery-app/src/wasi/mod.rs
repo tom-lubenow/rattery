@@ -8,6 +8,8 @@ pub mod backend;
 pub mod bindings;
 pub mod client;
 pub mod events;
+pub mod log;
+pub mod storage;
 pub mod task;
 pub mod websocket;
 
@@ -68,6 +70,7 @@ where
     Fut: Future<Output = Result<(), E>>,
     E: Display,
 {
+    log::install();
     if let Some(origin) = origin() {
         let origin: &'static str = Box::leak(origin.into_boxed_str());
         let _ = server_fn::client::try_set_server_url(origin);

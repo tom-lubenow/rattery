@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- WIT `rattery:tui@0.2.0` gains `terminal.log` and a `storage` interface
+  (origin-scoped key-value storage: `get`, `set`, `remove`, `keys`, `clear`,
+  `usage`). `rattery_app::storage` wraps it; the `log` facade is routed to the
+  host.
+- Host: `StoragePolicy` (`Persistent` per origin under the local data
+  directory, `Dir`, `Ephemeral`, `Disabled`), `Limits::storage_*` quotas,
+  `Phase::Log` with `LogLevel`, `Limits::logs_per_second`, `Stats::logs` /
+  `logs_dropped`. The example CLI adds `--storage-dir`, `--no-storage`,
+  `--log-file`.
+- Precompiled components: `rattery::precompile`, `App::from_precompiled`
+  (unsafe: native code), `rattery::embed_precompiled!`, and
+  `rattery_build::App::precompile(true)` behind the `precompile` feature of
+  `rattery-build`, which exports `RATTERY_APP_CWASM`. The counter shim uses it.
+
 ## 0.2.0 (2026-09-09)
 
 The first release on crates.io: `rattery` (host library), `rattery-app` (app

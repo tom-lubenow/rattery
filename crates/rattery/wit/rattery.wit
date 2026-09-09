@@ -250,6 +250,40 @@ interface terminal {
     /// embedders that want a readiness signal beyond "a frame was drawn"
     /// wait for this.
     ready: func();
+
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Emit a log record. The host hands it to the embedder live, sanitised
+    /// and rate limited; nothing is written to the terminal.
+    log: func(level: log-level, target: string, message: string);
+}
+
+/// Key-value storage scoped to the app's origin, like a browser's
+/// `localStorage`: private to the origin, bounded by a quota, persisted by
+/// the host between runs when it has an origin to key it by.
+interface storage {
+    variant storage-error {
+        /// The origin's quota (bytes or entries) would be exceeded.
+        quota-exceeded,
+        /// The key or value is larger than allowed.
+        too-large,
+        /// The host has storage disabled.
+        disabled,
+    }
+
+    get: func(key: string) -> option<list<u8>>;
+    set: func(key: string, value: list<u8>) -> result<_, storage-error>;
+    remove: func(key: string);
+    keys: func() -> list<string>;
+    clear: func();
+    /// Bytes in use and the quota, for the app to show or budget against.
+    usage: func() -> tuple<u64, u64>;
 }
 
 /// WebSockets, provided by the host because WASI 0.2 has none. Connections
@@ -296,6 +330,7 @@ interface websocket {
 world app {
     import terminal;
     import websocket;
+    import storage;
 
     /// Run the app to completion. `err` is a message the host shows the user.
     export run: async func() -> result<_, string>;

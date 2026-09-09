@@ -2360,6 +2360,8 @@ dependencies = [
  "http-body-util",
  "ratatui",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -2374,6 +2376,9 @@ dependencies = [
 [[package]]
 name = "rattery-build"
 version = "0.2.0"
+dependencies = [
+ "rattery",
+]
 
 [[package]]
 name = "rayon"

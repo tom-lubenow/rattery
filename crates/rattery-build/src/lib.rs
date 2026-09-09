@@ -21,6 +21,17 @@
 //! Changes under the app crate's `src` or to its `Cargo.toml` trigger a
 //! rebuild.
 //!
+//! With the `precompile` feature, [`App::precompile`] also compiles the
+//! component to native code for the shim's target and exports the result as
+//! `RATTERY_APP_CWASM`, so the shim starts without compiling anything:
+//!
+//! ```ignore
+//! // build.rs
+//! rattery_build::App::new("../app").precompile(true).build();
+//! // main.rs: the bytes were produced by this build, so they can be trusted.
+//! let app = unsafe { rattery::App::from_precompiled(rattery::embed_precompiled!().to_vec()) };
+//! ```
+//!
 //! The nested build needs the `wasm32-wasip2` target installed
 //! (`rustup target add wasm32-wasip2`).
 
@@ -36,6 +47,7 @@ pub struct App {
     release: bool,
     features: Vec<String>,
     env_name: String,
+    precompile: bool,
 }
 
 impl App {
@@ -50,7 +62,17 @@ impl App {
             release: true,
             features: Vec::new(),
             env_name: "RATTERY_APP_WASM".into(),
+            precompile: false,
         }
+    }
+
+    /// Also compile the component to native code for the shim's `TARGET`
+    /// and export its path as the `_CWASM` variant of the variable
+    /// (`RATTERY_APP_CWASM` by default). Needs the `precompile` feature.
+    #[cfg(feature = "precompile")]
+    pub fn precompile(mut self, yes: bool) -> Self {
+        self.precompile = yes;
+        self
     }
 
     /// The package to build when `path` is a workspace (`cargo build -p`).
@@ -164,7 +186,34 @@ impl App {
         std::fs::copy(built, &dest)
             .map_err(|e| format!("failed to copy {}: {e}", built.display()))?;
         println!("cargo:rustc-env={}={}", self.env_name, dest.display());
+        if self.precompile {
+            self.precompile_to(&dest)?;
+        }
         Ok(dest)
+    }
+
+    #[cfg(feature = "precompile")]
+    fn precompile_to(&self, component: &Path) -> Result<(), String> {
+        let target =
+            env::var("TARGET").map_err(|_| "TARGET is not set; call this from build.rs")?;
+        let bytes = std::fs::read(component)
+            .map_err(|e| format!("failed to read {}: {e}", component.display()))?;
+        let native = rattery::precompile(&bytes, Some(&target))
+            .map_err(|e| format!("precompiling for {target} failed: {e:#}"))?;
+        let dest = component.with_extension("cwasm");
+        std::fs::write(&dest, native)
+            .map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
+        let env_name = match self.env_name.strip_suffix("_WASM") {
+            Some(stem) => format!("{stem}_CWASM"),
+            None => format!("{}_CWASM", self.env_name),
+        };
+        println!("cargo:rustc-env={env_name}={}", dest.display());
+        Ok(())
+    }
+
+    #[cfg(not(feature = "precompile"))]
+    fn precompile_to(&self, _component: &Path) -> Result<(), String> {
+        Err("precompile needs the `precompile` feature of rattery-build".into())
     }
 }
 

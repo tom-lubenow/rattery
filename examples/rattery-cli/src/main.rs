@@ -2,12 +2,16 @@
 //! file. This is what a shim looks like when it takes everything as flags;
 //! your own shim will hardcode most of it (see `examples/counter/shim`).
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Script, sanitize};
+use rattery::{
+    App, AppStatus, CookiePolicy, HeadlessOptions, Phase, Script, StoragePolicy, sanitize,
+};
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
 #[derive(Debug, Parser)]
@@ -50,6 +54,19 @@ struct Cli {
     /// Store cookies in this file instead of the default jar.
     #[arg(long, value_name = "FILE")]
     cookie_jar: Option<PathBuf>,
+
+    /// Keep the app's key-value storage under this directory instead of the
+    /// default one (one private file per origin).
+    #[arg(long, value_name = "DIR", conflicts_with = "no_storage")]
+    storage_dir: Option<PathBuf>,
+
+    /// Refuse every storage write.
+    #[arg(long)]
+    no_storage: bool,
+
+    /// Append the app's log records to this file as they arrive.
+    #[arg(long, value_name = "FILE")]
+    log_file: Option<PathBuf>,
 
     /// Poll the server for a new component and restart the app in place
     /// when one is published (URL sources only).
@@ -137,7 +154,37 @@ async fn main() -> Result<()> {
         } else {
             CookiePolicy::Persistent
         })
+        .storage(if cli.no_storage {
+            StoragePolicy::Disabled
+        } else if cli.incognito {
+            StoragePolicy::Ephemeral
+        } else if let Some(dir) = cli.storage_dir {
+            StoragePolicy::Dir(dir)
+        } else {
+            StoragePolicy::Persistent
+        })
         .watch(cli.watch);
+    if let Some(path) = cli.log_file {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let file = Mutex::new(std::io::BufWriter::new(file));
+        app = app.on_phase(move |phase| {
+            if let Phase::Log {
+                level,
+                target,
+                message,
+            } = phase
+            {
+                // Sanitised by the host already; one record per line.
+                let mut file = file.lock().unwrap();
+                let _ = writeln!(file, "{level:5} {target}: {message}");
+                let _ = file.flush();
+            }
+        });
+    }
     if let Some(origin) = cli.origin {
         app = app.origin(origin);
     }
@@ -209,13 +256,15 @@ async fn main() -> Result<()> {
         let per =
             |total: Duration, n: u64| ms(total.checked_div(n.max(1) as u32).unwrap_or_default());
         eprintln!(
-            "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {}",
+            "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {}, logs {} ({} dropped)",
             s.draws,
             s.cells,
             per(s.draw_time, s.draws),
             s.flushes,
             per(s.flush_time, s.flushes),
-            s.events
+            s.events,
+            s.logs,
+            s.logs_dropped
         );
     }
     match &report.status {

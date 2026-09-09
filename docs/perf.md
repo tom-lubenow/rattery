@@ -58,6 +58,11 @@ first frame 0.4 ms. Cold cache: compiling the 400 KB release component takes
 35 ms; compiling a 19 MB debug component takes 60 to 120 ms (wasmtime compiles
 in parallel). Host resident memory while running the benchmark: 16.5 MB.
 
+Precompiled (`rattery::precompile` at build time, `App::from_precompiled` at
+run time): the compile step becomes a deserialisation, 1.1 ms instead of 49 ms
+cold for the bench component, and needs no compile cache on the user's
+machine. The counter shim ships this way.
+
 Sizes: the release example component is 400 KB; the stripped host binary is
 27 MB (wasmtime with Cranelift, rustls, tokio, tungstenite).
 

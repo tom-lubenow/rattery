@@ -11,4 +11,4 @@ wasmtime::component::bindgen!({
     additional_derives: [Clone, PartialEq, Eq],
 });
 
-pub use self::rattery::tui::{terminal, websocket};
+pub use self::rattery::tui::{storage, terminal, websocket};
