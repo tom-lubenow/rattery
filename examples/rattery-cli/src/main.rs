@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Script};
+use rattery::{App, AppStatus, CookiePolicy, HeadlessOptions, Script, sanitize};
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
 #[derive(Debug, Parser)]
@@ -29,11 +29,6 @@ struct Cli {
     /// Let the app reach any origin over HTTP.
     #[arg(long)]
     allow_all_origins: bool,
-
-    /// Browser-style CORS: other origins may opt in per response with
-    /// Access-Control-Allow-Origin.
-    #[arg(long)]
-    cors: bool,
 
     /// URL reported to the app as its location, query string included
     /// (defaults to SOURCE when it is a URL).
@@ -131,7 +126,6 @@ async fn main() -> Result<()> {
 
     let mut app = App::from_source(&cli.source)?
         .allow_all_origins(cli.allow_all_origins)
-        .cors(cli.cors)
         .mouse(!cli.no_mouse)
         .cache(!cli.no_cache)
         .cookies(if cli.no_cookies {
@@ -187,11 +181,12 @@ async fn main() -> Result<()> {
         println!("--- final screen ({}x{}) ---", screen.width, screen.height);
         print!("{screen}");
     }
+    // Guest output is untrusted: never let it drive the terminal.
     if !report.stdout.is_empty() {
-        print!("{}", report.stdout);
+        print!("{}", sanitize::text(&report.stdout));
     }
     if !report.stderr.is_empty() {
-        eprint!("{}", report.stderr);
+        eprint!("{}", sanitize::text(&report.stderr));
     }
     if cli.stats {
         let t = &report.timings;
@@ -226,7 +221,8 @@ async fn main() -> Result<()> {
     match &report.status {
         AppStatus::Exited(0) => {}
         AppStatus::Exited(code) => eprintln!("app exited with status {code}"),
-        AppStatus::Trapped(message) => eprintln!("app trapped: {message}"),
+        AppStatus::Trapped(message) => eprintln!("app trapped: {}", sanitize::text(message)),
+        AppStatus::LimitExceeded(what) => eprintln!("app stopped: {what}"),
         AppStatus::Killed => eprintln!("app terminated by rattery (Ctrl-C pressed three times)"),
         AppStatus::TimedOut => eprintln!("app stopped: headless timeout elapsed"),
     }

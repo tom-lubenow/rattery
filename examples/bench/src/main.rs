@@ -8,6 +8,8 @@
 //!   few cells actually change).
 //! - `http`: `frames` sequential GETs of the app's origin over `wasi:http`,
 //!   to measure request latency through the host (needs `--origin`).
+//! - `evil`: tries to inject escape sequences through cells, the title, and
+//!   stdout, then exits; the host must contain all of it.
 
 rattery_app::app!(run);
 
@@ -121,6 +123,39 @@ mod bench {
         let Params { frames, mode } = params();
         if mode == "http" {
             return http_bench(frames).await;
+        }
+        if mode == "evil" {
+            // A hostile app skips ratatui (whose buffer refuses such symbols)
+            // and talks to the terminal binding directly.
+            use rattery_app::bindings::terminal as t;
+            rattery_app::set_title("safe\u{1b}]0;pwned\u{7}title");
+            let cell = |symbol: &'static str| t::Cell {
+                symbol,
+                fg: t::Color::Reset,
+                bg: t::Color::Reset,
+                underline_color: t::Color::Reset,
+                modifier: t::Modifier::empty(),
+            };
+            let rows = ["\u{1b}[2J", "\u{7}", "ok", "\u{9b}31m", "é"];
+            let mut updates: Vec<t::CellUpdate> = rows
+                .iter()
+                .enumerate()
+                .map(|(y, symbol)| t::CellUpdate {
+                    x: 0,
+                    y: y as u16,
+                    cell: cell(symbol),
+                })
+                .collect();
+            updates.push(t::CellUpdate {
+                x: 60000,
+                y: 60000,
+                cell: cell("far"),
+            });
+            t::draw(&updates);
+            t::flush();
+            drop(terminal);
+            println!("stdout\u{1b}[2J\u{7}injection");
+            return Err("error\u{1b}[31mred".into());
         }
         let mut durations = Vec::with_capacity(frames);
         let mut cells = 0usize;

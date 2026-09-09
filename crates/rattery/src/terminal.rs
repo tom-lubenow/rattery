@@ -1,14 +1,16 @@
 //! The terminal the app renders into: crossterm and stdout when interactive,
 //! an in-memory `TestBackend` when headless. Also the event queue, the
-//! pollable that lets the guest wait for input, and the interrupt machinery.
+//! interrupt machinery, and the containment of everything the guest sends
+//! toward the terminal.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Stdout, Write};
+use std::panic::PanicHookInfo;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, EventStream,
@@ -20,66 +22,118 @@ use crossterm::{execute, queue};
 use futures::StreamExt;
 use ratatui::backend::{Backend, CrosstermBackend, TestBackend};
 use tokio::sync::Notify;
-use wasmtime::Engine;
+use tokio::task::JoinHandle;
 
 use crate::bindings::terminal::{
     CellUpdate, ClearType, Event, KeyCode, KeyEventKind, KeyModifiers, Position, Size, WindowSize,
 };
-use crate::convert;
+use crate::{Phase, convert, sanitize};
 
 const KILL_PRESSES: usize = 3;
 const KILL_WINDOW: Duration = Duration::from_millis(1500);
 
-/// Raw mode, alternate screen, and input reporting. Restored on drop, even on
-/// panic, so a misbehaving app never leaves the shell unusable.
+type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// Raw mode, alternate screen, and input reporting. Every step is undone if a
+/// later one fails, and everything is restored on drop, even on panic, so a
+/// misbehaving app never leaves the shell unusable. The panic hook installed
+/// for that is the previous hook wrapped, and is put back on drop.
 pub struct Session {
-    mouse: bool,
+    steps: Vec<Step>,
+    previous_hook: Arc<Mutex<Option<PanicHook>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    RawMode,
+    AlternateScreen,
+    BracketedPaste,
+    FocusChange,
+    MouseCapture,
 }
 
 impl Session {
     pub fn enter(mouse: bool) -> Result<Self> {
-        enable_raw_mode()?;
+        let mut steps = Vec::new();
         let mut out = io::stdout();
-        execute!(
-            out,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableFocusChange
-        )?;
-        if mouse {
-            execute!(out, EnableMouseCapture)?;
+        let attempt = (|| -> Result<()> {
+            enable_raw_mode().context("enabling raw mode")?;
+            steps.push(Step::RawMode);
+            execute!(out, EnterAlternateScreen).context("entering the alternate screen")?;
+            steps.push(Step::AlternateScreen);
+            execute!(out, EnableBracketedPaste).context("enabling bracketed paste")?;
+            steps.push(Step::BracketedPaste);
+            execute!(out, EnableFocusChange).context("enabling focus reporting")?;
+            steps.push(Step::FocusChange);
+            if mouse {
+                execute!(out, EnableMouseCapture).context("enabling mouse capture")?;
+                steps.push(Step::MouseCapture);
+            }
+            Ok(())
+        })();
+        if let Err(err) = attempt {
+            undo(&steps);
+            return Err(err.context("failed to set up the terminal"));
         }
-        let previous = std::panic::take_hook();
+
+        // Wrap the current panic hook so a panic restores the terminal first.
+        let previous_hook: Arc<Mutex<Option<PanicHook>>> =
+            Arc::new(Mutex::new(Some(std::panic::take_hook())));
+        let hook_steps = steps.clone();
+        let hook_previous = previous_hook.clone();
         std::panic::set_hook(Box::new(move |info| {
-            restore(mouse);
-            previous(info);
+            undo(&hook_steps);
+            if let Ok(guard) = hook_previous.lock()
+                && let Some(previous) = guard.as_ref()
+            {
+                previous(info);
+            }
         }));
-        Ok(Self { mouse })
+        Ok(Self {
+            steps,
+            previous_hook,
+        })
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        restore(self.mouse);
+        undo(&self.steps);
+        // Put the previous hook back; skip if a panic is in flight, since
+        // set_hook would itself panic then.
+        if !std::thread::panicking()
+            && let Some(previous) = self.previous_hook.lock().ok().and_then(|mut g| g.take())
+        {
+            std::panic::set_hook(previous);
+        }
     }
 }
 
-fn restore(mouse: bool) {
+fn undo(steps: &[Step]) {
     let mut out = io::stdout();
-    if mouse {
-        let _ = execute!(out, DisableMouseCapture);
+    for step in steps.iter().rev() {
+        match step {
+            Step::MouseCapture => {
+                let _ = execute!(out, DisableMouseCapture);
+            }
+            Step::FocusChange => {
+                let _ = execute!(out, DisableFocusChange);
+            }
+            Step::BracketedPaste => {
+                let _ = execute!(out, DisableBracketedPaste);
+            }
+            Step::AlternateScreen => {
+                let _ = execute!(out, LeaveAlternateScreen);
+            }
+            Step::RawMode => {
+                let _ = disable_raw_mode();
+            }
+        }
     }
-    let _ = execute!(
-        out,
-        DisableFocusChange,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = disable_raw_mode();
 }
 
 /// Why the host stopped the app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Interrupt {
     /// Ctrl-C three times in a row.
     Kill,
@@ -87,21 +141,21 @@ pub enum Interrupt {
     Timeout,
     /// A new version of the component is available.
     Reload,
+    /// A resource limit was exceeded.
+    Limit(String),
 }
 
-/// Stops a running app from anywhere: an epoch bump traps an app busy in
-/// wasm, and a notification unblocks the host if the app is waiting inside a
-/// host call.
+/// Stops a running app from anywhere. The reason is checked by the epoch
+/// callback on the next tick, which traps an app busy in wasm; the
+/// notification unblocks the host if the app is waiting inside a host call.
 pub struct Interrupter {
-    engine: Engine,
     reason: Mutex<Option<Interrupt>>,
     notify: Notify,
 }
 
 impl Interrupter {
-    pub fn new(engine: Engine) -> Self {
+    pub fn new() -> Self {
         Self {
-            engine,
             reason: Mutex::new(None),
             notify: Notify::new(),
         }
@@ -113,8 +167,11 @@ impl Interrupter {
             *slot = Some(reason);
         }
         drop(slot);
-        self.engine.increment_epoch();
         self.notify.notify_one();
+    }
+
+    pub fn is_fired(&self) -> bool {
+        self.reason.lock().unwrap().is_some()
     }
 
     /// The pending reason, cleared so the next run starts fresh.
@@ -124,6 +181,27 @@ impl Interrupter {
 
     pub async fn notified(&self) {
         self.notify.notified().await
+    }
+}
+
+/// Background tasks that belong to one run, cancelled and awaited on exit.
+#[derive(Default)]
+pub struct Tasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl Tasks {
+    pub fn spawn(&mut self, future: impl Future<Output = ()> + Send + 'static) {
+        self.handles.push(tokio::spawn(future));
+    }
+
+    pub async fn shutdown(self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        for handle in self.handles {
+            let _ = handle.await;
+        }
     }
 }
 
@@ -160,17 +238,20 @@ impl KillDetector {
     }
 }
 
-/// Events queued for the guest, plus a notifier so a pollable can wait on it.
+/// Events queued for the guest, bounded: when the app does not read, the
+/// oldest events are dropped rather than the queue growing.
 pub struct EventQueue {
     events: Mutex<VecDeque<Event>>,
+    capacity: usize,
     notify: Notify,
     kill: Mutex<KillDetector>,
 }
 
 impl EventQueue {
-    fn new(interrupter: Arc<Interrupter>) -> Self {
+    fn new(interrupter: Arc<Interrupter>, capacity: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::new()),
+            capacity: capacity.max(1),
             notify: Notify::new(),
             kill: Mutex::new(KillDetector {
                 presses: VecDeque::new(),
@@ -181,7 +262,12 @@ impl EventQueue {
 
     pub fn push(&self, event: Event) {
         self.kill.lock().unwrap().observe(&event);
-        self.events.lock().unwrap().push_back(event);
+        let mut events = self.events.lock().unwrap();
+        if events.len() >= self.capacity {
+            events.pop_front();
+        }
+        events.push_back(event);
+        drop(events);
         self.notify.notify_one();
     }
 
@@ -208,6 +294,9 @@ pub struct Stats {
     pub draws: u64,
     /// Cells carried by all `draw` calls together.
     pub cells: u64,
+    /// Cells refused: outside the screen, or replaced for containing
+    /// control characters or malformed symbols.
+    pub cells_rejected: u64,
     /// Time spent inside `draw` on the host, including terminal output.
     pub draw_time: Duration,
     /// `flush` calls.
@@ -289,6 +378,8 @@ macro_rules! with_backend {
     };
 }
 
+pub type PhaseHook = Arc<dyn Fn(Phase) + Send + Sync>;
+
 pub struct TerminalHost {
     output: Output,
     queue: Arc<EventQueue>,
@@ -297,6 +388,7 @@ pub struct TerminalHost {
     snapshots: Arc<Mutex<Vec<Screen>>>,
     stats: Stats,
     started: Instant,
+    on_phase: Option<PhaseHook>,
 }
 
 impl TerminalHost {
@@ -305,9 +397,11 @@ impl TerminalHost {
         origin: Option<String>,
         location: Option<String>,
         interrupter: Arc<Interrupter>,
+        queue_capacity: usize,
+        tasks: &mut Tasks,
     ) -> Self {
-        let queue = Arc::new(EventQueue::new(interrupter));
-        tokio::spawn(read_input(queue.clone()));
+        let queue = Arc::new(EventQueue::new(interrupter, queue_capacity));
+        tasks.spawn(read_input(queue.clone()));
         Self {
             output: Output::Crossterm(CrosstermBackend::new(io::stdout())),
             queue,
@@ -316,6 +410,7 @@ impl TerminalHost {
             snapshots: Arc::default(),
             stats: Stats::default(),
             started: Instant::now(),
+            on_phase: None,
         }
     }
 
@@ -324,18 +419,24 @@ impl TerminalHost {
         origin: Option<String>,
         location: Option<String>,
         interrupter: Arc<Interrupter>,
+        queue_capacity: usize,
         width: u16,
         height: u16,
     ) -> Self {
         Self {
             output: Output::Test(Arc::new(Mutex::new(TestBackend::new(width, height)))),
-            queue: Arc::new(EventQueue::new(interrupter)),
+            queue: Arc::new(EventQueue::new(interrupter, queue_capacity)),
             origin,
             location,
             snapshots: Arc::default(),
             stats: Stats::default(),
             started: Instant::now(),
+            on_phase: None,
         }
+    }
+
+    pub fn set_phase_hook(&mut self, hook: Option<PhaseHook>) {
+        self.on_phase = hook;
     }
 
     /// Counters since the terminal was opened.
@@ -373,18 +474,34 @@ impl TerminalHost {
         self.location.as_deref()
     }
 
+    /// Draw the cells the guest sent, after containment: cells outside the
+    /// screen are dropped, symbols are validated (see [`sanitize::symbol`]).
     pub fn draw(&mut self, updates: &[CellUpdate]) -> io::Result<()> {
         let t = Instant::now();
         if self.stats.first_draw.is_none() {
             self.stats.first_draw = Some(t.duration_since(self.started));
+            if let Some(hook) = &self.on_phase {
+                hook(Phase::Ready);
+            }
         }
-        let cells: Vec<(u16, u16, ratatui::buffer::Cell)> = updates
-            .iter()
-            .map(|u| (u.x, u.y, convert::cell(&u.cell)))
-            .collect();
+        let size = with_backend!(self, |b| b.size())?;
+        let mut rejected = 0u64;
+        let mut cells: Vec<(u16, u16, ratatui::buffer::Cell)> = Vec::with_capacity(updates.len());
+        for u in updates {
+            if u.x >= size.width || u.y >= size.height {
+                rejected += 1;
+                continue;
+            }
+            let symbol = sanitize::symbol(&u.cell.symbol);
+            if symbol.as_ref() != u.cell.symbol {
+                rejected += 1;
+            }
+            cells.push((u.x, u.y, convert::cell(&u.cell, &symbol)));
+        }
         let result = with_backend!(self, |b| b.draw(cells.iter().map(|(x, y, c)| (*x, *y, c))));
         self.stats.draws += 1;
         self.stats.cells += updates.len() as u64;
+        self.stats.cells_rejected += rejected;
         self.stats.draw_time += t.elapsed();
         result
     }
@@ -406,8 +523,13 @@ impl TerminalHost {
         Ok(Position { x: p.x, y: p.y })
     }
 
+    /// Move the cursor, clamped to the screen.
     pub fn set_cursor_position(&mut self, pos: Position) -> io::Result<()> {
-        let p = ratatui::layout::Position::new(pos.x, pos.y);
+        let size = with_backend!(self, |b| b.size())?;
+        let p = ratatui::layout::Position::new(
+            pos.x.min(size.width.saturating_sub(1)),
+            pos.y.min(size.height.saturating_sub(1)),
+        );
         with_backend!(self, |b| b.set_cursor_position(p))
     }
 
@@ -452,8 +574,11 @@ impl TerminalHost {
         self.flush()
     }
 
+    /// Set the window title, with control characters removed and the length
+    /// bounded (see [`sanitize::title`]).
     pub fn set_title(&mut self, title: &str) -> io::Result<()> {
         if let Output::Crossterm(_) = self.output {
+            let title = sanitize::title(title);
             let mut out = io::stdout();
             queue!(out, SetTitle(title))?;
             out.flush()?;

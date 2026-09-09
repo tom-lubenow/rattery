@@ -6,9 +6,10 @@ use ratatui::style::{Color, Modifier};
 
 use crate::bindings::terminal as t;
 
-pub fn cell(c: &t::Cell) -> Cell {
+/// A ratatui cell from a WIT cell, with the symbol already sanitised.
+pub fn cell(c: &t::Cell, symbol: &str) -> Cell {
     let mut cell = Cell::default();
-    cell.set_symbol(&c.symbol);
+    cell.set_symbol(symbol);
     cell.fg = color(c.fg);
     cell.bg = color(c.bg);
     cell.underline_color = color(c.underline_color);

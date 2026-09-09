@@ -1,52 +1,128 @@
-//! Fetching the app component, from a URL like a browser would or from disk.
+//! Fetching the app component: from a URL like a browser would, from disk,
+//! from memory, or through an embedder's resolver. Every path enforces the
+//! size and download-time limits.
 
-use anyhow::{Context, Result};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use url::Url;
 
-use crate::Source;
+use crate::{Limits, Resolved, Resolver, Source};
 
 pub struct Loaded {
     pub bytes: Vec<u8>,
-    /// The app's own origin, if it has one.
+    /// The app's own origin, if it has one. For a URL, the origin of the
+    /// final URL after redirects, not the one requested.
     pub origin: Option<String>,
+    /// The final URL, query included.
+    pub location: Option<String>,
     pub description: String,
-    /// Validators from the HTTP response, used to poll for new versions.
+    /// Validators from the HTTP response or the resolver, used to poll for
+    /// new versions.
     pub etag: Option<String>,
     pub last_modified: Option<String>,
 }
 
-pub async fn load(source: &Source) -> Result<Loaded> {
+pub async fn load(source: &Source, limits: &Limits) -> Result<Loaded> {
     match source {
         Source::Url(url) => {
-            let client = reqwest::Client::new();
-            let fetched = fetch_if_changed(&client, url, None, None, None)
+            let client = client(limits)?;
+            let fetched = fetch_if_changed(&client, url, None, None, None, limits)
                 .await?
                 .expect("an unconditional fetch always yields a body");
+            Ok(fetched)
+        }
+        Source::Path(path) => {
+            let metadata = tokio::fs::metadata(path)
+                .await
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            check_size(metadata.len(), limits, &path.display().to_string())?;
+            let bytes = tokio::fs::read(path)
+                .await
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            check_size(bytes.len() as u64, limits, &path.display().to_string())?;
             Ok(Loaded {
-                origin: Some(origin_of(url)),
-                description: url.to_string(),
-                ..fetched
+                bytes,
+                origin: None,
+                location: None,
+                description: path.display().to_string(),
+                etag: None,
+                last_modified: None,
             })
         }
-        Source::Path(path) => Ok(Loaded {
-            bytes: tokio::fs::read(path)
+        Source::Bytes(bytes) => {
+            check_size(bytes.len() as u64, limits, "the embedded component")?;
+            Ok(Loaded {
+                bytes: bytes.clone(),
+                origin: None,
+                location: None,
+                description: format!("{} bytes in memory", bytes.len()),
+                etag: None,
+                last_modified: None,
+            })
+        }
+        Source::Resolver(resolver) => {
+            let resolved = resolver
+                .resolve(None)
                 .await
-                .with_context(|| format!("failed to read {}", path.display()))?,
-            origin: None,
-            description: path.display().to_string(),
-            etag: None,
-            last_modified: None,
-        }),
-        Source::Bytes(bytes) => Ok(Loaded {
-            bytes: bytes.clone(),
-            origin: None,
-            description: format!("{} bytes in memory", bytes.len()),
-            etag: None,
-            last_modified: None,
-        }),
+                .context("the resolver failed")?
+                .context("the resolver produced no component")?;
+            Ok(from_resolved(resolved, limits)?)
+        }
     }
+}
+
+pub fn from_resolved(resolved: Resolved, limits: &Limits) -> Result<Loaded> {
+    check_size(
+        resolved.bytes.len() as u64,
+        limits,
+        "the resolved component",
+    )?;
+    Ok(Loaded {
+        bytes: resolved.bytes,
+        origin: resolved.origin,
+        location: resolved.location,
+        description: "a resolved component".into(),
+        etag: resolved.version,
+        last_modified: None,
+    })
+}
+
+fn check_size(len: u64, limits: &Limits, what: &str) -> Result<()> {
+    if len > limits.component_bytes as u64 {
+        bail!(
+            "{what} is {len} bytes, over the component size limit of {} bytes",
+            limits.component_bytes
+        );
+    }
+    Ok(())
+}
+
+/// A client that follows redirects only within one origin and gives up after
+/// the download timeout.
+pub fn client(limits: &Limits) -> Result<reqwest::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .map(|first| first.origin() == attempt.url().origin())
+            .unwrap_or(true);
+        if !same_origin {
+            return attempt.error("cross-origin redirect refused");
+        }
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        attempt.follow()
+    });
+    reqwest::Client::builder()
+        .redirect(policy)
+        .timeout(limits.download_timeout)
+        .build()
+        .context("failed to build an HTTP client")
 }
 
 pub fn origin_of(url: &Url) -> String {
@@ -61,6 +137,7 @@ pub async fn fetch_if_changed(
     etag: Option<&str>,
     last_modified: Option<&str>,
     previous: Option<&[u8]>,
+    limits: &Limits,
 ) -> Result<Option<Loaded>> {
     let mut request = client.get(url.clone());
     if let Some(etag) = etag {
@@ -79,6 +156,9 @@ pub async fn fetch_if_changed(
     let response = response
         .error_for_status()
         .with_context(|| format!("failed to fetch {url}"))?;
+    if let Some(len) = response.content_length() {
+        check_size(len, limits, url.as_ref())?;
+    }
     let header = |name| {
         response
             .headers()
@@ -88,17 +168,40 @@ pub async fn fetch_if_changed(
     };
     let etag = header(ETAG);
     let last_modified = header(LAST_MODIFIED);
-    let bytes = response.bytes().await?.to_vec();
+    // Privileges come from where the bytes came from.
+    let final_url = response.url().clone();
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("failed to fetch {url}"))?;
+        check_size((bytes.len() + chunk.len()) as u64, limits, url.as_ref())?;
+        bytes.extend_from_slice(&chunk);
+    }
     if previous.is_some_and(|previous| previous == bytes.as_slice()) {
         return Ok(None);
     }
     Ok(Some(Loaded {
         bytes,
-        origin: Some(origin_of(url)),
-        description: url.to_string(),
+        origin: Some(origin_of(&final_url)),
+        location: Some(final_url.to_string()),
+        description: final_url.to_string(),
         etag,
         last_modified,
     }))
+}
+
+/// Poll a resolver for a new version.
+pub async fn resolve_if_changed(
+    resolver: &Arc<dyn Resolver>,
+    current: Option<&str>,
+    previous: &[u8],
+    limits: &Limits,
+) -> Result<Option<Loaded>> {
+    match resolver.resolve(current).await? {
+        Some(resolved) if resolved.bytes != previous => Ok(Some(from_resolved(resolved, limits)?)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -133,5 +236,15 @@ mod tests {
             Source::Path(_)
         ));
         assert!(App::from_url("ftp://x/app.wasm").is_err());
+    }
+
+    #[test]
+    fn size_limit() {
+        let limits = Limits {
+            component_bytes: 10,
+            ..Limits::default()
+        };
+        assert!(check_size(11, &limits, "x").is_err());
+        assert!(check_size(10, &limits, "x").is_ok());
     }
 }

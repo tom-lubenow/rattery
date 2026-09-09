@@ -38,6 +38,10 @@ pub use rattery_macros::server;
 pub use server_fn;
 pub use server_fn::ServerFnError;
 
+/// The host contract this crate targets; must equal `rattery::ABI` of the
+/// host that runs the app. Record it in release metadata.
+pub const ABI: &str = "rattery:tui@0.1.0;cm-async;wasi:http@0.3.0";
+
 pub mod event;
 pub mod multipart;
 

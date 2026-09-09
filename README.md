@@ -195,7 +195,7 @@ Router::new()
 
 `examples/counter` is the complete version: background calls with a spinner, a
 streaming live feed, a websocket echo, a multipart upload, cookie sessions with
-per-session state, ETags for `--watch`, and a CORS opt-in flag. `rattery_app::websocket::WebSocket` is also usable
+per-session state, and ETags for `--watch`. `rattery_app::websocket::WebSocket` is also usable
 directly, outside server functions.
 
 `rattery_app::location()` returns the URL the app was loaded from, query string included,
@@ -214,18 +214,19 @@ a flag, shown here because it reads well:
 
 ```
 rattery <URL or path>
-        [--origin URL] [--allow-origin URL]... [--allow-all-origins] [--cors]
+        [--origin URL] [--allow-origin URL]... [--allow-all-origins]
         [--incognito | --no-cookies | --cookie-jar FILE]
         [--watch] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
         [--headless COLSxROWS [--script FILE] [--timeout SECS]]
 ```
 
-**Origin policy.** An app may reach its own origin: where it was loaded from, or
-`--origin` for an app loaded from a file. `--allow-origin` adds more,
-`--allow-all-origins` disables the check, and `--cors` lets other origins opt in
-themselves with `Access-Control-Allow-Origin`, the way they do for browsers. Every
-request carries an `Origin` header. Everything else is refused before a connection
-is opened.
+**Origin policy.** An app may reach its own origin: where it was loaded from (after
+same-origin redirects; cross-origin redirects are refused), or `--origin` for an app
+loaded from a file. `--allow-origin` adds more and `--allow-all-origins` disables the
+check. Every request carries an `Origin` header. Everything else is refused before a
+connection is opened. There is no CORS mode: cross-origin access is allow-list only
+until proper preflight and credential semantics exist. A `RequestPolicy` on the
+builder sees every allowed request and can refuse or edit it.
 
 **Cookies.** The host keeps a jar the way a browser does: the app never sees `Cookie`
 or `Set-Cookie`, so ordinary cookie sessions on the server work unchanged and
@@ -236,10 +237,14 @@ a file.
 **Reload.** `--watch` polls the URL with `If-None-Match` and restarts the app in place
 when the server publishes a new component.
 
-**Safety.** The guest's stdout and stderr are captured and printed after it exits, so
-panics are readable and never corrupt the screen. Ctrl-C three times within 1.5 seconds
-interrupts an unresponsive app, even one spinning in a tight loop. Raw mode and the
-alternate screen are always restored, including on panic.
+**Safety.** Everything the app sends toward the terminal is validated: control
+characters and malformed symbols never reach the screen or the title, cells outside
+the screen are dropped, and guest output is rendered with escapes shown rather than
+interpreted. Resource use is bounded by `Limits` (memory, CPU time on a continuous
+10 ms epoch tick, queues, message and body sizes, concurrency). Ctrl-C three times
+within 1.5 seconds interrupts an unresponsive app. Raw mode and the alternate screen
+are always restored, including on panic, and every background task is stopped before
+the terminal is handed back. See `docs/security.md`.
 
 **Stats.** `Report::timings` and `Report::stats` (the `--stats` flag prints them) carry
 phase timings (load, compile, instantiate, first frame) and terminal counters. `cargo
@@ -275,6 +280,12 @@ features, or the dev profile), compiles it for `wasm32-wasip2` into a target dir
 under `OUT_DIR`, and exports the component's path as `RATTERY_APP_WASM`; changes under
 the app's `src` rebuild it. The nested build needs the target installed
 (`rustup target add wasm32-wasip2`).
+
+Production controls on the builder: `limits` (see `docs/security.md`), `on_phase`
+(loaded, compiled, ready, denied requests, reload, exit), `request_policy` (route
+authorisation, credential injection), `extension` and `state` (extra WIT imports
+backed by your own state), `from_resolver` (the embedder retrieves and validates the
+bytes). `rattery::inspect` checks a component against `rattery::ABI` before it runs.
 
 `App::headless` returns the snapshots in the `Report`, so an app's integration tests
 can be a few lines:

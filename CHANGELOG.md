@@ -15,6 +15,14 @@ First release on crates.io: `rattery` (host library), `rattery-app` (app crate),
   kill switch and timeouts, timings and counters.
 - `rattery-build` compiles an app from `build.rs`; `rattery::embed!()` embeds it.
 - The general-purpose command moved to `examples/rattery-cli` and is not published.
+- Hardening (see `docs/security.md`): terminal output containment for cells,
+  titles, and guest output; allow-list-only cross-origin (the CORS mode was
+  removed) and same-origin-only redirects; `Limits` for memory, CPU time on a
+  continuous epoch tick, sizes, queues, and concurrency; private, locked,
+  atomically replaced cookie jars; all background tasks cancelled and awaited on
+  exit, the panic hook restored, transactional terminal setup.
+- Embedding controls: `RequestPolicy`, `on_phase`, `extension` and `state`,
+  `from_resolver`, `inspect`, `ABI`. Minimum supported Rust 1.95.
 
 ## 0.1.0 (2026-09-07)
 

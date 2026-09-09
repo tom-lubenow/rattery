@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version = "1.95"
 description = "Build a rattery app to a WASI component from build.rs, so a shim binary can embed it"
 keywords = ["ratatui", "wasm", "wasi", "build-dependencies"]
 categories = ["development-tools::build-utils"]

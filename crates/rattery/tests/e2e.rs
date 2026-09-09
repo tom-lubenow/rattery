@@ -55,6 +55,8 @@ fn guest(package: &str) -> PathBuf {
             "counter-app",
             "-p",
             "spin-app",
+            "-p",
+            "bench-app",
             "--target",
             "wasm32-wasip2",
         ])
@@ -250,17 +252,25 @@ async fn file_without_origin_fails_cleanly() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cross_origin_is_denied_unless_cors_permits() {
+async fn cross_origin_is_denied_unless_allow_listed() {
     require_wasip2!();
     let host = Server::start(&[]);
-    let api_closed = Server::start(&[]);
+    let api = Server::start(&[]);
 
-    // The app comes from `host` but is pointed at `api_closed`: cross-origin, denied.
+    // The app comes from `host` but is pointed at `api`: cross-origin, denied.
+    let denied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let report = App::from_url(format!("{}/app.wasm", host.url))
         .unwrap()
-        .origin(&api_closed.url)
-        .cors(true)
+        .origin(&api.url)
         .cookies(CookiePolicy::Ephemeral)
+        .on_phase({
+            let denied = denied.clone();
+            move |phase| {
+                if let rattery::Phase::RequestDenied { url, reason } = phase {
+                    denied.lock().unwrap().push(format!("{url}: {reason}"));
+                }
+            }
+        })
         .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
         .run()
         .await
@@ -268,13 +278,16 @@ async fn cross_origin_is_denied_unless_cors_permits() {
     let text = dump(&report);
     assert_eq!(report.status, AppStatus::Exited(0), "{text}");
     assert!(report.snapshots[0].contains("error"), "{text}");
+    assert!(
+        !denied.lock().unwrap().is_empty(),
+        "the embedder is told about denials"
+    );
 
-    // An API that opts in with Access-Control-Allow-Origin is reachable.
-    let api_open = Server::start(&["--cors-allow-origin", &host.url]);
+    // Explicitly allowing the origin works.
     let report = App::from_url(format!("{}/app.wasm", host.url))
         .unwrap()
-        .origin(&api_open.url)
-        .cors(true)
+        .origin(&api.url)
+        .allow_origin(&api.url)
         .cookies(CookiePolicy::Ephemeral)
         .headless(headless(
             "sleep 2500\nkey k\nsleep 700\nsnapshot\nkey q",
@@ -284,22 +297,160 @@ async fn cross_origin_is_denied_unless_cors_permits() {
         .await
         .unwrap();
     let text = dump(&report);
-    assert_eq!(report.status, AppStatus::Exited(0), "{text}");
     assert!(!report.snapshots[0].contains("error"), "{text}");
     assert!(report.snapshots[0].contains("2 calls"), "{text}");
+}
 
-    // Explicitly allowing the origin works without CORS.
-    let report = App::from_url(format!("{}/app.wasm", host.url))
+/// A policy that refuses one route and stamps every other request.
+struct RoutePolicy;
+
+impl rattery::RequestPolicy for RoutePolicy {
+    fn on_request<'a>(
+        &'a self,
+        request: &'a mut http::request::Parts,
+        info: &'a rattery::RequestInfo,
+    ) -> futures::future::BoxFuture<'a, Result<rattery::PolicyGuard, rattery::PolicyError>> {
+        Box::pin(async move {
+            assert!(!info.cross_origin);
+            if request.uri.path().contains("adjust_count") {
+                return Err(rattery::PolicyError::new("adjusting is not allowed here"));
+            }
+            request
+                .headers
+                .insert("x-shim", http::HeaderValue::from_static("1"));
+            Ok(None)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_policy_can_refuse_routes() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let denied = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let report = App::from_url(format!("{}/app.wasm", server.url))
         .unwrap()
-        .origin(&api_closed.url)
-        .allow_origin(&api_closed.url)
         .cookies(CookiePolicy::Ephemeral)
-        .headless(headless("sleep 2500\nsnapshot\nkey q", 20))
+        .request_policy(std::sync::Arc::new(RoutePolicy))
+        .on_phase({
+            let denied = denied.clone();
+            move |phase| {
+                if let rattery::Phase::RequestDenied { reason, .. } = phase {
+                    denied.lock().unwrap().push(reason);
+                }
+            }
+        })
+        .headless(headless(
+            "sleep 2500\nkey k\nsleep 700\nsnapshot\nkey q",
+            20,
+        ))
         .run()
         .await
         .unwrap();
     let text = dump(&report);
-    assert!(!report.snapshots[0].contains("error"), "{text}");
+    assert_eq!(report.status, AppStatus::Exited(0), "{text}");
+    // The first snapshot succeeded (policy allowed it), the increment did not.
+    assert_eq!(
+        count_on(&report.snapshots[0]).as_deref(),
+        Some("0"),
+        "{text}"
+    );
+    assert!(report.snapshots[0].contains("error"), "{text}");
+    assert_eq!(
+        denied.lock().unwrap().as_slice(),
+        ["adjusting is not allowed here"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn escape_sequences_from_the_guest_are_contained() {
+    require_wasip2!();
+    let report = App::from_path(guest("bench-app"))
+        .location("bench://local/app.wasm?mode=evil")
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless("sleep 1500\nsnapshot", 10))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::Exited(1), "{text}");
+    // The app exits at once, so the screen it left behind is the evidence.
+    let screen = report.final_screen.as_ref().unwrap();
+    for (y, expected) in ["\u{FFFD}", "\u{FFFD}", "\u{FFFD}", "\u{FFFD}", "é"]
+        .iter()
+        .enumerate()
+    {
+        let row = &screen.lines[y];
+        assert!(row.starts_with(expected), "row {y} was {row:?}\n{text}");
+        assert!(
+            !row.contains('\u{1b}') && !row.contains('\u{7}') && !row.contains('\u{9b}'),
+            "{row:?}"
+        );
+    }
+    assert_eq!(
+        report.stats.cells_rejected, 5,
+        "four bad symbols and one off-screen cell\n{text}"
+    );
+    // Raw output still carries the bytes; the sanitiser is for printing.
+    assert!(report.stdout.contains('\u{1b}'));
+    assert!(!rattery::sanitize::text(&report.stdout).contains('\u{1b}'));
+    assert!(
+        rattery::sanitize::text(&report.stderr).contains("\\u{1b}[31mred"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_budget_stops_a_spinning_app() {
+    require_wasip2!();
+    let report = App::from_path(guest("spin-app"))
+        .cookies(CookiePolicy::Ephemeral)
+        .limits(rattery::Limits {
+            cpu_time: Some(Duration::from_millis(500)),
+            ..Default::default()
+        })
+        .headless(headless("", 10))
+        .run()
+        .await
+        .unwrap();
+    assert!(
+        matches!(report.status, AppStatus::LimitExceeded(ref what) if what.contains("CPU")),
+        "{}",
+        dump(&report)
+    );
+    assert!(
+        report.timings.total < Duration::from_secs(5),
+        "{:?}",
+        report.timings
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_limit_is_enforced() {
+    require_wasip2!();
+    let result = App::from_path(guest("counter-app"))
+        .cookies(CookiePolicy::Ephemeral)
+        .limits(rattery::Limits {
+            memory_bytes: 1 << 16,
+            ..Default::default()
+        })
+        .headless(headless("sleep 500", 5))
+        .run()
+        .await;
+    match result {
+        Ok(report) => assert!(
+            !matches!(report.status, AppStatus::Exited(0) | AppStatus::TimedOut),
+            "{}",
+            dump(&report)
+        ),
+        Err(err) => {
+            let text = format!("{err:#}");
+            assert!(
+                text.to_lowercase().contains("memory") || text.contains("limit"),
+                "{text}"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
