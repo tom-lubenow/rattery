@@ -9,7 +9,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use wasmtime::ResourceLimiter;
 use wasmtime::component::{Accessor, HasSelf, Resource, ResourceTable};
@@ -28,7 +28,8 @@ pub struct RunParts {
     pub term: TerminalHost,
     pub ext: HashMap<TypeId, Box<dyn Any + Send>>,
     pub memory_peak: usize,
-    pub websocket_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Reaps finished connection tasks continuously; `close` + `wait` it.
+    pub websocket_tasks: tokio_util::task::TaskTracker,
 }
 
 /// The CPU budget, counted in epoch ticks while the guest executes.
@@ -140,8 +141,9 @@ pub struct HostState {
     on_phase: Option<PhaseHook>,
     /// Websocket slots; a permit lives in each socket resource.
     websocket_slots: Arc<tokio::sync::Semaphore>,
-    /// Connection tasks, awaited at shutdown.
-    websocket_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Connection tasks. A tracker forgets tasks as they finish, so an app
+    /// that connects and drops sockets forever costs nothing here.
+    websocket_tasks: tokio_util::task::TaskTracker,
     ext: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
@@ -201,7 +203,7 @@ impl HostState {
             interrupter,
             on_phase,
             websocket_slots,
-            websocket_tasks: Arc::default(),
+            websocket_tasks: tokio_util::task::TaskTracker::new(),
             ext,
         }
     }
@@ -213,7 +215,7 @@ impl HostState {
     /// The terminal, the extension state (carried across a reload), the peak
     /// memory the app used, and the websocket tasks still to be awaited.
     pub(crate) fn into_parts(self) -> RunParts {
-        let websocket_tasks = std::mem::take(&mut *self.websocket_tasks.lock().unwrap());
+        let websocket_tasks = self.websocket_tasks;
         RunParts {
             term: self.term,
             ext: self.ext,

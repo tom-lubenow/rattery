@@ -36,6 +36,10 @@ library), `rattery-app` (app crate), `rattery-macros`, `rattery-build`.
   semaphore permits held by the resource; `Phase::Ready` after the first
   successful draw and flush; websocket tasks awaited at shutdown; reload
   errors bounded; cookie quota keyed on domain, path, and name.
+- Fourth pass: websocket tasks tracked by a `TaskTracker` that forgets them as
+  they finish; the reload reset bypasses readiness accounting; tungstenite's
+  write buffer sized for a maximum frame independently of the app queue;
+  `message_bytes` is a strict final size.
 
 ## 0.1.0 (2026-09-07)
 

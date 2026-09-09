@@ -262,12 +262,10 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         ext = parts.ext;
         stats = term.stats();
         stats.memory_peak = parts.memory_peak;
-        // Sockets the app still held: their tasks were aborted with the
-        // store; wait for them to be gone.
-        for handle in parts.websocket_tasks {
-            handle.abort();
-            let _ = handle.await;
-        }
+        // Sockets the app still held: their tasks were aborted when their
+        // resources went with the store; wait for them to be gone.
+        parts.websocket_tasks.close();
+        parts.websocket_tasks.wait().await;
 
         append_bounded(
             &mut stdout_all,
@@ -354,14 +352,26 @@ fn append_bounded(kept: &mut String, more: &str, max: usize) {
     }
 }
 
+/// Cut `text` to at most `max` bytes, ending in `...` when there is room
+/// for the marker.
 fn truncate(mut text: String, max: usize) -> String {
-    if text.len() > max {
-        let mut cut = max;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-        text.push_str("...");
+    const MARK: &str = "...";
+    if text.len() <= max {
+        return text;
+    }
+    // Room for the marker, or as much text as fits when there is none.
+    let keep = if max >= MARK.len() {
+        max - MARK.len()
+    } else {
+        max
+    };
+    let mut cut = keep;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    if max >= MARK.len() {
+        text.push_str(MARK);
     }
     text
 }
@@ -444,5 +454,33 @@ async fn watch_resolver(
             *updates.lock().unwrap() = Some(next);
             interrupter.fire(Interrupt::Reload);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_bounded, truncate};
+
+    #[test]
+    fn truncate_is_a_strict_limit() {
+        assert_eq!(truncate("hello".into(), 10), "hello");
+        assert_eq!(truncate("hello world".into(), 8), "hello...");
+        assert_eq!(truncate("hello world".into(), 2), "he");
+        assert!(truncate("héllo wörld".into(), 5).len() <= 5);
+        for max in 0..12 {
+            assert!(
+                truncate("hello world!".into(), max).len() <= max,
+                "max {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_bounded_keeps_the_newest() {
+        let mut kept = String::new();
+        append_bounded(&mut kept, "abcdef", 4);
+        assert_eq!(kept, "cdef");
+        append_bounded(&mut kept, "gh", 4);
+        assert_eq!(kept, "efgh");
     }
 }

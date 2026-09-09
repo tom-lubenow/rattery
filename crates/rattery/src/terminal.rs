@@ -610,9 +610,15 @@ impl TerminalHost {
     }
 
     /// Wipe the screen between two apps sharing the terminal.
+    ///
+    /// This is host housekeeping, not a frame from the app, so it goes around
+    /// the readiness accounting: a guest interrupted between its first draw
+    /// and its flush must not be reported ready by our flush.
     pub fn reset(&mut self) -> io::Result<()> {
+        self.stats.first_draw = None;
+        self.ready_reported = false;
         with_backend!(self, |b| b.clear())?;
-        self.flush()
+        with_backend!(self, |b| Backend::flush(b))
     }
 
     /// Set the window title, with control characters removed and the length
@@ -653,5 +659,68 @@ async fn read_input(queue: Arc<EventQueue>) {
         if let Some(event) = convert::event(event) {
             queue.push(event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::terminal::{Cell, Color, Modifier};
+
+    fn host(phases: Arc<Mutex<Vec<Phase>>>) -> TerminalHost {
+        let interrupter = Arc::new(Interrupter::new());
+        let mut host = TerminalHost::headless(None, None, interrupter, 8, 1024, 10, 3);
+        host.set_phase_hook(Some(Arc::new(move |phase| {
+            phases.lock().unwrap().push(phase)
+        })));
+        host
+    }
+
+    fn update(x: u16, y: u16) -> CellUpdate {
+        CellUpdate {
+            x,
+            y,
+            cell: Cell {
+                symbol: "x".into(),
+                fg: Color::Reset,
+                bg: Color::Reset,
+                underline_color: Color::Reset,
+                modifier: Modifier::empty(),
+            },
+        }
+    }
+
+    #[test]
+    fn ready_needs_a_draw_and_a_flush_and_reset_does_not_count() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut host = host(phases.clone());
+        host.draw(&[update(0, 0)]).unwrap();
+        assert!(phases.lock().unwrap().is_empty(), "draw alone is not ready");
+        // Interrupted before its flush: the host's reset must not count.
+        host.reset().unwrap();
+        assert!(
+            phases.lock().unwrap().is_empty(),
+            "reset is not the app's flush"
+        );
+        host.mark_started();
+        host.draw(&[update(1, 1)]).unwrap();
+        host.flush().unwrap();
+        host.flush().unwrap();
+        assert_eq!(
+            phases.lock().unwrap().as_slice(),
+            [Phase::Ready],
+            "ready once, after the flush"
+        );
+    }
+
+    #[test]
+    fn off_screen_and_hostile_cells_are_counted() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut host = host(phases);
+        let mut bad = update(0, 0);
+        bad.cell.symbol = "\u{1b}[2J".into();
+        host.draw(&[bad, update(50, 50), update(2, 2)]).unwrap();
+        assert_eq!(host.stats().cells_rejected, 2);
+        assert_eq!(host.stats().cells, 3);
     }
 }

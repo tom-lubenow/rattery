@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use futures::{SinkExt, StreamExt};
 use http::header::{COOKIE, ORIGIN};
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message as WsMessage, WebSocketConfig};
 use url::Url;
@@ -233,7 +232,7 @@ impl WsSocket {
         on_phase: Option<&PhaseHook>,
         limits: &Limits,
         slot: tokio::sync::OwnedSemaphorePermit,
-        tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+        tasks: &tokio_util::task::TaskTracker,
     ) -> Result<Self, Error> {
         let http_url = as_http_url(url)
             .ok_or_else(|| Error::Connect(format!("invalid websocket URL {url:?}")))?;
@@ -278,13 +277,19 @@ impl WsSocket {
             .map_err(|_| Error::Denied)?;
         let request = http::Request::from_parts(parts, ());
 
-        // tungstenite requires max_write_buffer_size > write_buffer_size.
-        let write_buffer = (128 << 10).min(limits.websocket_queue_bytes);
+        // tungstenite's write buffer is independent of the app-level queue:
+        // it must hold one maximum message as a frame (payload plus up to
+        // 14 bytes of header and mask) on top of its flush threshold, and
+        // must be strictly larger than that threshold.
+        const FRAME_OVERHEAD: usize = 14;
+        let write_buffer: usize = 128 << 10;
         let config = WebSocketConfig::default()
             .max_message_size(Some(limits.websocket_message_bytes))
             .max_frame_size(Some(limits.websocket_message_bytes))
             .write_buffer_size(write_buffer)
-            .max_write_buffer_size(limits.websocket_queue_bytes.max(write_buffer) + 1);
+            .max_write_buffer_size(
+                write_buffer + limits.websocket_message_bytes + FRAME_OVERHEAD + 1,
+            );
         let (stream, response) =
             tokio_tungstenite::connect_async_with_config(request, Some(config), false)
                 .await
@@ -307,9 +312,8 @@ impl WsSocket {
             work_notify: Notify::new(),
             failure: Mutex::new(None),
         });
-        let task = tokio::spawn(run_connection(stream, shared.clone()));
+        let task = tasks.spawn(run_connection(stream, shared.clone()));
         let abort = task.abort_handle();
-        tasks.lock().unwrap().push(task);
         Ok(Self {
             shared,
             task: abort,
