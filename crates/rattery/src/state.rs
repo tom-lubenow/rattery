@@ -9,7 +9,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wasmtime::ResourceLimiter;
 use wasmtime::component::{Accessor, HasSelf, Resource, ResourceTable};
@@ -22,6 +22,14 @@ use crate::http::{CookieJar, OriginHooks, OriginPolicy, RequestPolicy};
 use crate::terminal::{Interrupt, Interrupter, PhaseHook, TerminalHost};
 use crate::websocket::WsSocket;
 use crate::{Limits, Phase};
+
+/// What survives a run of the store.
+pub struct RunParts {
+    pub term: TerminalHost,
+    pub ext: HashMap<TypeId, Box<dyn Any + Send>>,
+    pub memory_peak: usize,
+    pub websocket_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
 
 /// The CPU budget, counted in epoch ticks while the guest executes.
 pub struct CpuBudget {
@@ -130,7 +138,10 @@ pub struct HostState {
     cpu: CpuBudget,
     interrupter: Arc<Interrupter>,
     on_phase: Option<PhaseHook>,
-    websockets: usize,
+    /// Websocket slots; a permit lives in each socket resource.
+    websocket_slots: Arc<tokio::sync::Semaphore>,
+    /// Connection tasks, awaited at shutdown.
+    websocket_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     ext: HashMap<TypeId, Box<dyn Any + Send>>,
 }
 
@@ -160,6 +171,7 @@ impl HostState {
             ext,
         } = config;
         let limiter = AggregateLimiter::new(&limits);
+        let websocket_slots = Arc::new(tokio::sync::Semaphore::new(limits.websockets));
         let mut table = ResourceTable::new();
         table.set_max_capacity(limits.resources);
         let budget_ticks = limits
@@ -188,7 +200,8 @@ impl HostState {
             },
             interrupter,
             on_phase,
-            websockets: 0,
+            websocket_slots,
+            websocket_tasks: Arc::default(),
             ext,
         }
     }
@@ -197,10 +210,16 @@ impl HostState {
         self.term
     }
 
-    /// The terminal, the extension state (carried across a reload), and the
-    /// peak memory the app used.
-    pub(crate) fn into_parts(self) -> (TerminalHost, HashMap<TypeId, Box<dyn Any + Send>>, usize) {
-        (self.term, self.ext, self.limiter.memory_peak())
+    /// The terminal, the extension state (carried across a reload), the peak
+    /// memory the app used, and the websocket tasks still to be awaited.
+    pub(crate) fn into_parts(self) -> RunParts {
+        let websocket_tasks = std::mem::take(&mut *self.websocket_tasks.lock().unwrap());
+        RunParts {
+            term: self.term,
+            ext: self.ext,
+            memory_peak: self.limiter.memory_peak(),
+            websocket_tasks,
+        }
     }
 
     pub(crate) fn limiter(&mut self) -> &mut AggregateLimiter {
@@ -367,8 +386,8 @@ impl websocket::HostSocket for HostState {
     }
 
     async fn drop(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<()> {
+        // The slot permit and the task's abort handle go with the resource.
         self.table.delete(this)?;
-        self.websockets = self.websockets.saturating_sub(1);
         Ok(())
     }
 }
@@ -378,32 +397,29 @@ impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
         store: &Accessor<U, Self>,
         url: String,
     ) -> wasmtime::Result<Result<Resource<WsSocket>, websocket::Error>> {
-        // Reserve a socket slot before awaiting, so concurrent attempts
-        // cannot overshoot the limit together.
-        let reserved = store.with(|mut view| {
-            let state = view.get();
-            if state.websockets >= state.limits.websockets {
-                return None;
-            }
-            state.websockets += 1;
-            Some((
-                state.policy.clone(),
-                state.cookies.clone(),
-                state.request_policy.clone(),
-                state.on_phase.clone(),
-                state.limits.clone(),
-            ))
-        });
-        let Some((policy, cookies, request_policy, on_phase, limits)) = reserved else {
+        // A slot is a semaphore permit held by the socket resource: it is
+        // released whether the attempt is cancelled, fails, cannot be stored,
+        // or the resource is dropped normally.
+        let (slot, policy, cookies, request_policy, on_phase, limits, tasks) =
             store.with(|mut view| {
                 let state = view.get();
-                if let Some(hook) = &state.on_phase {
-                    hook(Phase::RequestDenied {
-                        url: url.clone(),
-                        reason: format!("websocket limit of {} reached", state.limits.websockets),
-                    });
-                }
+                (
+                    state.websocket_slots.clone().try_acquire_owned().ok(),
+                    state.policy.clone(),
+                    state.cookies.clone(),
+                    state.request_policy.clone(),
+                    state.on_phase.clone(),
+                    state.limits.clone(),
+                    state.websocket_tasks.clone(),
+                )
             });
+        let Some(slot) = slot else {
+            if let Some(hook) = &on_phase {
+                hook(Phase::RequestDenied {
+                    url: url.clone(),
+                    reason: format!("websocket limit of {} reached", limits.websockets),
+                });
+            }
             return Ok(Err(websocket::Error::Denied));
         };
         let connected = WsSocket::connect(
@@ -413,14 +429,13 @@ impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
             request_policy.as_ref(),
             on_phase.as_ref(),
             &limits,
+            slot,
+            &tasks,
         )
         .await;
         match connected {
             Ok(socket) => Ok(Ok(store.with(|mut view| view.get().table.push(socket))?)),
-            Err(err) => {
-                store.with(|mut view| view.get().websockets -= 1);
-                Ok(Err(err))
-            }
+            Err(err) => Ok(Err(err)),
         }
     }
 

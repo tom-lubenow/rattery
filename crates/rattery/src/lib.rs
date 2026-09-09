@@ -292,8 +292,8 @@ impl Default for Limits {
             frame_cells: 1 << 20,
             websockets: 16,
             websocket_queue: 64,
-            websocket_queue_bytes: 4 << 20,
-            websocket_message_bytes: 16 << 20,
+            websocket_queue_bytes: 8 << 20,
+            websocket_message_bytes: 4 << 20,
             http_concurrency: 16,
             request_body_bytes: 64 << 20,
             response_body_bytes: 64 << 20,
@@ -306,6 +306,39 @@ impl Default for Limits {
             memories: 8,
             instances: 16,
         }
+    }
+}
+
+impl Limits {
+    /// Check the limits are coherent: every queue must hold at least one
+    /// maximum-sized message, and no bound may be zero. [`App::run`] refuses
+    /// limits that fail this.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.websocket_queue_bytes >= self.websocket_message_bytes,
+            "websocket_queue_bytes ({}) must be at least websocket_message_bytes ({}) so a \
+             maximum-sized message can be queued",
+            self.websocket_queue_bytes,
+            self.websocket_message_bytes
+        );
+        for (name, value) in [
+            ("memory_bytes", self.memory_bytes),
+            ("component_bytes", self.component_bytes),
+            ("event_queue", self.event_queue),
+            ("frame_cells", self.frame_cells),
+            ("websocket_queue", self.websocket_queue),
+            ("websocket_message_bytes", self.websocket_message_bytes),
+            ("http_concurrency", self.http_concurrency),
+            ("request_body_bytes", self.request_body_bytes),
+            ("response_body_bytes", self.response_body_bytes),
+            ("guest_output_bytes", self.guest_output_bytes),
+            ("message_bytes", self.message_bytes),
+            ("resources", self.resources),
+            ("instances", self.instances),
+        ] {
+            anyhow::ensure!(value > 0, "Limits::{name} must be greater than zero");
+        }
+        Ok(())
     }
 }
 
@@ -683,5 +716,26 @@ mod wit_sync {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::Limits;
+
+    #[test]
+    fn defaults_are_coherent_and_incoherence_is_rejected() {
+        Limits::default().validate().unwrap();
+        let bad = Limits {
+            websocket_queue_bytes: 1 << 20,
+            websocket_message_bytes: 2 << 20,
+            ..Limits::default()
+        };
+        assert!(bad.validate().is_err());
+        let zero = Limits {
+            http_concurrency: 0,
+            ..Limits::default()
+        };
+        assert!(zero.validate().is_err());
     }
 }

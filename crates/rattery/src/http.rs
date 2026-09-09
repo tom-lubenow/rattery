@@ -319,17 +319,24 @@ impl CookieJar {
     /// cookie stored for the domain whatever its path.
     fn merge(&self, store: &mut CookieStore, url: &Url, values: &[&str]) {
         for text in values {
-            let name = text.split('=').next().unwrap_or("").trim();
-            let for_domain: Vec<String> = store
-                .iter_any()
-                .filter(|c| c.domain.matches(url))
-                .map(|c| c.name().to_owned())
-                .collect();
-            let replaces = for_domain.iter().any(|n| n == name);
-            if for_domain.len() >= self.max_per_host && !replaces {
+            let Ok(candidate) = cookie_store::Cookie::parse(*text, url) else {
+                continue;
+            };
+            let mut for_domain = 0usize;
+            let mut replaces = false;
+            for existing in store.iter_any().filter(|c| c.domain.matches(url)) {
+                for_domain += 1;
+                if existing.name() == candidate.name()
+                    && existing.domain == candidate.domain
+                    && existing.path == candidate.path
+                {
+                    replaces = true;
+                }
+            }
+            if for_domain >= self.max_per_host && !replaces {
                 continue;
             }
-            let _ = store.parse(text, url);
+            let _ = store.insert(candidate.into_owned(), url);
         }
     }
 }
@@ -777,6 +784,59 @@ mod tests {
             sent.to_str().unwrap().split("; ").count(),
             DEFAULT_COOKIES_PER_HOST
         );
+        assert_eq!(
+            jar.store.lock().unwrap().iter_any().count(),
+            DEFAULT_COOKIES_PER_HOST
+        );
+    }
+
+    #[test]
+    fn cookie_quota_counts_every_path() {
+        let url = Url::parse("http://localhost:3000/").unwrap();
+
+        // Distinct names on distinct paths.
+        let jar = CookieJar::ephemeral();
+        for i in 0..(DEFAULT_COOKIES_PER_HOST + 10) {
+            let mut headers = http::HeaderMap::new();
+            headers.append(
+                SET_COOKIE,
+                HeaderValue::from_str(&format!("c{i}=v; Path=/p{i}")).unwrap(),
+            );
+            jar.store_response(&url, &headers);
+        }
+        assert_eq!(
+            jar.store.lock().unwrap().iter_any().count(),
+            DEFAULT_COOKIES_PER_HOST
+        );
+
+        // One name across many paths does not escape the quota either.
+        let jar = CookieJar::ephemeral();
+        for i in 0..(DEFAULT_COOKIES_PER_HOST + 10) {
+            let mut headers = http::HeaderMap::new();
+            headers.append(
+                SET_COOKIE,
+                HeaderValue::from_str(&format!("same=v{i}; Path=/p{i}")).unwrap(),
+            );
+            jar.store_response(&url, &headers);
+        }
+        assert_eq!(
+            jar.store.lock().unwrap().iter_any().count(),
+            DEFAULT_COOKIES_PER_HOST
+        );
+
+        // Replacing an existing cookie (same name, domain, and path) still
+        // works at quota, and does not add one.
+        let mut headers = http::HeaderMap::new();
+        headers.append(SET_COOKIE, HeaderValue::from_static("same=new; Path=/p0"));
+        jar.store_response(&url, &headers);
+        assert_eq!(
+            jar.store.lock().unwrap().iter_any().count(),
+            DEFAULT_COOKIES_PER_HOST
+        );
+        let sent = jar
+            .request_header(&Url::parse("http://localhost:3000/p0/x").unwrap())
+            .unwrap();
+        assert!(sent.to_str().unwrap().contains("same=new"));
     }
 
     #[test]

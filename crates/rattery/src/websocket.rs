@@ -91,15 +91,24 @@ impl Shared {
     }
 
     /// Queue an incoming message; when the app is not reading, the oldest
-    /// messages give way rather than the queue growing.
-    fn push_incoming(&self, message: WsMessage) {
+    /// messages give way rather than the queue growing. A message that could
+    /// never fit is a protocol violation and ends the connection.
+    fn push_incoming(&self, message: WsMessage) -> Result<(), Error> {
         let mut queue = self.incoming.lock().unwrap();
+        if message.len() > queue.max_bytes {
+            return Err(Error::Protocol(format!(
+                "message of {} bytes is over the queue limit of {} bytes",
+                message.len(),
+                queue.max_bytes
+            )));
+        }
         while !queue.has_room_for(message.len()) && queue.pop_front().is_some() {
             queue.dropped += 1;
         }
         queue.push_back(message);
         drop(queue);
         self.incoming_notify.notify_one();
+        Ok(())
     }
 
     /// Wait for the next message. Backs `socket.receive`.
@@ -117,11 +126,20 @@ impl Shared {
     }
 
     /// Queue an outgoing message, waiting for room. Backs `socket.send`.
+    /// A message larger than the whole queue is refused rather than waited
+    /// for forever.
     pub async fn send(&self, message: Message) -> Result<(), Error> {
         let message = match message {
             Message::Text(text) => WsMessage::Text(text.into()),
             Message::Binary(bytes) => WsMessage::Binary(bytes.into()),
         };
+        let max_bytes = self.outgoing.lock().unwrap().max_bytes;
+        if message.len() > max_bytes {
+            return Err(Error::Protocol(format!(
+                "message of {} bytes is over the queue limit of {max_bytes} bytes",
+                message.len()
+            )));
+        }
         loop {
             let notified = self.room_notify.notified();
             if let Some(failure) = self.failure() {
@@ -177,9 +195,11 @@ fn convert_incoming(message: WsMessage) -> Message {
 /// connection and stops its task.
 pub struct WsSocket {
     shared: Arc<Shared>,
-    task: JoinHandle<()>,
+    task: tokio::task::AbortHandle,
     max_message_bytes: usize,
     _guard: crate::http::PolicyGuard,
+    /// The socket slot; released with the resource however it ends.
+    _slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Map a websocket URL onto the http URL the policy and cookie jar understand.
@@ -204,6 +224,7 @@ fn as_ws_url(url: &Url) -> Option<Url> {
 impl WsSocket {
     /// Connect and complete the handshake, applying the origin policy, the
     /// request policy, and the cookie jar.
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         url: &str,
         policy: &OriginPolicy,
@@ -211,6 +232,8 @@ impl WsSocket {
         request_policy: Option<&Arc<dyn RequestPolicy>>,
         on_phase: Option<&PhaseHook>,
         limits: &Limits,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>,
     ) -> Result<Self, Error> {
         let http_url = as_http_url(url)
             .ok_or_else(|| Error::Connect(format!("invalid websocket URL {url:?}")))?;
@@ -255,10 +278,13 @@ impl WsSocket {
             .map_err(|_| Error::Denied)?;
         let request = http::Request::from_parts(parts, ());
 
+        // tungstenite requires max_write_buffer_size > write_buffer_size.
+        let write_buffer = (128 << 10).min(limits.websocket_queue_bytes);
         let config = WebSocketConfig::default()
             .max_message_size(Some(limits.websocket_message_bytes))
             .max_frame_size(Some(limits.websocket_message_bytes))
-            .max_write_buffer_size(limits.websocket_queue_bytes.max(64 << 10));
+            .write_buffer_size(write_buffer)
+            .max_write_buffer_size(limits.websocket_queue_bytes.max(write_buffer) + 1);
         let (stream, response) =
             tokio_tungstenite::connect_async_with_config(request, Some(config), false)
                 .await
@@ -282,11 +308,14 @@ impl WsSocket {
             failure: Mutex::new(None),
         });
         let task = tokio::spawn(run_connection(stream, shared.clone()));
+        let abort = task.abort_handle();
+        tasks.lock().unwrap().push(task);
         Ok(Self {
             shared,
-            task,
+            task: abort,
             max_message_bytes: limits.websocket_message_bytes,
             _guard: guard,
+            _slot: slot,
         })
     }
 
@@ -343,7 +372,9 @@ async fn run_connection(
             },
             incoming = source.next() => match incoming {
                 Some(Ok(message @ (WsMessage::Text(_) | WsMessage::Binary(_)))) => {
-                    shared.push_incoming(message);
+                    if let Err(err) = shared.push_incoming(message) {
+                        break err;
+                    }
                 }
                 Some(Ok(WsMessage::Close(frame))) => {
                     break Error::Closed(frame.map(|f| f.reason.to_string()));
@@ -360,6 +391,56 @@ async fn run_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared(capacity: usize, max_bytes: usize) -> Shared {
+        Shared {
+            incoming: Mutex::new(Queue::new(capacity, max_bytes)),
+            incoming_notify: Notify::new(),
+            outgoing: Mutex::new(Queue::new(capacity, max_bytes)),
+            room_notify: Notify::new(),
+            work_notify: Notify::new(),
+            failure: Mutex::new(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_messages_are_refused_in_both_directions() {
+        let s = shared(4, 10);
+        // Outgoing: too big for the queue is an error, not an endless wait.
+        assert!(s.send(Message::Binary(vec![0; 11])).await.is_err());
+        assert!(s.send(Message::Binary(vec![0; 10])).await.is_ok());
+        // Incoming: too big ends the connection rather than overfilling.
+        assert!(
+            s.push_incoming(WsMessage::Binary(vec![0; 11].into()))
+                .is_err()
+        );
+        assert!(
+            s.push_incoming(WsMessage::Binary(vec![0; 6].into()))
+                .is_ok()
+        );
+        assert!(
+            s.push_incoming(WsMessage::Binary(vec![0; 6].into()))
+                .is_ok()
+        );
+        let q = s.incoming.lock().unwrap();
+        assert_eq!(q.items.len(), 1, "the older message gave way");
+        assert_eq!(q.dropped, 1);
+        assert!(q.bytes <= 10);
+    }
+
+    #[tokio::test]
+    async fn send_waits_for_room_and_resumes() {
+        let s = Arc::new(shared(1, 100));
+        s.send(Message::Binary(vec![0; 5])).await.unwrap();
+        let waiter = tokio::spawn({
+            let s = s.clone();
+            async move { s.send(Message::Binary(vec![0; 5])).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "queue is full, send must wait");
+        assert!(s.next_outgoing().await.is_some());
+        assert!(waiter.await.unwrap().is_ok());
+    }
 
     #[test]
     fn queue_bounds_count_and_bytes() {

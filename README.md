@@ -302,7 +302,7 @@ assert!(report.snapshots[0].contains("1"));
 
 Working: rendering, keyboard, mouse, paste, focus and resize events; request/response,
 streaming, websocket, and multipart server functions; background tasks on the component
-model's async ABI with HTTP over WASI 0.3; the origin policy with allow lists and CORS;
+model's async ABI with HTTP over WASI 0.3; the origin policy with allow lists;
 a persistent cookie jar; hot reload; the library API; headless mode; a kill switch and
 timeouts; end-to-end tests of all of it. Note that wasmtime's WASI 0.3 support is marked
 experimental upstream; rattery pins wasmtime and tracks it.

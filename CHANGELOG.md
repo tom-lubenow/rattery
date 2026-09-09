@@ -2,15 +2,15 @@
 
 ## 0.2.0 (2026-09-08)
 
-First release on crates.io: `rattery` (host library), `rattery-app` (app crate),
-`rattery-macros`, `rattery-build`.
+The first release intended for crates.io (not yet published): `rattery` (host
+library), `rattery-app` (app crate), `rattery-macros`, `rattery-build`.
 
 - Apps are ordinary binary crates built for `wasm32-wasip2`; `rattery_app::app!`
   exports one async `run` and the host drives it with the component model's async
   ABI. HTTP uses `wasi:http@0.3`, timers the 0.3 clock; stdio stays on WASI 0.2.
 - Server functions: request/response, streaming, websocket (host-provided), and
   multipart (rattery's own encoding).
-- Host library: origin policy with allow lists and CORS, cookie jar with session
+- Host library: origin policy with allow lists, cookie jar with session
   persistence, watch-and-reload, headless mode with scripted input and snapshots,
   kill switch and timeouts, timings and counters.
 - `rattery-build` compiles an app from `build.rs`; `rattery::embed!()` embeds it.
@@ -30,6 +30,12 @@ First release on crates.io: `rattery` (host library), `rattery-app` (app crate),
   `Phase::Ready` only after a successful frame plus `rattery_app::ready()` /
   `Phase::AppReady`; paste, append, output, and message size caps; one cookie
   jar lock for load-modify-save and per-domain quotas. WIT package 0.2.0.
+- Third pass: `Limits::validate` (queues must hold one maximum message;
+  defaults are 4 MiB messages, 8 MiB queues) and oversized messages refused in
+  both directions instead of waiting or overfilling; websocket slots are
+  semaphore permits held by the resource; `Phase::Ready` after the first
+  successful draw and flush; websocket tasks awaited at shutdown; reload
+  errors bounded; cookie quota keyed on domain, path, and name.
 
 ## 0.1.0 (2026-09-07)
 

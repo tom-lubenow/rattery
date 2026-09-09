@@ -416,6 +416,7 @@ pub struct TerminalHost {
     stats: Stats,
     started: Instant,
     on_phase: Option<PhaseHook>,
+    ready_reported: bool,
 }
 
 impl TerminalHost {
@@ -439,6 +440,7 @@ impl TerminalHost {
             stats: Stats::default(),
             started: Instant::now(),
             on_phase: None,
+            ready_reported: false,
         }
     }
 
@@ -461,6 +463,7 @@ impl TerminalHost {
             stats: Stats::default(),
             started: Instant::now(),
             on_phase: None,
+            ready_reported: false,
         }
     }
 
@@ -477,6 +480,7 @@ impl TerminalHost {
     pub fn mark_started(&mut self) {
         self.started = Instant::now();
         self.stats.first_draw = None;
+        self.ready_reported = false;
     }
 
     pub fn queue(&self) -> Arc<EventQueue> {
@@ -524,9 +528,6 @@ impl TerminalHost {
         let result = with_backend!(self, |b| b.draw(cells.iter().map(|(x, y, c)| (*x, *y, c))));
         if result.is_ok() && self.stats.first_draw.is_none() {
             self.stats.first_draw = Some(t.duration_since(self.started));
-            if let Some(hook) = &self.on_phase {
-                hook(Phase::Ready);
-            }
         }
         self.stats.draws += 1;
         self.stats.cells += updates.len() as u64;
@@ -592,11 +593,19 @@ impl TerminalHost {
         })
     }
 
+    /// Flush the frame. The first successful draw-and-flush is the moment
+    /// the app has presented something, which is `Phase::Ready`.
     pub fn flush(&mut self) -> io::Result<()> {
         let t = Instant::now();
         let result = with_backend!(self, |b| Backend::flush(b));
         self.stats.flushes += 1;
         self.stats.flush_time += t.elapsed();
+        if result.is_ok() && self.stats.first_draw.is_some() && !self.ready_reported {
+            self.ready_reported = true;
+            if let Some(hook) = &self.on_phase {
+                hook(Phase::Ready);
+            }
+        }
         result
     }
 

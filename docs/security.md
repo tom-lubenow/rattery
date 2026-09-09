@@ -65,9 +65,9 @@ ordinary TUI and can be tightened for untrusted apps.
 | input event queue | 1024 | oldest events dropped |
 | paste event | 1 MiB | longer pastes are cut at a character boundary |
 | cells per frame | 1 M | frame refused, app stopped |
-| open websockets | 16 | a slot is reserved before the handshake, so concurrent attempts cannot overshoot |
-| websocket queues | 64 messages and 4 MiB per direction | incoming: oldest dropped; outgoing: `send` is async and waits (backpressure) |
-| websocket message | 16 MiB | tungstenite frame and message caps, send refused |
+| open websockets | 16 | a semaphore permit taken before the handshake and held by the socket resource, so cancelled attempts, failures, and drops all release it |
+| websocket queues | 64 messages and 8 MiB per direction | incoming: oldest dropped; outgoing: `send` is async and waits (backpressure); a message larger than the queue is refused |
+| websocket message | 4 MiB | tungstenite frame and message caps, send refused; `Limits::validate` requires the queue to hold one |
 | concurrent HTTP requests | 16 | semaphore held for the request's lifetime |
 | request body | 64 MiB | `Limited` body |
 | response body | 64 MiB | `Limited` body |
@@ -92,8 +92,8 @@ every mode is restored in reverse order. The panic hook installed for that
 wraps the previous hook; it is put back on exit, and if the run panics, the
 panic is caught, the hook restored, and the panic resumed.
 
-`Phase::Ready` fires after the first frame has been validated and drawn
-successfully. An app that wants a stronger signal calls
+`Phase::Ready` fires after the first frame has been validated, drawn, and
+flushed successfully. An app that wants a stronger signal calls
 `rattery_app::ready()` when its data is loaded and a real screen is up, which
 arrives as `Phase::AppReady`.
 

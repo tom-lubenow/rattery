@@ -47,6 +47,7 @@ pub async fn run(app: App) -> Result<Report> {
 async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Report> {
     let run_started = std::time::Instant::now();
     let limits = app.limits.clone();
+    limits.validate().context("invalid limits")?;
     let on_phase = app.on_phase.clone();
     let phase = |phase: Phase| {
         if let Some(hook) = &on_phase {
@@ -256,11 +257,17 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         };
         let state = store.into_data();
         // Nothing else keeps extension state; it stays with us across reloads.
-        let (t, e, memory_peak) = state.into_parts();
-        term = t;
-        ext = e;
+        let parts = state.into_parts();
+        term = parts.term;
+        ext = parts.ext;
         stats = term.stats();
-        stats.memory_peak = memory_peak;
+        stats.memory_peak = parts.memory_peak;
+        // Sockets the app still held: their tasks were aborted with the
+        // store; wait for them to be gone.
+        for handle in parts.websocket_tasks {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         append_bounded(
             &mut stdout_all,
@@ -278,7 +285,11 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             if let Some(next) = updates.lock().unwrap().take() {
                 match compile(&engine, &next) {
                     Ok(compiled) => component = compiled,
-                    Err(err) => stderr_all.push_str(&format!("rattery: reload skipped: {err:#}\n")),
+                    Err(err) => append_bounded(
+                        &mut stderr_all,
+                        &format!("rattery: reload skipped: {err:#}\n"),
+                        limits.guest_output_bytes,
+                    ),
                 }
             }
             let _ = term.reset();
