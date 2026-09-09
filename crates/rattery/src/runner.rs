@@ -24,6 +24,27 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(750);
 pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 
 pub async fn run(app: App) -> Result<Report> {
+    // If anything inside panics, the terminal is restored by the session's
+    // drop and the panic hook is put back here, before the panic continues.
+    let hook_slot: crate::terminal::HookSlot = Arc::default();
+    let outcome = {
+        use futures::FutureExt;
+        std::panic::AssertUnwindSafe(run_inner(app, hook_slot.clone()))
+            .catch_unwind()
+            .await
+    };
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            if let Some(previous) = hook_slot.lock().ok().and_then(|mut g| g.take()) {
+                std::panic::set_hook(previous);
+            }
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Report> {
     let run_started = std::time::Instant::now();
     let limits = app.limits.clone();
     let on_phase = app.on_phase.clone();
@@ -115,12 +136,13 @@ pub async fn run(app: App) -> Result<Report> {
     let location = app.location.clone().or_else(|| loaded.location.clone());
     let (session, mut term) = match &app.headless {
         None => {
-            let session = Session::enter(app.mouse)?;
+            let session = Session::enter(app.mouse, hook_slot.clone())?;
             let term = TerminalHost::interactive(
                 server_origin.clone(),
                 location,
                 interrupter.clone(),
                 limits.event_queue,
+                limits.paste_bytes,
                 &mut tasks,
             );
             (Some(session), term)
@@ -131,6 +153,7 @@ pub async fn run(app: App) -> Result<Report> {
                 location,
                 interrupter.clone(),
                 limits.event_queue,
+                limits.paste_bytes,
                 options.width,
                 options.height,
             );
@@ -209,7 +232,7 @@ pub async fn run(app: App) -> Result<Report> {
             ext: std::mem::take(&mut ext),
         });
         let mut store = Store::new(&engine, state);
-        store.limiter(|state| state.store_limits());
+        store.limiter(|state| state.limiter());
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(|mut store| match store.data_mut().tick() {
             None => Ok(UpdateDeadline::Yield(1)),
@@ -233,13 +256,22 @@ pub async fn run(app: App) -> Result<Report> {
         };
         let state = store.into_data();
         // Nothing else keeps extension state; it stays with us across reloads.
-        let (t, e) = state.into_parts();
+        let (t, e, memory_peak) = state.into_parts();
         term = t;
         ext = e;
         stats = term.stats();
+        stats.memory_peak = memory_peak;
 
-        stdout_all.push_str(&String::from_utf8_lossy(&stdout.contents()));
-        stderr_all.push_str(&String::from_utf8_lossy(&stderr.contents()));
+        append_bounded(
+            &mut stdout_all,
+            &String::from_utf8_lossy(&stdout.contents()),
+            limits.guest_output_bytes,
+        );
+        append_bounded(
+            &mut stderr_all,
+            &String::from_utf8_lossy(&stderr.contents()),
+            limits.guest_output_bytes,
+        );
 
         let reason = interrupter.take_reason();
         if reason == Some(Interrupt::Reload) {
@@ -261,12 +293,17 @@ pub async fn run(app: App) -> Result<Report> {
             (_, Some(Interrupt::Reload)) | (None, None) => AppStatus::Exited(0),
             (Some(Ok(Ok(()))), None) => AppStatus::Exited(0),
             (Some(Ok(Err(message))), None) => {
-                stderr_all.push_str(&format!("{message}\n"));
+                let message = truncate(message, limits.message_bytes);
+                append_bounded(
+                    &mut stderr_all,
+                    &format!("{message}\n"),
+                    limits.guest_output_bytes,
+                );
                 AppStatus::Exited(1)
             }
             (Some(Err(err)), None) => match err.downcast_ref::<I32Exit>() {
                 Some(exit) => AppStatus::Exited(exit.0),
-                None => AppStatus::Trapped(format!("{err:?}")),
+                None => AppStatus::Trapped(truncate(format!("{err:?}"), limits.message_bytes)),
             },
         };
     };
@@ -292,6 +329,30 @@ pub async fn run(app: App) -> Result<Report> {
         timings,
         stats,
     })
+}
+
+/// Append to a text kept within `max` bytes in total: the oldest output goes.
+fn append_bounded(kept: &mut String, more: &str, max: usize) {
+    kept.push_str(more);
+    if kept.len() > max {
+        let mut cut = kept.len() - max;
+        while !kept.is_char_boundary(cut) {
+            cut += 1;
+        }
+        kept.drain(..cut);
+    }
+}
+
+fn truncate(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut cut = max;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("...");
+    }
+    text
 }
 
 fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {

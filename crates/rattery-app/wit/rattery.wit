@@ -5,7 +5,7 @@
 /// terminal. It is deliberately shaped like ratatui's `Backend` trait plus a
 /// crossterm-style event stream, so the guest never emits escape sequences and
 /// the host never needs to know what a widget is.
-package rattery:tui@0.1.0;
+package rattery:tui@0.2.0;
 
 interface terminal {
     // ---- rendering types -------------------------------------------------
@@ -244,6 +244,12 @@ interface terminal {
 
     /// Set the terminal window title.
     set-title: func(title: string);
+
+    /// Tell the host the app is ready for the user: its data is loaded and
+    /// it is showing a real screen rather than a placeholder. Optional;
+    /// embedders that want a readiness signal beyond "a frame was drawn"
+    /// wait for this.
+    ready: func();
 }
 
 /// WebSockets, provided by the host because WASI 0.2 has none. Connections
@@ -274,8 +280,9 @@ interface websocket {
         /// failed, the error, every time.
         receive: async func() -> result<message, error>;
 
-        /// Queue a message to send.
-        send: func(message: message) -> result<_, error>;
+        /// Send a message. Waits while the outgoing queue is full, so a
+        /// slow peer applies backpressure instead of growing host memory.
+        send: async func(message: message) -> result<_, error>;
 
         /// Close the connection.
         close: func();

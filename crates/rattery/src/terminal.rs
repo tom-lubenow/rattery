@@ -34,13 +34,17 @@ const KILL_WINDOW: Duration = Duration::from_millis(1500);
 
 type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync + 'static>;
 
+/// Where a session parks the panic hook it replaced. Shared with the runner
+/// so the hook can be put back even if the session was destroyed by a panic.
+pub type HookSlot = Arc<Mutex<Option<PanicHook>>>;
+
 /// Raw mode, alternate screen, and input reporting. Every step is undone if a
 /// later one fails, and everything is restored on drop, even on panic, so a
 /// misbehaving app never leaves the shell unusable. The panic hook installed
 /// for that is the previous hook wrapped, and is put back on drop.
 pub struct Session {
     steps: Vec<Step>,
-    previous_hook: Arc<Mutex<Option<PanicHook>>>,
+    previous_hook: HookSlot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +57,7 @@ enum Step {
 }
 
 impl Session {
-    pub fn enter(mouse: bool) -> Result<Self> {
+    pub fn enter(mouse: bool, previous_hook: HookSlot) -> Result<Self> {
         let mut steps = Vec::new();
         let mut out = io::stdout();
         let attempt = (|| -> Result<()> {
@@ -77,8 +81,7 @@ impl Session {
         }
 
         // Wrap the current panic hook so a panic restores the terminal first.
-        let previous_hook: Arc<Mutex<Option<PanicHook>>> =
-            Arc::new(Mutex::new(Some(std::panic::take_hook())));
+        *previous_hook.lock().unwrap() = Some(std::panic::take_hook());
         let hook_steps = steps.clone();
         let hook_previous = previous_hook.clone();
         std::panic::set_hook(Box::new(move |info| {
@@ -195,12 +198,23 @@ impl Tasks {
         self.handles.push(tokio::spawn(future));
     }
 
-    pub async fn shutdown(self) {
-        for handle in &self.handles {
+    pub async fn shutdown(mut self) {
+        let handles = std::mem::take(&mut self.handles);
+        for handle in &handles {
             handle.abort();
         }
-        for handle in self.handles {
+        for handle in handles {
             let _ = handle.await;
+        }
+    }
+}
+
+/// If the run is abandoned (the future dropped, a timeout, a panic), the
+/// tasks are cancelled rather than detached.
+impl Drop for Tasks {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
         }
     }
 }
@@ -243,15 +257,17 @@ impl KillDetector {
 pub struct EventQueue {
     events: Mutex<VecDeque<Event>>,
     capacity: usize,
+    paste_bytes: usize,
     notify: Notify,
     kill: Mutex<KillDetector>,
 }
 
 impl EventQueue {
-    fn new(interrupter: Arc<Interrupter>, capacity: usize) -> Self {
+    fn new(interrupter: Arc<Interrupter>, capacity: usize, paste_bytes: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
+            paste_bytes,
             notify: Notify::new(),
             kill: Mutex::new(KillDetector {
                 presses: VecDeque::new(),
@@ -260,7 +276,16 @@ impl EventQueue {
         }
     }
 
-    pub fn push(&self, event: Event) {
+    pub fn push(&self, mut event: Event) {
+        if let Event::Paste(text) = &mut event
+            && text.len() > self.paste_bytes
+        {
+            let mut cut = self.paste_bytes;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+        }
         self.kill.lock().unwrap().observe(&event);
         let mut events = self.events.lock().unwrap();
         if events.len() >= self.capacity {
@@ -307,6 +332,8 @@ pub struct Stats {
     pub events: u64,
     /// When the first `draw` arrived, relative to the app starting.
     pub first_draw: Option<Duration>,
+    /// The most linear memory the app had in use at once, in bytes.
+    pub memory_peak: usize,
 }
 
 /// The text of a headless screen.
@@ -398,9 +425,10 @@ impl TerminalHost {
         location: Option<String>,
         interrupter: Arc<Interrupter>,
         queue_capacity: usize,
+        paste_bytes: usize,
         tasks: &mut Tasks,
     ) -> Self {
-        let queue = Arc::new(EventQueue::new(interrupter, queue_capacity));
+        let queue = Arc::new(EventQueue::new(interrupter, queue_capacity, paste_bytes));
         tasks.spawn(read_input(queue.clone()));
         Self {
             output: Output::Crossterm(CrosstermBackend::new(io::stdout())),
@@ -420,12 +448,13 @@ impl TerminalHost {
         location: Option<String>,
         interrupter: Arc<Interrupter>,
         queue_capacity: usize,
+        paste_bytes: usize,
         width: u16,
         height: u16,
     ) -> Self {
         Self {
             output: Output::Test(Arc::new(Mutex::new(TestBackend::new(width, height)))),
-            queue: Arc::new(EventQueue::new(interrupter, queue_capacity)),
+            queue: Arc::new(EventQueue::new(interrupter, queue_capacity, paste_bytes)),
             origin,
             location,
             snapshots: Arc::default(),
@@ -478,12 +507,6 @@ impl TerminalHost {
     /// screen are dropped, symbols are validated (see [`sanitize::symbol`]).
     pub fn draw(&mut self, updates: &[CellUpdate]) -> io::Result<()> {
         let t = Instant::now();
-        if self.stats.first_draw.is_none() {
-            self.stats.first_draw = Some(t.duration_since(self.started));
-            if let Some(hook) = &self.on_phase {
-                hook(Phase::Ready);
-            }
-        }
         let size = with_backend!(self, |b| b.size())?;
         let mut rejected = 0u64;
         let mut cells: Vec<(u16, u16, ratatui::buffer::Cell)> = Vec::with_capacity(updates.len());
@@ -499,6 +522,12 @@ impl TerminalHost {
             cells.push((u.x, u.y, convert::cell(&u.cell, &symbol)));
         }
         let result = with_backend!(self, |b| b.draw(cells.iter().map(|(x, y, c)| (*x, *y, c))));
+        if result.is_ok() && self.stats.first_draw.is_none() {
+            self.stats.first_draw = Some(t.duration_since(self.started));
+            if let Some(hook) = &self.on_phase {
+                hook(Phase::Ready);
+            }
+        }
         self.stats.draws += 1;
         self.stats.cells += updates.len() as u64;
         self.stats.cells_rejected += rejected;
@@ -506,7 +535,10 @@ impl TerminalHost {
         result
     }
 
+    /// Scroll by up to one screen; more is pointless and costs output.
     pub fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        let size = with_backend!(self, |b| b.size())?;
+        let n = n.min(size.height);
         with_backend!(self, |b| b.append_lines(n))
     }
 
@@ -595,6 +627,13 @@ impl TerminalHost {
     /// Count an event delivered through `next-event`.
     pub fn note_event(&mut self) {
         self.stats.events += 1;
+    }
+
+    /// The app declared itself ready.
+    pub fn app_ready(&mut self) {
+        if let Some(hook) = &self.on_phase {
+            hook(Phase::AppReady);
+        }
     }
 }
 

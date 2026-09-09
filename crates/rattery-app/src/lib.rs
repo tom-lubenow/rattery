@@ -40,7 +40,7 @@ pub use server_fn::ServerFnError;
 
 /// The host contract this crate targets; must equal `rattery::ABI` of the
 /// host that runs the app. Record it in release metadata.
-pub const ABI: &str = "rattery:tui@0.1.0;cm-async;wasi:http@0.3.0";
+pub const ABI: &str = "rattery:tui@0.2.0;cm-async;wasi:http@0.3.0";
 
 pub mod event;
 pub mod multipart;
@@ -52,8 +52,8 @@ mod wasi;
 pub use wasi::__run_app;
 #[cfg(target_os = "wasi")]
 pub use wasi::{
-    Terminal, backend::RatteryBackend, bindings, client::ServerFnClient, location, origin, runtime,
-    set_title, task, time, websocket,
+    Terminal, backend::RatteryBackend, bindings, client::ServerFnClient, location, origin, ready,
+    runtime, set_title, task, time, websocket,
 };
 
 /// Declare the app's entry point: an `async fn(Terminal) -> Result<(), E>`.

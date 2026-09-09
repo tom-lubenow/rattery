@@ -1,13 +1,14 @@
 //! WebSockets on behalf of the guest: tokio-tungstenite behind the
 //! `rattery:tui/websocket` interface, with the origin policy, the embedder's
-//! request policy, the cookie jar, and the queue and message limits applied.
+//! request policy, the cookie jar, and the queue and message limits applied
+//! in both directions.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use futures::{SinkExt, StreamExt};
 use http::header::{COOKIE, ORIGIN};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message as WsMessage, WebSocketConfig};
@@ -18,51 +19,145 @@ use crate::http::{CookieJar, Decision, OriginPolicy, RequestInfo, RequestKind, R
 use crate::terminal::PhaseHook;
 use crate::{Limits, Phase};
 
-#[derive(Default)]
-struct State {
-    incoming: VecDeque<Message>,
-    /// Messages dropped because the app was not reading.
+/// A bounded queue of messages: at most `capacity` messages and `bytes`
+/// bytes together.
+struct Queue {
+    items: VecDeque<WsMessage>,
+    bytes: usize,
+    capacity: usize,
+    max_bytes: usize,
+    /// Incoming only: messages dropped because the app was not reading.
     dropped: u64,
-    failure: Option<Error>,
+    closed: bool,
 }
 
-/// State shared between the socket resource, its reader task, and any
-/// `receive` call in flight.
+impl Queue {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
+        Self {
+            items: VecDeque::new(),
+            bytes: 0,
+            capacity: capacity.max(1),
+            max_bytes: max_bytes.max(1),
+            dropped: 0,
+            closed: false,
+        }
+    }
+
+    fn has_room_for(&self, size: usize) -> bool {
+        self.items.len() < self.capacity && self.bytes + size <= self.max_bytes
+    }
+
+    fn push_back(&mut self, message: WsMessage) {
+        self.bytes += message.len();
+        self.items.push_back(message);
+    }
+
+    fn pop_front(&mut self) -> Option<WsMessage> {
+        let message = self.items.pop_front()?;
+        self.bytes -= message.len();
+        Some(message)
+    }
+}
+
+/// State shared between the socket resource, its connection task, and the
+/// `send` and `receive` calls in flight.
 pub struct Shared {
-    state: Mutex<State>,
-    notify: Notify,
-    queue_capacity: usize,
+    incoming: Mutex<Queue>,
+    incoming_notify: Notify,
+    outgoing: Mutex<Queue>,
+    /// Woken when the connection task drained something (room for `send`).
+    room_notify: Notify,
+    /// Woken when `send` queued something (work for the connection task).
+    work_notify: Notify,
+    failure: Mutex<Option<Error>>,
 }
 
 impl Shared {
-    fn update(&self, f: impl FnOnce(&mut State)) {
-        f(&mut self.state.lock().unwrap());
-        self.notify.notify_one();
+    fn fail(&self, failure: Error) {
+        let mut slot = self.failure.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+        drop(slot);
+        self.outgoing.lock().unwrap().closed = true;
+        self.incoming_notify.notify_waiters();
+        self.incoming_notify.notify_one();
+        self.room_notify.notify_waiters();
+        self.work_notify.notify_one();
+    }
+
+    fn failure(&self) -> Option<Error> {
+        self.failure.lock().unwrap().clone()
     }
 
     /// Queue an incoming message; when the app is not reading, the oldest
-    /// message gives way rather than the queue growing.
-    fn push(&self, message: Message) {
-        self.update(|s| {
-            if s.incoming.len() >= self.queue_capacity {
-                s.incoming.pop_front();
-                s.dropped += 1;
-            }
-            s.incoming.push_back(message);
-        });
+    /// messages give way rather than the queue growing.
+    fn push_incoming(&self, message: WsMessage) {
+        let mut queue = self.incoming.lock().unwrap();
+        while !queue.has_room_for(message.len()) && queue.pop_front().is_some() {
+            queue.dropped += 1;
+        }
+        queue.push_back(message);
+        drop(queue);
+        self.incoming_notify.notify_one();
     }
 
     /// Wait for the next message. Backs `socket.receive`.
     pub async fn next_message(&self) -> Result<Message, Error> {
         loop {
-            let notified = self.notify.notified();
+            let notified = self.incoming_notify.notified();
+            if let Some(message) = self.incoming.lock().unwrap().pop_front() {
+                return Ok(convert_incoming(message));
+            }
+            if let Some(failure) = self.failure() {
+                return Err(failure);
+            }
+            notified.await;
+        }
+    }
+
+    /// Queue an outgoing message, waiting for room. Backs `socket.send`.
+    pub async fn send(&self, message: Message) -> Result<(), Error> {
+        let message = match message {
+            Message::Text(text) => WsMessage::Text(text.into()),
+            Message::Binary(bytes) => WsMessage::Binary(bytes.into()),
+        };
+        loop {
+            let notified = self.room_notify.notified();
+            if let Some(failure) = self.failure() {
+                return Err(failure);
+            }
             {
-                let mut state = self.state.lock().unwrap();
-                if let Some(message) = state.incoming.pop_front() {
-                    return Ok(message);
+                let mut queue = self.outgoing.lock().unwrap();
+                if queue.has_room_for(message.len()) {
+                    queue.push_back(message);
+                    drop(queue);
+                    self.work_notify.notify_one();
+                    return Ok(());
                 }
-                if let Some(failure) = &state.failure {
-                    return Err(failure.clone());
+            }
+            notified.await;
+        }
+    }
+
+    pub fn close(&self) {
+        self.outgoing.lock().unwrap().closed = true;
+        self.work_notify.notify_one();
+    }
+
+    /// The next outgoing message, or `None` once closed and drained.
+    async fn next_outgoing(&self) -> Option<WsMessage> {
+        loop {
+            let notified = self.work_notify.notified();
+            {
+                let mut queue = self.outgoing.lock().unwrap();
+                if let Some(message) = queue.pop_front() {
+                    drop(queue);
+                    self.room_notify.notify_waiters();
+                    return Some(message);
+                }
+                if queue.closed {
+                    return None;
                 }
             }
             notified.await;
@@ -70,16 +165,18 @@ impl Shared {
     }
 }
 
-enum Outgoing {
-    Message(WsMessage),
-    Close,
+fn convert_incoming(message: WsMessage) -> Message {
+    match message {
+        WsMessage::Text(text) => Message::Text(text.to_string()),
+        WsMessage::Binary(bytes) => Message::Binary(bytes.to_vec()),
+        other => Message::Binary(other.into_data().to_vec()),
+    }
 }
 
 /// The host side of a `websocket.socket` resource. Dropping it closes the
-/// connection and stops its reader task.
+/// connection and stops its task.
 pub struct WsSocket {
     shared: Arc<Shared>,
-    outgoing: mpsc::UnboundedSender<Outgoing>,
     task: JoinHandle<()>,
     max_message_bytes: usize,
     _guard: crate::http::PolicyGuard,
@@ -160,7 +257,8 @@ impl WsSocket {
 
         let config = WebSocketConfig::default()
             .max_message_size(Some(limits.websocket_message_bytes))
-            .max_frame_size(Some(limits.websocket_message_bytes));
+            .max_frame_size(Some(limits.websocket_message_bytes))
+            .max_write_buffer_size(limits.websocket_queue_bytes.max(64 << 10));
         let (stream, response) =
             tokio_tungstenite::connect_async_with_config(request, Some(config), false)
                 .await
@@ -170,15 +268,22 @@ impl WsSocket {
         }
 
         let shared = Arc::new(Shared {
-            state: Mutex::default(),
-            notify: Notify::new(),
-            queue_capacity: limits.websocket_queue.max(1),
+            incoming: Mutex::new(Queue::new(
+                limits.websocket_queue,
+                limits.websocket_queue_bytes,
+            )),
+            incoming_notify: Notify::new(),
+            outgoing: Mutex::new(Queue::new(
+                limits.websocket_queue,
+                limits.websocket_queue_bytes,
+            )),
+            room_notify: Notify::new(),
+            work_notify: Notify::new(),
+            failure: Mutex::new(None),
         });
-        let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_connection(stream, shared.clone(), rx));
+        let task = tokio::spawn(run_connection(stream, shared.clone()));
         Ok(Self {
             shared,
-            outgoing: tx,
             task,
             max_message_bytes: limits.websocket_message_bytes,
             _guard: guard,
@@ -189,14 +294,9 @@ impl WsSocket {
         self.shared.clone()
     }
 
-    pub fn send(&self, message: Message) -> Result<(), Error> {
-        {
-            let state = self.shared.state.lock().unwrap();
-            if let Some(failure) = &state.failure {
-                return Err(failure.clone());
-            }
-        }
-        let size = match &message {
+    /// Refuse a message over the size limit before it is queued.
+    pub fn check_size(&self, message: &Message) -> Result<(), Error> {
+        let size = match message {
             Message::Text(text) => text.len(),
             Message::Binary(bytes) => bytes.len(),
         };
@@ -206,17 +306,11 @@ impl WsSocket {
                 self.max_message_bytes
             )));
         }
-        let message = match message {
-            Message::Text(text) => WsMessage::Text(text.into()),
-            Message::Binary(bytes) => WsMessage::Binary(bytes.into()),
-        };
-        self.outgoing
-            .send(Outgoing::Message(message))
-            .map_err(|_| Error::Closed(None))
+        Ok(())
     }
 
     pub fn close(&self) {
-        let _ = self.outgoing.send(Outgoing::Close);
+        self.shared.close();
     }
 }
 
@@ -232,25 +326,25 @@ async fn run_connection(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     shared: Arc<Shared>,
-    mut outgoing: mpsc::UnboundedReceiver<Outgoing>,
 ) {
     let (mut sink, mut source) = stream.split();
     let failure = loop {
         tokio::select! {
-            next = outgoing.recv() => match next {
-                Some(Outgoing::Message(message)) => {
+            next = shared.next_outgoing() => match next {
+                Some(message) => {
                     if let Err(err) = sink.send(message).await {
                         break Error::Protocol(err.to_string());
                     }
                 }
-                Some(Outgoing::Close) | None => {
+                None => {
                     let _ = sink.close().await;
                     break Error::Closed(None);
                 }
             },
             incoming = source.next() => match incoming {
-                Some(Ok(WsMessage::Text(text))) => shared.push(Message::Text(text.to_string())),
-                Some(Ok(WsMessage::Binary(bytes))) => shared.push(Message::Binary(bytes.to_vec())),
+                Some(Ok(message @ (WsMessage::Text(_) | WsMessage::Binary(_)))) => {
+                    shared.push_incoming(message);
+                }
                 Some(Ok(WsMessage::Close(frame))) => {
                     break Error::Closed(frame.map(|f| f.reason.to_string()));
                 }
@@ -260,5 +354,24 @@ async fn run_connection(
             },
         }
     };
-    shared.update(|s| s.failure = Some(failure));
+    shared.fail(failure);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_bounds_count_and_bytes() {
+        let mut q = Queue::new(2, 10);
+        assert!(q.has_room_for(6));
+        q.push_back(WsMessage::Binary(vec![0; 6].into()));
+        assert!(!q.has_room_for(5), "bytes cap");
+        assert!(q.has_room_for(4));
+        q.push_back(WsMessage::Binary(vec![0; 1].into()));
+        assert!(!q.has_room_for(1), "count cap");
+        q.pop_front();
+        assert!(q.has_room_for(3));
+        assert_eq!(q.bytes, 1);
+    }
 }

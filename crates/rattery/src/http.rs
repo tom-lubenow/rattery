@@ -244,15 +244,7 @@ impl CookieJar {
                 path.display()
             );
         }
-        let store = match open_no_follow(&path) {
-            Some(file) => {
-                let _ = file.lock_shared();
-                let loaded = cookie_store::serde::json::load_all(BufReader::new(&file)).ok();
-                let _ = file.unlock();
-                loaded.unwrap_or_default()
-            }
-            None => CookieStore::default(),
-        };
+        let store = with_jar_lock(&path, || load_store(&path))?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             path: Some(path),
@@ -282,45 +274,94 @@ impl CookieJar {
     }
 
     /// Record `Set-Cookie` headers, within quota: oversized cookies and
-    /// cookies beyond the per-host limit are ignored.
+    /// cookies beyond the per-domain limit are ignored. With a persistent
+    /// jar this is one locked load-modify-save transaction, so concurrent
+    /// processes never overwrite each other's cookies.
     pub fn store_response(&self, url: &Url, headers: &http::HeaderMap) {
-        let mut stored = false;
-        {
-            let mut store = self.store.lock().unwrap();
-            for value in headers.get_all(SET_COOKIE) {
-                let Ok(text) = value.to_str() else { continue };
-                if text.len() > self.max_cookie_bytes {
-                    continue;
-                }
-                let name = text.split('=').next().unwrap_or("").trim();
-                let existing = store.get_request_values(url).count();
-                let replaces = store.get_request_values(url).any(|(n, _)| n == name);
-                if existing >= self.max_per_host && !replaces {
-                    continue;
-                }
-                stored |= store.parse(text, url).is_ok();
-            }
+        let values: Vec<&str> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter(|text| text.len() <= self.max_cookie_bytes)
+            .collect();
+        if values.is_empty() {
+            return;
         }
-        if stored {
-            self.save();
+        match &self.path {
+            None => {
+                let mut store = self.store.lock().unwrap();
+                self.merge(&mut store, url, &values);
+            }
+            Some(path) => {
+                let result = with_jar_lock(path, || {
+                    let mut store = load_store(path)?;
+                    self.merge(&mut store, url, &values);
+                    save_private(path, |file| {
+                        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, file)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    })?;
+                    Ok(store)
+                });
+                match result {
+                    Ok(store) => *self.store.lock().unwrap() = store,
+                    Err(err) => {
+                        eprintln!(
+                            "rattery: could not save cookies to {}: {err}",
+                            path.display()
+                        )
+                    }
+                }
+            }
         }
     }
 
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
-        if let Err(err) = save_private(path, |file| {
-            cookie_store::serde::json::save_incl_expired_and_nonpersistent(
-                &self.store.lock().unwrap(),
-                file,
-            )
-            .map_err(|e| std::io::Error::other(e.to_string()))
-        }) {
-            eprintln!(
-                "rattery: could not save cookies to {}: {err}",
-                path.display()
-            );
+    /// Apply `Set-Cookie` values within the per-domain quota, counting every
+    /// cookie stored for the domain whatever its path.
+    fn merge(&self, store: &mut CookieStore, url: &Url, values: &[&str]) {
+        for text in values {
+            let name = text.split('=').next().unwrap_or("").trim();
+            let for_domain: Vec<String> = store
+                .iter_any()
+                .filter(|c| c.domain.matches(url))
+                .map(|c| c.name().to_owned())
+                .collect();
+            let replaces = for_domain.iter().any(|n| n == name);
+            if for_domain.len() >= self.max_per_host && !replaces {
+                continue;
+            }
+            let _ = store.parse(text, url);
         }
     }
+}
+
+fn load_store(path: &Path) -> Result<CookieStore> {
+    match open_no_follow(path) {
+        Some(file) => {
+            Ok(cookie_store::serde::json::load_all(BufReader::new(file)).unwrap_or_default())
+        }
+        None => Ok(CookieStore::default()),
+    }
+}
+
+/// Run `f` holding the jar's lock file exclusively: one lock for readers and
+/// writers, so a load-modify-save is a transaction.
+fn with_jar_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let parent = path
+        .parent()
+        .context("cookie jar has no parent directory")?;
+    let mut dir = std::fs::DirBuilder::new();
+    dir.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dir.mode(0o700);
+    }
+    dir.create(parent)?;
+    let lock = private_file(&path.with_extension("lock"), false)?;
+    lock.lock()?;
+    let result = f();
+    let _ = lock.unlock();
+    result
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -355,9 +396,9 @@ fn libc_o_nofollow() -> i32 {
     }
 }
 
-/// Write `path` privately and atomically: owner-only directory and file, a
-/// temporary file synced and renamed into place under an exclusive lock, and
-/// the directory synced afterwards.
+/// Write `path` privately and atomically: owner-only file, a temporary file
+/// synced and renamed into place, and the directory synced afterwards. The
+/// caller holds the jar lock.
 fn save_private(
     path: &Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
@@ -365,22 +406,9 @@ fn save_private(
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("no parent directory"))?;
-    let mut dir = std::fs::DirBuilder::new();
-    dir.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        dir.mode(0o700);
-    }
-    dir.create(parent)?;
     if is_symlink(path) {
         return Err(std::io::Error::other("target is a symbolic link"));
     }
-
-    let lock_path = path.with_extension("lock");
-    let lock = private_file(&lock_path, false)?;
-    lock.lock()?;
-
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let result = (|| {
         let mut file = private_file(&tmp, true)?;
@@ -394,7 +422,6 @@ fn save_private(
         Ok(())
     })();
     let _ = std::fs::remove_file(&tmp);
-    let _ = lock.unlock();
     result
 }
 

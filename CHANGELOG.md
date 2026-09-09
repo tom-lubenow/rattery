@@ -23,6 +23,13 @@ First release on crates.io: `rattery` (host library), `rattery-app` (app crate),
   exit, the panic hook restored, transactional terminal setup.
 - Embedding controls: `RequestPolicy`, `on_phase`, `extension` and `state`,
   `from_resolver`, `inspect`, `ABI`. Minimum supported Rust 1.95.
+- Second hardening pass: aggregate memory limit across memories and a host
+  resource-count limit; websocket `send` is async with bounded, byte-quota'd
+  queues in both directions and socket slots reserved before the handshake;
+  tasks cancelled on drop and the panic hook restored across a panic;
+  `Phase::Ready` only after a successful frame plus `rattery_app::ready()` /
+  `Phase::AppReady`; paste, append, output, and message size caps; one cookie
+  jar lock for load-modify-save and per-domain quotas. WIT package 0.2.0.
 
 ## 0.1.0 (2026-09-07)
 

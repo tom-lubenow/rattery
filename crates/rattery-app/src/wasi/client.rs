@@ -297,6 +297,7 @@ where
             let sink = futures::sink::unfold(socket, |socket, bytes: Bytes| async move {
                 socket
                     .send(Message::Binary(bytes.to_vec()))
+                    .await
                     .map_err(|err| ServerFnErrorErr::Request(err.to_string()))?;
                 Ok::<_, ServerFnErrorErr>(socket)
             });

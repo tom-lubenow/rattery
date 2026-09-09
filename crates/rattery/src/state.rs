@@ -11,7 +11,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use wasmtime::StoreLimits;
+use wasmtime::ResourceLimiter;
 use wasmtime::component::{Accessor, HasSelf, Resource, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
@@ -29,6 +29,89 @@ pub struct CpuBudget {
     pub budget_ticks: Option<u64>,
 }
 
+/// Bounds memory and tables *in aggregate* across every memory and table
+/// the instance has, unlike wasmtime's `StoreLimits`, whose limits apply to
+/// each memory separately.
+pub struct AggregateLimiter {
+    memory_limit: usize,
+    memory_used: usize,
+    table_limit: usize,
+    table_used: usize,
+    memories: usize,
+    tables: usize,
+    instances: usize,
+    peak: usize,
+}
+
+impl AggregateLimiter {
+    pub fn new(limits: &Limits) -> Self {
+        Self {
+            memory_limit: limits.memory_bytes,
+            memory_used: 0,
+            table_limit: limits.table_elements,
+            table_used: 0,
+            memories: limits.memories,
+            tables: limits.tables,
+            instances: limits.instances,
+            peak: 0,
+        }
+    }
+
+    /// The most linear memory in use at once across all memories.
+    pub fn memory_peak(&self) -> usize {
+        self.peak
+    }
+}
+
+impl ResourceLimiter for AggregateLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let others = self.memory_used.saturating_sub(current);
+        if others.saturating_add(desired) > self.memory_limit {
+            return Err(wasmtime::Error::msg(format!(
+                "memory limit of {} bytes exceeded (growing to {desired} bytes with {others} bytes in other memories)",
+                self.memory_limit
+            )));
+        }
+        self.memory_used = others + desired;
+        self.peak = self.peak.max(self.memory_used);
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let others = self.table_used.saturating_sub(current);
+        if others.saturating_add(desired) > self.table_limit {
+            return Err(wasmtime::Error::msg(format!(
+                "table limit of {} elements exceeded",
+                self.table_limit
+            )));
+        }
+        self.table_used = others + desired;
+        Ok(true)
+    }
+
+    fn instances(&self) -> usize {
+        self.instances
+    }
+
+    fn tables(&self) -> usize {
+        self.tables
+    }
+
+    fn memories(&self) -> usize {
+        self.memories
+    }
+}
+
 /// The data behind the wasmtime `Store`. Host extensions registered with
 /// [`App::extension`](crate::App::extension) receive a
 /// `Linker<HostState>` and can keep their own state in it through
@@ -43,7 +126,7 @@ pub struct HostState {
     request_policy: Option<Arc<dyn RequestPolicy>>,
     term: TerminalHost,
     limits: Limits,
-    store_limits: StoreLimits,
+    limiter: AggregateLimiter,
     cpu: CpuBudget,
     interrupter: Arc<Interrupter>,
     on_phase: Option<PhaseHook>,
@@ -76,19 +159,14 @@ impl HostState {
             on_phase,
             ext,
         } = config;
-        let store_limits = wasmtime::StoreLimitsBuilder::new()
-            .memory_size(limits.memory_bytes)
-            .table_elements(limits.table_elements)
-            .tables(limits.tables)
-            .memories(limits.memories)
-            .instances(limits.instances)
-            .trap_on_grow_failure(true)
-            .build();
+        let limiter = AggregateLimiter::new(&limits);
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(limits.resources);
         let budget_ticks = limits
             .cpu_time
             .map(|d| (d.as_nanos() / crate::runner::EPOCH_TICK.as_nanos()).max(1) as u64);
         Self {
-            table: ResourceTable::new(),
+            table,
             wasi,
             http: WasiHttpCtx::new(),
             hooks: OriginHooks::new(
@@ -103,7 +181,7 @@ impl HostState {
             request_policy,
             term,
             limits,
-            store_limits,
+            limiter,
             cpu: CpuBudget {
                 ticks: 0,
                 budget_ticks,
@@ -119,13 +197,14 @@ impl HostState {
         self.term
     }
 
-    /// The terminal and the extension state, to carry across a reload.
-    pub(crate) fn into_parts(self) -> (TerminalHost, HashMap<TypeId, Box<dyn Any + Send>>) {
-        (self.term, self.ext)
+    /// The terminal, the extension state (carried across a reload), and the
+    /// peak memory the app used.
+    pub(crate) fn into_parts(self) -> (TerminalHost, HashMap<TypeId, Box<dyn Any + Send>>, usize) {
+        (self.term, self.ext, self.limiter.memory_peak())
     }
 
-    pub(crate) fn store_limits(&mut self) -> &mut StoreLimits {
-        &mut self.store_limits
+    pub(crate) fn limiter(&mut self) -> &mut AggregateLimiter {
+        &mut self.limiter
     }
 
     /// State registered with [`App::state`](crate::App::state).
@@ -263,6 +342,11 @@ impl terminal::Host for HostState {
         self.term.set_title(&title)?;
         Ok(())
     }
+
+    async fn ready(&mut self) -> wasmtime::Result<()> {
+        self.term.app_ready();
+        Ok(())
+    }
 }
 
 impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
@@ -277,14 +361,6 @@ impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
 impl websocket::Host for HostState {}
 
 impl websocket::HostSocket for HostState {
-    async fn send(
-        &mut self,
-        this: Resource<WsSocket>,
-        message: websocket::Message,
-    ) -> wasmtime::Result<Result<(), websocket::Error>> {
-        Ok(self.table.get(&this)?.send(message))
-    }
-
     async fn close(&mut self, this: Resource<WsSocket>) -> wasmtime::Result<()> {
         self.table.get(&this)?.close();
         Ok(())
@@ -302,27 +378,35 @@ impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
         store: &Accessor<U, Self>,
         url: String,
     ) -> wasmtime::Result<Result<Resource<WsSocket>, websocket::Error>> {
-        let (policy, cookies, request_policy, on_phase, limits, open) = store.with(|mut view| {
+        // Reserve a socket slot before awaiting, so concurrent attempts
+        // cannot overshoot the limit together.
+        let reserved = store.with(|mut view| {
             let state = view.get();
-            (
+            if state.websockets >= state.limits.websockets {
+                return None;
+            }
+            state.websockets += 1;
+            Some((
                 state.policy.clone(),
                 state.cookies.clone(),
                 state.request_policy.clone(),
                 state.on_phase.clone(),
                 state.limits.clone(),
-                state.websockets,
-            )
+            ))
         });
-        if open >= limits.websockets {
-            if let Some(hook) = &on_phase {
-                hook(Phase::RequestDenied {
-                    url: url.clone(),
-                    reason: format!("websocket limit of {} reached", limits.websockets),
-                });
-            }
+        let Some((policy, cookies, request_policy, on_phase, limits)) = reserved else {
+            store.with(|mut view| {
+                let state = view.get();
+                if let Some(hook) = &state.on_phase {
+                    hook(Phase::RequestDenied {
+                        url: url.clone(),
+                        reason: format!("websocket limit of {} reached", state.limits.websockets),
+                    });
+                }
+            });
             return Ok(Err(websocket::Error::Denied));
-        }
-        match WsSocket::connect(
+        };
+        let connected = WsSocket::connect(
             &url,
             &policy,
             cookies.as_ref(),
@@ -330,13 +414,27 @@ impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
             on_phase.as_ref(),
             &limits,
         )
-        .await
-        {
-            Ok(socket) => Ok(Ok(store.with(|mut view| {
-                let state = view.get();
-                state.websockets += 1;
-                state.table.push(socket)
-            })?)),
+        .await;
+        match connected {
+            Ok(socket) => Ok(Ok(store.with(|mut view| view.get().table.push(socket))?)),
+            Err(err) => {
+                store.with(|mut view| view.get().websockets -= 1);
+                Ok(Err(err))
+            }
+        }
+    }
+
+    async fn send(
+        store: &Accessor<U, Self>,
+        this: Resource<WsSocket>,
+        message: websocket::Message,
+    ) -> wasmtime::Result<Result<(), websocket::Error>> {
+        let shared = store.with(|mut view| {
+            let socket = view.get().table.get(&this)?;
+            Ok::<_, wasmtime::Error>(socket.check_size(&message).map(|()| socket.shared()))
+        })?;
+        match shared {
+            Ok(shared) => Ok(shared.send(message).await),
             Err(err) => Ok(Err(err)),
         }
     }
@@ -347,5 +445,26 @@ impl<U> websocket::HostSocketWithStore<U> for HasSelf<HostState> {
     ) -> wasmtime::Result<Result<websocket::Message, websocket::Error>> {
         let shared = store.with(|mut view| view.get().table.get(&this).map(WsSocket::shared))?;
         Ok(shared.next_message().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_limit_is_aggregate_across_memories() {
+        let limits = Limits {
+            memory_bytes: 100,
+            ..Limits::default()
+        };
+        let mut limiter = AggregateLimiter::new(&limits);
+        assert!(limiter.memory_growing(0, 60, None).unwrap());
+        // A second memory: 60 in use elsewhere, 50 more would exceed 100.
+        assert!(limiter.memory_growing(0, 50, None).is_err());
+        assert!(limiter.memory_growing(0, 40, None).unwrap());
+        // The first memory growing from 60 to 70: 40 + 70 > 100.
+        assert!(limiter.memory_growing(60, 70, None).is_err());
+        assert_eq!(limiter.memory_peak(), 100);
     }
 }

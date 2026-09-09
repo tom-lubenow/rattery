@@ -96,10 +96,12 @@ impl WebSocket {
         Ok(self.socket.receive().await?.into())
     }
 
-    /// Queue a message to send.
-    pub fn send(&self, message: impl Into<Message>) -> Result<(), Error> {
+    /// Send a message. Waits while the outgoing queue is full: a slow peer
+    /// applies backpressure to the app instead of growing memory.
+    pub async fn send(&self, message: impl Into<Message>) -> Result<(), Error> {
         self.socket
-            .send(&message.into().into())
+            .send(message.into().into())
+            .await
             .map_err(Error::from)
     }
 

@@ -42,11 +42,13 @@ generic failure.
 
 **Cookies.** The app never sees `Cookie` or `Set-Cookie`; the host attaches
 and records them, so `HttpOnly` holds and the app cannot forge or exfiltrate
-credentials through headers. Quotas: 64 cookies per host, 4 KiB each. A
-persistent jar is a private file: owner-only permissions in an owner-only
-directory, never followed through a symbolic link, shared between processes
-under a file lock, replaced by writing a temporary file, syncing it, renaming
-it into place, and syncing the directory.
+credentials through headers. Quotas: 64 cookies per domain whatever their
+paths, 4 KiB each. A persistent jar is a private file: owner-only permissions
+in an owner-only directory, never followed through a symbolic link, and
+every load and every load-modify-save runs under one exclusive lock shared by
+readers and writers, so concurrent processes never overwrite each other's
+cookies. Writes go to a temporary file that is synced, renamed into place,
+and followed by a directory sync.
 
 ## Resource limits
 
@@ -55,19 +57,23 @@ ordinary TUI and can be tightened for untrusted apps.
 
 | limit | default | enforced by |
 |---|---|---|
-| linear memory | 256 MiB | wasmtime store limiter, growth traps |
+| linear memory | 256 MiB in aggregate across all memories | a custom `ResourceLimiter`; growth beyond it traps |
+| host resources held (streams, bodies, sockets) | 4096 | `ResourceTable` capacity |
 | CPU time | unlimited | epoch ticks every 10 ms while the guest executes; over budget stops the app with `AppStatus::LimitExceeded` |
 | component size | 64 MiB | checked before download completes and before compile |
 | download time | 60 s | HTTP client timeout |
 | input event queue | 1024 | oldest events dropped |
+| paste event | 1 MiB | longer pastes are cut at a character boundary |
 | cells per frame | 1 M | frame refused, app stopped |
-| open websockets | 16 | connect refused |
-| websocket queue | 1024 messages | oldest dropped |
+| open websockets | 16 | a slot is reserved before the handshake, so concurrent attempts cannot overshoot |
+| websocket queues | 64 messages and 4 MiB per direction | incoming: oldest dropped; outgoing: `send` is async and waits (backpressure) |
 | websocket message | 16 MiB | tungstenite frame and message caps, send refused |
 | concurrent HTTP requests | 16 | semaphore held for the request's lifetime |
 | request body | 64 MiB | `Limited` body |
 | response body | 64 MiB | `Limited` body |
-| guest stdout / stderr | 1 MiB each | bounded pipe |
+| guest stdout / stderr | 1 MiB each, in total across reloads | bounded pipe, oldest output dropped |
+| error and trap messages | 16 KiB | truncated |
+| `append-lines` | one screen | clamped to the screen height |
 | tables, memories, instances | 32, 8, 16 | wasmtime store limiter |
 
 The epoch ticks continuously from a host task, not only when the host has
@@ -79,10 +85,17 @@ and every tick yields to the host so input, timeouts, the kill switch
 
 Every task started for a run (input reader, epoch ticker, watcher, script
 runner, timeout, websocket connections) is cancelled and awaited before the
-terminal is handed back. Terminal setup is transactional: if enabling a later
-mode fails, the earlier ones are undone, and on exit or panic every mode is
-restored in reverse order. The panic hook installed for that wraps the
-previous hook and is put back on exit.
+terminal is handed back, and cancelled by `Drop` if the run is abandoned (the
+future dropped, a timeout, a panic). Terminal setup is transactional: if
+enabling a later mode fails, the earlier ones are undone, and on exit or panic
+every mode is restored in reverse order. The panic hook installed for that
+wraps the previous hook; it is put back on exit, and if the run panics, the
+panic is caught, the hook restored, and the panic resumed.
+
+`Phase::Ready` fires after the first frame has been validated and drawn
+successfully. An app that wants a stronger signal calls
+`rattery_app::ready()` when its data is loaded and a real screen is up, which
+arrives as `Phase::AppReady`.
 
 ## Compatibility
 

@@ -35,6 +35,13 @@ pub fn set_title(title: &str) {
     bindings::terminal::set_title(title)
 }
 
+/// Tell the host the app is ready for the user: data loaded, a real screen
+/// showing. Optional; embedders may wait for it (`Phase::AppReady`) rather
+/// than for the first frame.
+pub fn ready() {
+    bindings::terminal::ready()
+}
+
 /// Timers that cooperate with the runtime.
 pub mod time {
     use std::time::Duration;

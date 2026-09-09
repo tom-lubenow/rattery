@@ -108,7 +108,7 @@ pub use terminal::{Screen, Stats};
 /// It names the WIT package version of the terminal and websocket
 /// interfaces, the component-model async ABI, and the WASI HTTP version the
 /// guest runtime uses. Any change to these is a new identifier.
-pub const ABI: &str = "rattery:tui@0.1.0;cm-async;wasi:http@0.3.0";
+pub const ABI: &str = "rattery:tui@0.2.0;cm-async;wasi:http@0.3.0";
 
 /// The bytes of the app that `rattery-build` compiled in `build.rs`:
 /// `include_bytes!(env!("RATTERY_APP_WASM"))`. Pass a variable name for an
@@ -170,7 +170,7 @@ pub fn inspect_with(bytes: &[u8], limits: &Limits) -> Result<ComponentInfo> {
         .collect();
     let terminal_ok = imports
         .iter()
-        .any(|i| i.starts_with("rattery:tui/terminal@0.1."));
+        .any(|i| i.starts_with("rattery:tui/terminal@0.2."));
     let compatible = terminal_ok && exports.iter().any(|e| e == "run");
     let extension_imports = imports
         .iter()
@@ -234,7 +234,8 @@ impl std::fmt::Debug for Source {
 /// ordinary TUI; tighten them for untrusted apps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Linear memory the app may grow to, in bytes.
+    /// Linear memory the app may grow to, in bytes, across all of its
+    /// memories together.
     pub memory_bytes: usize,
     /// Total time the app may spend executing (not waiting), charged in
     /// 10 ms ticks. `None` is unlimited.
@@ -249,8 +250,12 @@ pub struct Limits {
     pub frame_cells: usize,
     /// Open websockets at once.
     pub websockets: usize,
-    /// Messages queued per websocket while the app is not reading.
+    /// Messages queued per websocket per direction: incoming while the app
+    /// is not reading (older ones drop), outgoing while the peer is slow
+    /// (`send` waits).
     pub websocket_queue: usize,
+    /// Bytes queued per websocket per direction, across all queued messages.
+    pub websocket_queue_bytes: usize,
     /// Largest websocket message, in either direction.
     pub websocket_message_bytes: usize,
     /// HTTP requests in flight at once.
@@ -259,8 +264,16 @@ pub struct Limits {
     pub request_body_bytes: usize,
     /// Largest response body.
     pub response_body_bytes: usize,
-    /// Bytes of stdout and of stderr kept from the app.
+    /// Bytes of stdout and of stderr kept from the app, in total across
+    /// reloads; older output gives way.
     pub guest_output_bytes: usize,
+    /// Longest paste event delivered to the app; longer ones are cut.
+    pub paste_bytes: usize,
+    /// Longest error or trap message kept from the app.
+    pub message_bytes: usize,
+    /// Host resources (streams, requests, sockets, bodies) the app may hold
+    /// at once.
+    pub resources: usize,
     /// wasmtime store limits: tables, table elements, memories, instances.
     pub tables: usize,
     pub table_elements: usize,
@@ -278,12 +291,16 @@ impl Default for Limits {
             event_queue: 1024,
             frame_cells: 1 << 20,
             websockets: 16,
-            websocket_queue: 1024,
+            websocket_queue: 64,
+            websocket_queue_bytes: 4 << 20,
             websocket_message_bytes: 16 << 20,
             http_concurrency: 16,
             request_body_bytes: 64 << 20,
             response_body_bytes: 64 << 20,
             guest_output_bytes: 1 << 20,
+            paste_bytes: 1 << 20,
+            message_bytes: 16 << 10,
+            resources: 4096,
             tables: 32,
             table_elements: 1 << 20,
             memories: 8,
@@ -301,8 +318,11 @@ pub enum Phase {
     Compiled,
     /// It was instantiated and is about to run.
     Instantiated,
-    /// It drew its first frame: the app is ready for the user.
+    /// It drew its first frame successfully.
     Ready,
+    /// The app called `rattery_app::ready()`: by its own account it is
+    /// ready for the user (data loaded, a real screen showing).
+    AppReady,
     /// A request was refused by the origin policy, the request policy, or a limit.
     RequestDenied { url: String, reason: String },
     /// A new component is being loaded in place.
