@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.2.0 (2026-09-08)
+## 0.2.0 (2026-09-09)
 
-The first release intended for crates.io (not yet published): `rattery` (host
-library), `rattery-app` (app crate), `rattery-macros`, `rattery-build`.
+The first release on crates.io: `rattery` (host library), `rattery-app` (app
+crate), `rattery-macros`, `rattery-build`.
 
 - Apps are ordinary binary crates built for `wasm32-wasip2`; `rattery_app::app!`
   exports one async `run` and the host drives it with the component model's async
