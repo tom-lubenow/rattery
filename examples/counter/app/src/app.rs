@@ -41,8 +41,6 @@ struct App {
     /// How many times this app has been launched from this origin, kept in
     /// the host's origin-scoped storage.
     launches: u64,
-    /// A newer version the host told us about; `R` reloads into it.
-    update: Option<Update>,
     quit: bool,
 }
 
@@ -158,6 +156,25 @@ impl App {
         .detach();
     }
 
+    /// Ask the host to look for a newer version; the answer lands in the feed.
+    fn check_for_update(&mut self) {
+        let push = self.feed_writer();
+        rattery_app::task::spawn(async move {
+            match rattery_app::update::check().await {
+                Ok(Some(update)) => push(format!(
+                    "update: {} pending",
+                    update.version.as_deref().unwrap_or("new version")
+                )),
+                Ok(None) => push(format!(
+                    "update: none ({:?})",
+                    rattery_app::update::availability()
+                )),
+                Err(err) => push(format!("update check failed: {err}")),
+            }
+        })
+        .detach();
+    }
+
     /// Send a ping over the chat websocket.
     fn ping(&mut self) {
         self.pings += 1;
@@ -233,9 +250,8 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
 
         match event {
             Event::Wake => app.settle(),
-            Event::UpdateAvailable(update) => {
-                rattery_app::log::info!("update available: {update:?}");
-                app.update = Some(update);
+            Event::UpdateChanged => {
+                rattery_app::log::info!("pending update: {:?}", rattery_app::update::pending());
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
@@ -249,7 +265,8 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('r') => app.start(fetch_snapshot()),
                 // Nothing to save here: the count lives on the server and the
                 // launch counter is already in storage.
-                KeyCode::Char('R') => rattery_app::reload(),
+                KeyCode::Char('R') => rattery_app::update::reload(),
+                KeyCode::Char('c') => app.check_for_update(),
                 KeyCode::Char('s') => app.start(slow_snapshot(2000)),
                 KeyCode::Char('w') => app.ping(),
                 KeyCode::Char('u') => app.upload_file(),
@@ -282,10 +299,10 @@ fn ui(frame: &mut Frame, app: &App) {
     };
     // The update banner takes the header's spare line, like a browser's
     // "new version available" bar.
-    let banner = match &app.update {
+    let banner = match rattery_app::update::pending() {
         Some(update) => {
             let version = update.version.as_deref().unwrap_or("new");
-            let deadline = match update.deadline {
+            let deadline = match update.reload_after {
                 Some(d) => format!(", forced in {}s", d.as_secs()),
                 None => String::new(),
             };

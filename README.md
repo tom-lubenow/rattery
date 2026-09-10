@@ -193,10 +193,11 @@ Router::new()
     .route("/api/{*rest}", any(rattery_app::server_fn::axum::handle_server_fn))
 ```
 
-Updates work as they do on the web: when the host finds a new version it sends
-`Event::UpdateAvailable`, and the app calls `rattery_app::reload()` when it is a good
-moment (after saving a draft to storage, say); under the default policy the host
-reloads it anyway once a grace period passes.
+Updates work as they do on the web: when a new version is pending the host sends
+`Event::UpdateChanged`, `rattery_app::update::pending()` says what and by when, and the
+app calls `rattery_app::update::reload()` at a good moment (after saving a draft to
+storage, say); under the default policy the host reloads it anyway once a grace period
+passes and the app is idle. `rattery_app::update::check()` asks the host to look now.
 
 Two more things a browser gives a page, the host gives an app. `rattery_app::storage`
 is `localStorage`: a small key-value store scoped to the app's origin that survives
@@ -258,14 +259,21 @@ has no origin and so gets ephemeral storage.
 `--log-file` appends them to a file you can `tail -f` in another terminal while the
 app has the screen.
 
-**Reload.** `--watch` polls the URL with `If-None-Match`. What happens when a new
-component appears is a `ReloadPolicy`, the way a browser leaves reloading to the page:
-`Immediate` replaces the app at once (the dev loop; `--reload-grace 0`), `AppControlled`
-delivers `Event::UpdateAvailable` and waits for the app to call
-`rattery_app::reload()` (`none`), and `Deferred` does the same but reloads anyway once
-the grace period passes (the library default, five minutes; the event carries the
-deadline). An app can save its state to storage first, and the server should keep the
-old routes working for the grace period, since the old app keeps calling them.
+**Updates.** Three things are kept apart, the way a browser does: discovery, state,
+and the reload. Discovery is `--watch` polling the URL with `If-None-Match`, a
+`rattery-app-version` header on any server function reply naming a version the host
+does not know (so a deploy is noticed on the next call, not the next poll), the app
+calling `rattery_app::update::check()`, or the embedder offering bytes through
+`AppHandle`. A new component is compiled and linked before anyone hears of it. The
+state is `rattery_app::update::pending()` (version and deadlines as of now) for the
+app and `AppHandle::pending_update` for the embedder; `Event::UpdateChanged` says it
+changed, including when a rollback withdraws it. The reload is the app's
+`rattery_app::update::reload()` or the embedder's `AppHandle::reload`, and a
+`ReloadPolicy` says whether the host ever forces it: `Immediate` (the dev loop;
+`--reload-grace 0`), `AppControlled` (`none`), or `Deferred` (the default): after five
+minutes of grace, at the first thirty seconds of idleness, and within an hour
+regardless. An app can save its state to storage first, and the server should keep
+the old routes working for the grace period, since the old app keeps calling them.
 
 **ABI transitions.** Every component fetch carries a `rattery-abi` header with the
 host's `rattery::ABI`, so a server can serve the build that matches each client during

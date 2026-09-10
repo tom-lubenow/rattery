@@ -22,6 +22,7 @@ use crate::bindings::websocket;
 use crate::http::{CookieJar, OriginHooks, OriginPolicy, RequestPolicy};
 use crate::storage::Storage;
 use crate::terminal::{Interrupt, Interrupter, PhaseHook, TerminalHost};
+use crate::update::{self, Updates};
 use crate::websocket::WsSocket;
 use crate::{Limits, Phase};
 
@@ -138,6 +139,7 @@ pub struct HostState {
     request_policy: Option<Arc<dyn RequestPolicy>>,
     term: TerminalHost,
     storage: Storage,
+    updates: Arc<Updates>,
     limits: Limits,
     limiter: AggregateLimiter,
     cpu: CpuBudget,
@@ -158,6 +160,7 @@ pub struct HostStateConfig {
     pub request_policy: Option<Arc<dyn RequestPolicy>>,
     pub term: TerminalHost,
     pub storage: Storage,
+    pub updates: Arc<Updates>,
     pub limits: Limits,
     pub interrupter: Arc<Interrupter>,
     pub on_phase: Option<PhaseHook>,
@@ -173,6 +176,7 @@ impl HostState {
             request_policy,
             term,
             storage,
+            updates,
             limits,
             interrupter,
             on_phase,
@@ -189,18 +193,23 @@ impl HostState {
             table,
             wasi,
             http: WasiHttpCtx::new(),
-            hooks: OriginHooks::new(
-                policy.clone(),
-                cookies.clone(),
-                request_policy.clone(),
-                &limits,
-                on_phase.clone(),
-            ),
+            hooks: {
+                let mut hooks = OriginHooks::new(
+                    policy.clone(),
+                    cookies.clone(),
+                    request_policy.clone(),
+                    &limits,
+                    on_phase.clone(),
+                );
+                hooks.set_updates(updates.clone());
+                hooks
+            },
             policy,
             cookies,
             request_policy,
             term,
             storage,
+            updates,
             limits,
             limiter,
             cpu: CpuBudget {
@@ -384,6 +393,14 @@ impl terminal::Host for HostState {
         Err(wasmtime::Error::msg("the app asked to be reloaded"))
     }
 
+    async fn pending_update(&mut self) -> wasmtime::Result<Option<terminal::Update>> {
+        Ok(self.updates.pending().map(update::to_wit))
+    }
+
+    async fn update_availability(&mut self) -> wasmtime::Result<terminal::Availability> {
+        Ok(self.updates.availability())
+    }
+
     async fn log(
         &mut self,
         level: terminal::LogLevel,
@@ -440,6 +457,24 @@ impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
         let event = queue.next().await;
         store.with(|mut view| view.get().term.note_event());
         Ok(event)
+    }
+
+    /// A fetch can take seconds: it runs without the store held, so the app
+    /// keeps drawing and reading input meanwhile.
+    async fn check_update(
+        store: &Accessor<U, Self>,
+    ) -> wasmtime::Result<Result<Option<terminal::Update>, String>> {
+        let (updates, message_bytes) = store.with(|mut view| {
+            let state = view.get();
+            (state.updates.clone(), state.limits.message_bytes)
+        });
+        Ok(match updates.check().await {
+            Ok(info) => Ok(info.map(update::to_wit)),
+            Err(err) => Err(crate::runner::truncate(
+                crate::sanitize::text(&format!("{err:#}")),
+                message_bytes,
+            )),
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 //! Compile, sandbox, and run one app: the core of the library.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -14,14 +14,11 @@ use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::{HostState, HostStateConfig};
 use crate::storage::Storage;
-use crate::terminal::{EventQueue, PhaseHook};
 use crate::terminal::{Interrupt, Interrupter, Screen, Session, Tasks, TerminalHost};
+use crate::update::{Running, Updates, UpdatesConfig, WATCH_INTERVAL};
 use crate::{
-    App, AppStatus, CookiePolicy, Phase, ReloadPolicy, Report, Source, StoragePolicy, bindings,
-    headless,
+    App, AppStatus, CookiePolicy, Phase, Report, Source, StoragePolicy, bindings, headless,
 };
-
-const WATCH_INTERVAL: Duration = Duration::from_millis(750);
 
 /// How often the engine's epoch advances while an app runs. Each tick the
 /// guest yields to the host, so input, timeouts, and the kill switch stay
@@ -127,6 +124,8 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
 
     let interrupter = Arc::new(Interrupter::new());
     let mut tasks = Tasks::default();
+    // Filled once the update state exists; the headless script needs it.
+    let updates_slot: Arc<std::sync::OnceLock<Arc<Updates>>> = Arc::default();
 
     // The epoch ticker: the one clock every deadline is measured against.
     tasks.spawn({
@@ -173,6 +172,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
                 term.queue(),
                 backend,
                 term.snapshots(),
+                updates_slot.clone(),
             ));
             if let Some(timeout) = options.timeout {
                 let interrupter = interrupter.clone();
@@ -189,39 +189,45 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     let snapshots = term.snapshots();
     let screen_source = term.test_backend();
 
-    // In watch mode, poll for a new component; the policy says whether the
-    // app is replaced at once or told and left to reload itself.
-    let updates = Arc::new(Updates {
+    // The update state: what is running, what is pending, when the host
+    // acts. Discovery is the watcher, a check from the app or the embedder,
+    // or a version hint on a server reply.
+    let updates = Arc::new(Updates::new(UpdatesConfig {
         engine: engine.clone(),
         linker: linker.clone(),
         policy: app.reload,
+        watched: app.watch,
+        source: app.source.clone(),
+        limits: limits.clone(),
         queue: term.queue(),
         interrupter: interrupter.clone(),
         on_phase: on_phase.clone(),
-        message_bytes: limits.message_bytes,
-        pending: Mutex::new(None),
-        last_rejection: Mutex::new(None),
-        deadline: Mutex::new(None),
-    });
-    if app.watch {
-        match &app.source {
-            Source::Url(url) => tasks.spawn(watch_url(
-                url.clone(),
-                loaded.bytes.clone(),
-                loaded.etag.clone(),
-                loaded.last_modified.clone(),
-                limits.clone(),
-                updates.clone(),
-            )),
-            Source::Resolver(resolver) => tasks.spawn(watch_resolver(
-                resolver.clone(),
-                loaded.bytes.clone(),
-                loaded.etag.clone(),
-                limits.clone(),
-                updates.clone(),
-            )),
-            _ => {}
-        }
+        running: Running {
+            bytes: Arc::new(loaded.bytes.clone()),
+            instance: instance_pre.clone(),
+            version: loaded.etag.clone().or_else(|| loaded.last_modified.clone()),
+        },
+        etag: loaded.etag.clone(),
+        last_modified: loaded.last_modified.clone(),
+    }));
+    let _ = updates_slot.set(updates.clone());
+    if let Some(handle) = &app.handle {
+        handle.attach(updates.clone(), interrupter.clone());
+    }
+    if app.watch
+        && matches!(
+            app.source,
+            Source::Url(_) | Source::Resolver(_) | Source::Path(_)
+        )
+    {
+        let updates = updates.clone();
+        tasks.spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_INTERVAL).await;
+                // A source that is down or mid-restart just gets polled again.
+                let _ = updates.check().await;
+            }
+        });
     }
 
     // Storage is keyed by the app's origin; without one it cannot persist.
@@ -257,6 +263,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             request_policy: app.request_policy.clone(),
             term,
             storage,
+            updates: updates.clone(),
             limits: limits.clone(),
             interrupter: interrupter.clone(),
             on_phase: on_phase.clone(),
@@ -313,9 +320,8 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
 
         let reason = interrupter.take_reason();
         if reason == Some(Interrupt::Reload) {
-            // Without a pending update (the app reloaded itself, or the
-            // headless `update` command was used) the same component
-            // restarts. A pending one was compiled and linked by the watcher.
+            // Without a pending update the same component restarts. A
+            // pending one was compiled and linked when it was offered.
             if let Some(next) = updates.take() {
                 previous_instance = Some(std::mem::replace(&mut instance_pre, next));
             }
@@ -346,6 +352,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
 
         break match (outcome, reason) {
             (_, Some(Interrupt::Kill)) => AppStatus::Killed,
+            (_, Some(Interrupt::Shutdown)) => AppStatus::Stopped,
             (_, Some(Interrupt::Timeout)) => AppStatus::TimedOut,
             (_, Some(Interrupt::Limit(what))) => AppStatus::LimitExceeded(what),
             (_, Some(Interrupt::Reload)) | (None, None) => AppStatus::Exited(0),
@@ -407,7 +414,7 @@ fn append_bounded(kept: &mut String, more: &str, max: usize) {
 
 /// Cut `text` to at most `max` bytes, ending in `...` when there is room
 /// for the marker.
-fn truncate(mut text: String, max: usize) -> String {
+pub(crate) fn truncate(mut text: String, max: usize) -> String {
     const MARK: &str = "...";
     if text.len() <= max {
         return text;
@@ -459,7 +466,7 @@ pub fn precompile(component: &[u8], target: Option<&str>) -> Result<Vec<u8>> {
 }
 
 /// The rattery ABI `component` needs when it is not this host's.
-fn requires_abi(engine: &Engine, component: &Component) -> Option<String> {
+pub(crate) fn requires_abi(engine: &Engine, component: &Component) -> Option<String> {
     let ty = component.component_type();
     crate::abi_of(ty.imports(engine).map(|(name, _)| name))
         .and_then(|abi| crate::abi_mismatch(&abi))
@@ -467,7 +474,7 @@ fn requires_abi(engine: &Engine, component: &Component) -> Option<String> {
 
 /// Resolve every import against the host's linker without running anything.
 /// An ABI transition is named as such in the error.
-fn link(
+pub(crate) fn link(
     engine: &Engine,
     linker: &Linker<HostState>,
     component: &Component,
@@ -486,7 +493,7 @@ fn link(
         })
 }
 
-fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {
+pub(crate) fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {
     if loaded.precompiled {
         // SAFETY: the embedder vouched for these bytes by using
         // `App::from_precompiled`; wasmtime still checks the header, the
@@ -522,198 +529,6 @@ fn wasi_ctx(
         wasi.env(key, value);
     }
     wasi.build()
-}
-
-#[allow(clippy::too_many_arguments)]
-/// The newest component the watcher found, and how the app hears about it.
-struct Updates {
-    engine: Engine,
-    linker: Linker<HostState>,
-    policy: ReloadPolicy,
-    queue: Arc<EventQueue>,
-    interrupter: Arc<Interrupter>,
-    on_phase: Option<PhaseHook>,
-    message_bytes: usize,
-    pending: Mutex<Option<AppPre<HostState>>>,
-    /// The last rejection reported, so a server that keeps answering the
-    /// same way is reported once, not every poll.
-    last_rejection: Mutex<Option<String>>,
-    /// The forced reload under `ReloadPolicy::Deferred`: when, and the task
-    /// that fires it. The first update's deadline stands for later ones, so a
-    /// stream of deploys cannot postpone the reload forever.
-    deadline: Mutex<Option<(std::time::Instant, tokio::task::JoinHandle<()>)>>,
-}
-
-impl Updates {
-    /// Compile and link a fetched component off the async runtime. A
-    /// component that fails is reported and never offered, so a broken
-    /// deploy cannot interrupt the running app.
-    async fn validate(self: &Arc<Self>, next: Loaded) {
-        let updates = self.clone();
-        let validated = tokio::task::spawn_blocking(move || {
-            let component = compile(&updates.engine, &next).map_err(|err| (err, None))?;
-            let requires = requires_abi(&updates.engine, &component);
-            match link(
-                &updates.engine,
-                &updates.linker,
-                &component,
-                &next.description,
-            ) {
-                Ok(instance) => Ok((next, instance)),
-                Err(err) => Err((err, requires)),
-            }
-        })
-        .await;
-        match validated {
-            Ok(Ok((next, instance))) => self.offer(next, instance),
-            Ok(Err((err, requires))) => self.reject(format!("{err:#}"), requires),
-            Err(err) => self.reject(format!("validation failed: {err}"), None),
-        }
-    }
-
-    /// A fetch that failed for a reason worth reporting: the server has no
-    /// build for this host.
-    fn fetch_failed(&self, err: &anyhow::Error) {
-        if let Some(upgrade) = err.downcast_ref::<loader::UpgradeRequired>() {
-            self.reject(upgrade.to_string(), upgrade.required.clone());
-        }
-    }
-
-    fn reject(&self, reason: String, requires_abi: Option<String>) {
-        let reason = truncate(crate::sanitize::text(&reason), self.message_bytes);
-        let mut last = self.last_rejection.lock().unwrap();
-        if last.as_deref() == Some(reason.as_str()) {
-            return;
-        }
-        *last = Some(reason.clone());
-        drop(last);
-        if let Some(hook) = &self.on_phase {
-            hook(Phase::UpdateRejected {
-                reason,
-                requires_abi,
-            });
-        }
-    }
-
-    fn offer(&self, next: Loaded, instance: AppPre<HostState>) {
-        // The validator comes from the server: keep it printable and short.
-        let version = next
-            .etag
-            .clone()
-            .or_else(|| next.last_modified.clone())
-            .map(|v| truncate(crate::sanitize::text(&v), self.message_bytes.min(256)));
-        *self.pending.lock().unwrap() = Some(instance);
-        if let Some(hook) = &self.on_phase {
-            hook(Phase::UpdateAvailable {
-                version: version.clone(),
-            });
-        }
-        let deadline_ms = match self.policy {
-            ReloadPolicy::Immediate => {
-                self.interrupter.fire(Interrupt::Reload);
-                return;
-            }
-            ReloadPolicy::AppControlled => None,
-            ReloadPolicy::Deferred { grace } => {
-                let mut deadline = self.deadline.lock().unwrap();
-                let at = match &*deadline {
-                    Some((at, task)) if !task.is_finished() => *at,
-                    _ => {
-                        let at = std::time::Instant::now() + grace;
-                        let interrupter = self.interrupter.clone();
-                        let task = tokio::spawn(async move {
-                            tokio::time::sleep(grace).await;
-                            interrupter.fire(Interrupt::Reload);
-                        });
-                        *deadline = Some((at, task));
-                        at
-                    }
-                };
-                Some(
-                    at.saturating_duration_since(std::time::Instant::now())
-                        .as_millis() as u64,
-                )
-            }
-        };
-        self.queue.push(bindings::terminal::Event::UpdateAvailable(
-            bindings::terminal::Update {
-                version,
-                deadline_ms,
-            },
-        ));
-    }
-
-    /// The pending update, for the reload that is now happening; the
-    /// deadline for it is moot.
-    fn take(&self) -> Option<AppPre<HostState>> {
-        if let Some((_, task)) = self.deadline.lock().unwrap().take() {
-            task.abort();
-        }
-        self.pending.lock().unwrap().take()
-    }
-}
-
-impl Drop for Updates {
-    fn drop(&mut self) {
-        if let Some((_, task)) = self.deadline.get_mut().unwrap().take() {
-            task.abort();
-        }
-    }
-}
-
-async fn watch_url(
-    url: url::Url,
-    mut current: Vec<u8>,
-    mut etag: Option<String>,
-    mut last_modified: Option<String>,
-    limits: crate::Limits,
-    updates: Arc<Updates>,
-) {
-    let Ok(client) = loader::client(&limits) else {
-        return;
-    };
-    loop {
-        tokio::time::sleep(WATCH_INTERVAL).await;
-        let fetched = loader::fetch_if_changed(
-            &client,
-            &url,
-            etag.as_deref(),
-            last_modified.as_deref(),
-            Some(&current),
-            &limits,
-        )
-        .await;
-        // A server that is down or mid-restart just gets polled again.
-        match fetched {
-            Ok(Some(next)) => {
-                current = next.bytes.clone();
-                etag = next.etag.clone();
-                last_modified = next.last_modified.clone();
-                updates.validate(next).await;
-            }
-            Ok(None) => {}
-            Err(err) => updates.fetch_failed(&err),
-        }
-    }
-}
-
-async fn watch_resolver(
-    resolver: Arc<dyn crate::Resolver>,
-    mut current: Vec<u8>,
-    mut version: Option<String>,
-    limits: crate::Limits,
-    updates: Arc<Updates>,
-) {
-    loop {
-        tokio::time::sleep(WATCH_INTERVAL).await;
-        if let Ok(Some(next)) =
-            loader::resolve_if_changed(&resolver, version.as_deref(), &current, &limits).await
-        {
-            current = next.bytes.clone();
-            version = next.etag.clone();
-            updates.validate(next).await;
-        }
-    }
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use ratatui::backend::{Backend, TestBackend};
 
 use crate::bindings::terminal::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
-    MouseEventKind, Size, Update,
+    MouseEventKind, Size,
 };
 use crate::terminal::{EventQueue, Screen};
 
@@ -53,9 +53,10 @@ pub enum ScriptCommand {
         steps: usize,
         interval: Duration,
     },
-    /// Tell the app an update is available (with this version string), as
-    /// the watcher would. The app's `reload()` then restarts the same
-    /// component, which is enough to test the handling.
+    /// Make an update pending (with this version string), as the watcher
+    /// would, on the running component itself: the app's handling can be
+    /// tested without a server, and its `reload()` restarts the same
+    /// component.
     Update(Option<String>),
 }
 
@@ -211,6 +212,7 @@ pub async fn run_script(
     queue: Arc<EventQueue>,
     backend: Arc<Mutex<TestBackend>>,
     snapshots: Arc<Mutex<Vec<Screen>>>,
+    updates: Arc<std::sync::OnceLock<Arc<crate::update::Updates>>>,
 ) {
     for command in script.0 {
         match command {
@@ -235,10 +237,11 @@ pub async fn run_script(
                 let screen = Screen::from_backend(&backend.lock().unwrap());
                 snapshots.lock().unwrap().push(screen);
             }
-            ScriptCommand::Update(version) => queue.push(Event::UpdateAvailable(Update {
-                version,
-                deadline_ms: None,
-            })),
+            ScriptCommand::Update(version) => {
+                if let Some(updates) = updates.get() {
+                    updates.offer_same(version);
+                }
+            }
             ScriptCommand::MouseMove { column, row } => queue.push(mouse_move(column, row)),
             ScriptCommand::Sweep { steps, interval } => {
                 let size = backend.lock().unwrap().size().unwrap_or_default();

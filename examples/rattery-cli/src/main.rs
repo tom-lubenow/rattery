@@ -77,7 +77,7 @@ struct Cli {
     /// With --watch: how a new version is applied. `0` (the default here)
     /// replaces the app at once; `none` tells the app and lets it reload
     /// itself when ready; SECS tells the app and reloads it anyway after
-    /// that long.
+    /// that long, at the next idle moment (within an hour regardless).
     #[arg(long, value_name = "SECS|none", default_value = "0", requires = "watch", value_parser = parse_reload)]
     reload_grace: ReloadPolicy,
 
@@ -128,6 +128,8 @@ fn parse_reload(s: &str) -> Result<ReloadPolicy, String> {
         "0" => ReloadPolicy::Immediate,
         secs => ReloadPolicy::Deferred {
             grace: Duration::from_secs_f64(secs.parse().map_err(|e| format!("bad seconds: {e}"))?),
+            idle: Duration::from_secs(30),
+            hard_limit: Duration::from_secs(3600),
         },
     })
 }
@@ -156,7 +158,7 @@ Headless scripts are one command per line; blank lines and # comments are ignore
   snapshot           capture the screen; printed when the app ends
   mouse move 10 5    pointer movement to column 10, row 5
   sweep 400 5        400 movements along the diagonal, 5 ms apart
-  update v2          announce an update (the app may call reload)
+  update v2          make an update pending (the app may reload onto it)
 ";
 
 #[tokio::main]
@@ -332,6 +334,7 @@ async fn main() -> Result<()> {
         AppStatus::Trapped(message) => eprintln!("app trapped: {}", sanitize::text(message)),
         AppStatus::LimitExceeded(what) => eprintln!("app stopped: {what}"),
         AppStatus::Killed => eprintln!("app terminated by rattery (Ctrl-C pressed three times)"),
+        AppStatus::Stopped => {}
         AppStatus::TimedOut => eprintln!("app stopped: headless timeout elapsed"),
     }
     std::process::exit(report.exit_code());

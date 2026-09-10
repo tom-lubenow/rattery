@@ -118,10 +118,13 @@ panic is caught, the hook restored, and the panic resumed.
 
 A reload never happens behind the app's back unless the embedder asks for
 that: `ReloadPolicy::Immediate` replaces it at once, `AppControlled` only
-delivers `Event::UpdateAvailable`, and `Deferred` (the default) delivers the
-event with its deadline and forces the reload when the deadline passes. The
-first deadline stands across further updates, so a stream of deploys cannot
-postpone it. The version string in the event is the server's validator,
+delivers `Event::UpdateChanged`, and `Deferred` (the default) forces the
+reload after a grace period at the first idle moment, and at a hard limit
+regardless. The first deadline stands across further updates, so a stream of
+deploys cannot postpone it, and a rollback withdraws the pending update
+rather than reloading the app onto the version it already runs. A version
+hint on a server reply only triggers a check; the bytes still come from the
+app's source. The version string in the event is the server's validator,
 sanitised and cut to 256 bytes. A new component is compiled and linked
 against the host before the app is told about it; one that fails becomes
 `Phase::UpdateRejected` and the running app is left alone.

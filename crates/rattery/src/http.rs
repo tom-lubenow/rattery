@@ -458,9 +458,15 @@ pub struct OriginHooks {
     request_body_bytes: usize,
     response_body_bytes: usize,
     on_phase: Option<crate::terminal::PhaseHook>,
+    updates: Option<Arc<crate::update::Updates>>,
 }
 
 impl OriginHooks {
+    /// Where version hints on replies go.
+    pub fn set_updates(&mut self, updates: Arc<crate::update::Updates>) {
+        self.updates = Some(updates);
+    }
+
     pub fn new(
         policy: OriginPolicy,
         cookies: Option<CookieJar>,
@@ -476,6 +482,7 @@ impl OriginHooks {
             request_body_bytes: limits.request_body_bytes,
             response_body_bytes: limits.response_body_bytes,
             on_phase,
+            updates: None,
         }
     }
 }
@@ -559,6 +566,7 @@ impl WasiHttpHooks for OriginHooks {
         let concurrency = self.concurrency.clone();
         let request_body_bytes = self.request_body_bytes;
         let response_body_bytes = self.response_body_bytes;
+        let updates = self.updates.clone();
 
         Box::new(async move {
             let permit = concurrency
@@ -577,6 +585,16 @@ impl WasiHttpHooks for OriginHooks {
                 .boxed_unsync();
             let request = http::Request::from_parts(parts, body);
             let (response, io) = default_send_request(request, options).await?;
+            // The server names the component version it serves; one the
+            // host does not know means a deploy happened.
+            if let Some(updates) = &updates
+                && let Some(version) = response
+                    .headers()
+                    .get(crate::update::VERSION_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            {
+                updates.hint(version);
+            }
             if let Some(policy) = &request_policy {
                 let (head, body) = response.into_parts();
                 policy.on_response(&head, &info).await;

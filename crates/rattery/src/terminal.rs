@@ -142,8 +142,10 @@ pub enum Interrupt {
     Kill,
     /// The headless timeout elapsed.
     Timeout,
-    /// A new version of the component is available.
+    /// Reload: onto the pending update, or restart the current version.
     Reload,
+    /// The embedder asked for the app to stop.
+    Shutdown,
     /// A resource limit was exceeded.
     Limit(String),
 }

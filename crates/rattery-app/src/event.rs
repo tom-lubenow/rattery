@@ -16,26 +16,15 @@ pub enum Event {
     Paste(String),
     /// The terminal was resized to `(columns, rows)`.
     Resize(u16, u16),
-    /// A newer version of the app is available. Save what matters (see
-    /// [`storage`](crate::storage)) and call [`reload`](crate::reload) when
-    /// convenient; if the host has a deadline, it reloads the app itself
-    /// when that passes.
-    UpdateAvailable(Update),
+    /// The pending update changed: a newer version appeared, was superseded,
+    /// or was withdrawn. Read [`update::pending`](crate::update::pending)
+    /// for the state; save what matters to [`storage`](crate::storage) and
+    /// call [`update::reload`](crate::update::reload) when convenient.
+    UpdateChanged,
     /// Something inside the app asked for attention: a [`Task`](crate::task::Task)
     /// finished, or [`task::wake`](crate::task::wake) was called. Re-render and
     /// check your task handles.
     Wake,
-}
-
-/// What [`Event::UpdateAvailable`] knows about the new version.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct Update {
-    /// The server's validator for the new version (an ETag or a date). Opaque;
-    /// show it or ignore it.
-    pub version: Option<String>,
-    /// Time left before the host reloads the app regardless, if it has a
-    /// deadline.
-    pub deadline: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (2026-09-10)
+
+WIT package `rattery:tui@0.4.0`; `ABI` is now
+`rattery:tui@0.4.0;cm-async;wasi:http@0.3.0`. Apps and hosts must move
+together.
+
+- The update model is now discovery, state, and application, kept apart.
+  App side: `check-update` (ask now; fallible), `pending-update` (state with
+  deadlines as of the call), `update-availability` (watched, on request,
+  or unavailable for embedded components), `reload`; `Event::UpdateChanged`
+  replaces `UpdateAvailable(update)`. `rattery_app::update` wraps them.
+- Host side: `AppHandle` (`App::handle`) with `check_update`, `offer`,
+  `pending_update`, `reload`, `shutdown` (`AppStatus::Stopped`); the state
+  machine tracks the running and pending versions, and a rollback withdraws
+  the pending update (`Phase::UpdateWithdrawn`) instead of reloading onto
+  the running version. `Path` sources can be checked and watched.
+- `ReloadPolicy::Deferred` gains `idle` and `hard_limit`: after `grace` the
+  host reloads at the first idle moment, and at `hard_limit` regardless.
+  Default: five minutes, thirty seconds, one hour.
+- A `rattery-app-version` response header on server function replies (the
+  example server sets it) triggers a check at once, so a deploy is noticed
+  on the next call instead of the next poll.
+
 ## 0.3.3 (2026-09-10)
 
 - Input coalescing: a pointer movement or resize the app has not read yet

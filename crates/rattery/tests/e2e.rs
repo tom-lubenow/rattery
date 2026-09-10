@@ -488,6 +488,8 @@ async fn watch_reloads_when_the_served_component_changes() {
             .watch(true)
             .reload_policy(ReloadPolicy::Deferred {
                 grace: Duration::from_secs(3),
+                idle: Duration::from_secs(1),
+                hard_limit: Duration::from_secs(10),
             })
             .on_phase(move |phase| {
                 if matches!(phase, Phase::UpdateAvailable { .. } | Phase::Reloading) {
@@ -907,7 +909,7 @@ async fn a_broken_update_never_interrupts_the_app() {
 fn future_abi_component() -> Vec<u8> {
     let mut bytes = std::fs::read(guest("counter-app")).unwrap();
     for interface in ["terminal", "websocket", "storage"] {
-        let from = format!("rattery:tui/{interface}@0.3.0");
+        let from = format!("rattery:tui/{interface}@0.4.0");
         let to = format!("rattery:tui/{interface}@0.9.0");
         let mut at = 0;
         while let Some(pos) = bytes[at..]
@@ -1066,4 +1068,186 @@ async fn hover_input_is_coalesced_when_frames_fall_behind() {
         lag(&all),
         lag(&merged)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_is_withdrawn_when_the_server_reverts() {
+    require_wasip2!();
+    let dir = std::env::temp_dir().join(format!("rattery-revert-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let served = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &served).unwrap();
+    let server = Server::start_serving(&served);
+    let _ = guest("spin-app");
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let run = tokio::spawn(
+        App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .watch(true)
+            .reload_policy(ReloadPolicy::AppControlled)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("sleep 4500\nsnapshot\nsleep 3000\nsnapshot", 9))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::copy(guest("spin-app"), &served).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // Rolled back: the server serves the running version again.
+    std::fs::copy(guest("counter-app"), &served).unwrap();
+
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(
+        report.snapshots[0].contains("available: R reloads"),
+        "{text}"
+    );
+    assert!(
+        !report.snapshots[0].contains("forced in"),
+        "app-controlled\n{text}"
+    );
+    assert!(
+        !report.snapshots[1].contains("available"),
+        "withdrawn\n{text}"
+    );
+    assert!(report.snapshots[1].contains("rattery counter"), "{text}");
+    let phases = phases.lock().unwrap();
+    let available = phases
+        .iter()
+        .position(|p| matches!(p, Phase::UpdateAvailable { .. }))
+        .unwrap_or_else(|| panic!("{phases:?}"));
+    let withdrawn = phases
+        .iter()
+        .position(|p| *p == Phase::UpdateWithdrawn)
+        .unwrap_or_else(|| panic!("{phases:?}"));
+    assert!(available < withdrawn, "{phases:?}");
+    assert!(!phases.contains(&Phase::Reloading), "{phases:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn server_replies_hint_at_new_versions_without_polling() {
+    require_wasip2!();
+    let dir = std::env::temp_dir().join(format!("rattery-hint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let served = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &served).unwrap();
+    let server = Server::start_serving(&served);
+    let _ = guest("spin-app");
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    // No watch: the only way to learn of the deploy is the version header
+    // on the reply to the increment (`k`) at four seconds.
+    let run = tokio::spawn(
+        App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .reload_policy(ReloadPolicy::AppControlled)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless(
+                "sleep 2500\nsnapshot\nsleep 1500\nkey k\nsleep 2000\nsnapshot\nkey R\nsleep 2500\nsnapshot",
+                12,
+            ))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::copy(guest("spin-app"), &served).unwrap();
+
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(!report.snapshots[0].contains("available"), "{text}");
+    assert!(
+        report.snapshots[1].contains("available: R reloads"),
+        "{text}"
+    );
+    assert!(
+        report.snapshots[2].contains("spinning forever"),
+        "reloaded onto it\n{text}"
+    );
+    let phases = phases.lock().unwrap();
+    assert!(
+        phases
+            .iter()
+            .any(|p| matches!(p, Phase::UpdateAvailable { .. })),
+        "{phases:?}"
+    );
+    assert!(phases.contains(&Phase::Reloading), "{phases:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_embedder_handle_and_the_app_can_check_and_reload() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let dir = std::env::temp_dir().join(format!("rattery-handle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &path).unwrap();
+    let spin = std::fs::read(guest("spin-app")).unwrap();
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let mut app = App::from_path(&path)
+        .origin(&server.url)
+        .reload_policy(ReloadPolicy::AppControlled)
+        .on_phase(move |phase| seen.lock().unwrap().push(phase))
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless(
+            "sleep 2500\nkey c\nsleep 1500\nsnapshot\nsleep 30000",
+            40,
+        ));
+    let handle = app.handle();
+    assert!(handle.pending_update().is_none());
+    assert!(!handle.reload(), "not running yet");
+    let run = tokio::spawn(app.run());
+
+    // The app's own check (`c`) re-reads the file: nothing new yet.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Offering the running bytes is not an update.
+    let same = std::fs::read(&path).unwrap();
+    assert_eq!(handle.offer(same, Some("same".into())).await.unwrap(), None);
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Now the file changes; the embedder's check finds it.
+    std::fs::write(&path, &spin).unwrap();
+    let info = handle.check_update().await.unwrap().expect("an update");
+    assert_eq!(info.reload_after, None, "app-controlled: {info:?}");
+    assert_eq!(handle.pending_update(), Some(info));
+    assert!(handle.reload());
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(handle.shutdown());
+
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::Stopped, "{text}");
+    assert_eq!(report.exit_code(), 0);
+    assert!(
+        report.snapshots[0].contains("update: none (OnRequest)"),
+        "the app's check saw no update and knows it may ask\n{text}"
+    );
+    assert!(
+        report
+            .final_screen
+            .as_ref()
+            .unwrap()
+            .contains("spinning forever"),
+        "{text}"
+    );
+    let phases = phases.lock().unwrap();
+    assert!(
+        phases
+            .iter()
+            .any(|p| matches!(p, Phase::UpdateAvailable { .. })),
+        "{phases:?}"
+    );
+    assert!(phases.contains(&Phase::Reloading), "{phases:?}");
+    assert!(
+        phases.contains(&Phase::Exited(AppStatus::Stopped)),
+        "{phases:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

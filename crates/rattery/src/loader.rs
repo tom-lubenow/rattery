@@ -2,6 +2,7 @@
 //! from memory, or through an embedder's resolver. Every path enforces the
 //! size and download-time limits.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -243,6 +244,34 @@ pub async fn fetch_if_changed(
         description: final_url.to_string(),
         etag,
         last_modified,
+    }))
+}
+
+/// Re-read a file source; `None` when it still holds `previous`.
+pub async fn read_if_changed(
+    path: &Path,
+    previous: &[u8],
+    limits: &Limits,
+) -> Result<Option<Loaded>> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    check_size(metadata.len(), limits, &path.display().to_string())?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    check_size(bytes.len() as u64, limits, &path.display().to_string())?;
+    if bytes == previous {
+        return Ok(None);
+    }
+    Ok(Some(Loaded {
+        bytes,
+        precompiled: false,
+        origin: None,
+        location: None,
+        description: path.display().to_string(),
+        etag: None,
+        last_modified: None,
     }))
 }
 

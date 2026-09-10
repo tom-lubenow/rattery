@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
             any(rattery_app::server_fn::axum::handle_server_fn),
         )
         .layer(middleware::from_fn(session))
+        .layer(middleware::from_fn_with_state(state.clone(), app_version))
         .with_state(state);
 
     let listener = TcpListener::bind(&args.bind).await?;
@@ -76,6 +77,31 @@ async fn main() -> Result<()> {
 
 async fn index() -> &'static str {
     "This server hosts a rattery app.\n\nRun it in your terminal with:\n    rattery http://<this host>/app.wasm\n"
+}
+
+/// The component's validator: its size and modification time.
+async fn app_etag(path: &std::path::Path) -> std::io::Result<String> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("\"{}-{modified}\"", metadata.len()))
+}
+
+/// Every reply names the component version the server serves, so a host
+/// notices a deploy on the next server function call instead of the next
+/// poll.
+async fn app_version(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(etag) = app_etag(&state.app_path).await
+        && let Ok(value) = HeaderValue::from_str(&etag)
+    {
+        response.headers_mut().insert("rattery-app-version", value);
+    }
+    response
 }
 
 /// Serve the component with an ETag so `rattery --watch` can poll cheaply.
@@ -100,17 +126,10 @@ async fn serve_app(State(state): State<AppState>, request: Request) -> Response 
                 .into_response();
         }
     }
-    let metadata = match tokio::fs::metadata(&*state.app_path).await {
-        Ok(metadata) => metadata,
+    let etag = match app_etag(&state.app_path).await {
+        Ok(etag) => etag,
         Err(err) => return app_missing(&state, err),
     };
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let etag = format!("\"{}-{modified}\"", metadata.len());
     if request
         .headers()
         .get(header::IF_NONE_MATCH)

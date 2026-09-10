@@ -84,6 +84,7 @@ pub mod sanitize;
 mod state;
 mod storage;
 mod terminal;
+mod update;
 mod websocket;
 
 use std::any::{Any, TypeId};
@@ -104,13 +105,14 @@ pub use http::{
 pub use runner::precompile;
 pub use state::HostState;
 pub use terminal::{Screen, Stats};
+pub use update::VERSION_HEADER as APP_VERSION_HEADER;
 
 /// The contract this host speaks, for release metadata and [`inspect`].
 ///
 /// It names the WIT package version of the terminal and websocket
 /// interfaces, the component-model async ABI, and the WASI HTTP version the
 /// guest runtime uses. Any change to these is a new identifier.
-pub const ABI: &str = "rattery:tui@0.3.0;cm-async;wasi:http@0.3.0";
+pub const ABI: &str = "rattery:tui@0.4.0;cm-async;wasi:http@0.3.0";
 
 /// The request header sent with every component fetch, carrying [`ABI`], so
 /// a server can serve the build that matches the host or answer
@@ -434,11 +436,15 @@ pub enum Phase {
         target: String,
         message: String,
     },
-    /// The watcher found a newer component. Under
+    /// A newer component is pending: found by the watcher, a check, a
+    /// version hint on a server reply, or offered by the embedder. Under
     /// [`ReloadPolicy::Immediate`] the reload follows at once; otherwise the
     /// app has been told and decides. `version` is the server's validator,
     /// sanitised.
     UpdateAvailable { version: Option<String> },
+    /// The pending update is gone: the source serves the running version
+    /// again (a rollback), so there is nothing to reload to.
+    UpdateWithdrawn,
     /// The watcher found a newer component that does not compile or does not
     /// link against this host, so it was not offered; the app keeps running
     /// and the watcher keeps polling for the next version.
@@ -495,25 +501,131 @@ pub enum StoragePolicy {
     Disabled,
 }
 
-/// What happens when [`App::watch`] finds a newer component. A browser never
+/// What happens when a newer component becomes pending. A browser never
 /// reloads a page under the user; the page learns of the update and reloads
 /// itself. The same choice is the embedder's here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadPolicy {
     /// Replace the running app at once. Right for the dev loop.
     Immediate,
-    /// Tell the app (`Event::UpdateAvailable`) and let it call
-    /// `rattery_app::reload()` when it is ready, however long that takes.
+    /// Tell the app (`Event::UpdateChanged`) and let it call
+    /// `rattery_app::update::reload()` when it is ready, however long that
+    /// takes.
     AppControlled,
-    /// Tell the app, with the deadline, and reload it anyway once `grace`
-    /// has passed. The default, with five minutes.
-    Deferred { grace: Duration },
+    /// Tell the app, with the deadlines, and reload it anyway: after
+    /// `grace`, at the first moment the app has had no input for `idle`;
+    /// at `hard_limit` regardless. The first deadline stands across further
+    /// updates.
+    Deferred {
+        grace: Duration,
+        idle: Duration,
+        hard_limit: Duration,
+    },
 }
 
 impl Default for ReloadPolicy {
+    /// Five minutes of grace, then at thirty seconds of idleness, and within
+    /// an hour regardless.
     fn default() -> Self {
         ReloadPolicy::Deferred {
             grace: Duration::from_secs(300),
+            idle: Duration::from_secs(30),
+            hard_limit: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// A pending update as the embedder sees it (see [`AppHandle`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateInfo {
+    /// The server's validator, sanitised.
+    pub version: Option<String>,
+    /// Time before the host may reload on its own at an idle moment.
+    pub reload_after: Option<Duration>,
+    /// Time before the host reloads regardless.
+    pub reload_by: Option<Duration>,
+}
+
+#[derive(Default)]
+struct HandleInner {
+    updates: std::sync::OnceLock<Arc<update::Updates>>,
+    interrupter: std::sync::OnceLock<Arc<terminal::Interrupter>>,
+}
+
+/// Control over a running app from any task: check for updates, offer a
+/// component, reload, shut down. From [`App::handle`]; inert until the run
+/// starts.
+#[derive(Clone, Default)]
+pub struct AppHandle {
+    inner: Arc<HandleInner>,
+}
+
+impl AppHandle {
+    pub(crate) fn attach(
+        &self,
+        updates: Arc<update::Updates>,
+        interrupter: Arc<terminal::Interrupter>,
+    ) {
+        let _ = self.inner.updates.set(updates);
+        let _ = self.inner.interrupter.set(interrupter);
+    }
+
+    fn updates(&self) -> Result<&Arc<update::Updates>> {
+        self.inner
+            .updates
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("the app is not running"))
+    }
+
+    /// Ask the source for a newer component now; returns the pending update
+    /// afterwards.
+    pub async fn check_update(&self) -> Result<Option<UpdateInfo>> {
+        self.updates()?.check().await
+    }
+
+    /// Offer a component the embedder obtained itself (a push channel, a
+    /// package). Validated like any update; the running version's bytes
+    /// withdraw a pending update.
+    pub async fn offer(
+        &self,
+        bytes: Vec<u8>,
+        version: Option<String>,
+    ) -> Result<Option<UpdateInfo>> {
+        let loaded = loader::Loaded {
+            precompiled: false,
+            description: "an offered component".into(),
+            bytes,
+            origin: None,
+            location: None,
+            etag: version,
+            last_modified: None,
+        };
+        Ok(self.updates()?.offer(loaded).await)
+    }
+
+    /// The pending update, with its deadlines as of now.
+    pub fn pending_update(&self) -> Option<UpdateInfo> {
+        self.inner.updates.get().and_then(|u| u.pending())
+    }
+
+    /// Reload now: onto the pending update, or restart the current version.
+    /// Returns false if the app is not running.
+    pub fn reload(&self) -> bool {
+        self.fire(terminal::Interrupt::Reload)
+    }
+
+    /// Stop the app; the run ends with [`AppStatus::Stopped`].
+    pub fn shutdown(&self) -> bool {
+        self.fire(terminal::Interrupt::Shutdown)
+    }
+
+    fn fire(&self, interrupt: terminal::Interrupt) -> bool {
+        match self.inner.interrupter.get() {
+            Some(interrupter) => {
+                interrupter.fire(interrupt);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -552,6 +664,8 @@ pub enum AppStatus {
     Trapped(String),
     /// The user pressed Ctrl-C three times in a row.
     Killed,
+    /// The embedder stopped it through [`AppHandle::shutdown`].
+    Stopped,
     /// The headless timeout elapsed.
     TimedOut,
     /// A [`Limits`] bound was exceeded; the text says which.
@@ -586,6 +700,7 @@ impl Report {
             AppStatus::Exited(code) => *code,
             AppStatus::Trapped(_) => 101,
             AppStatus::Killed => 130,
+            AppStatus::Stopped => 0,
             AppStatus::TimedOut => 124,
             AppStatus::LimitExceeded(_) => 137,
         }
@@ -649,6 +764,7 @@ pub struct App {
     pub(crate) request_policy: Option<Arc<dyn RequestPolicy>>,
     pub(crate) extensions: Vec<Extension>,
     pub(crate) ext: HashMap<TypeId, Box<dyn Any + Send>>,
+    pub(crate) handle: Option<AppHandle>,
 }
 
 impl App {
@@ -667,6 +783,7 @@ impl App {
             storage: StoragePolicy::Persistent,
             watch: false,
             reload: ReloadPolicy::default(),
+            handle: None,
             headless: None,
             limits: Limits::default(),
             on_phase: None,
@@ -809,12 +926,18 @@ impl App {
         self
     }
 
-    /// What to do when [`watch`](App::watch) finds a new version; see
+    /// What to do when a newer component becomes pending; see
     /// [`ReloadPolicy`]. Whatever the policy, an app may reload itself at
-    /// any time with `rattery_app::reload()`.
+    /// any time with `rattery_app::update::reload()`.
     pub fn reload_policy(mut self, policy: ReloadPolicy) -> Self {
         self.reload = policy;
         self
+    }
+
+    /// A handle to control the app once it runs: check for updates, offer a
+    /// component, reload, shut down. Clone it and keep it anywhere.
+    pub fn handle(&mut self) -> AppHandle {
+        self.handle.get_or_insert_with(AppHandle::default).clone()
     }
 
     /// Run without touching the real terminal; see [`HeadlessOptions`].
