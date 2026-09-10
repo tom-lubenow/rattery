@@ -58,6 +58,54 @@ first frame 0.4 ms. Cold cache: compiling the 400 KB release component takes
 35 ms; compiling a 19 MB debug component takes 60 to 120 ms (wasmtime compiles
 in parallel). Host resident memory while running the benchmark: 16.5 MB.
 
+## Mouse movement and hover
+
+`cargo xtask hover` measures the case that makes a TUI feel slow rather than
+merely cost CPU: a tiled layout that highlights the tile under the pointer
+and redraws on every movement, the way a tiling widget library does. The
+pointer sweeps the screen 400 times, 5 ms apart (200 Hz, about what a
+terminal emits). `work=10` renders the layout ten times per frame to stand
+in for a heavier UI. Measured on the same machine as above, 200×50 headless:
+
+| run | frame ms | lag at end |
+|---|---|---|
+| native ratatui, `TestBackend` | 0.96 | - |
+| component, release | 2.4 | 0 |
+| component, release, work=10, every event | 10.8 | 1894 ms |
+| component, release, work=10, coalesced | 11.1 | 7 ms |
+| component, opt-level 0, every event | 21.7 | 6252 ms |
+| component, opt-level 0, coalesced | 22.1 | 26 ms |
+| component, opt-level 0, work=10, every event | 218 | 84.6 s |
+| component, opt-level 0, work=10, coalesced | 217 | 369 ms |
+| native, work=10 | 9.0 | - |
+
+Three things follow.
+
+**The boundary is not the cost.** The host spends 1 to 5 µs per frame on
+the cell diff (about 76 cells change per hover frame). Rendering inside the
+component costs about 2.5× native for the same ratatui code (Cranelift
+against LLVM), which is the whole difference between the first two rows.
+
+**A debug build is the cost.** At opt-level 0 the same widget takes 22 ms
+a frame, nine times the release figure and twenty-three times native. That
+is the difference between hover that keeps up with a 200 Hz pointer and one
+that cannot. The workspace here sets `[profile.dev.package."*"] opt-level =
+2`, but that covers registry dependencies only: an app crate, or a widget
+library vendored as a path dependency, is compiled at opt-level 0 in a dev
+build. Build apps in release (`rattery-build` does by default), or add the
+app and vendored crates to the profile override.
+
+**Once a frame is slower than the pointer, the queue is the cost.** Every
+movement queued behind a slow frame is another full frame later, so the lag
+grows for as long as the pointer moves: two seconds at work=10, six at
+opt-level 0, eighty-five with both, and the hover highlight trails the
+pointer by that much. The
+host therefore merges a pointer movement into an unread one (and a resize
+into an unread resize) by default; only the latest position matters. The
+backlog then never exceeds one frame, and the lag at the end of the sweep is
+one frame's worth. Drags, clicks, scrolls, and keys are never merged.
+`App::coalesce_input(false)` and `--no-coalesce` turn it off for measuring.
+
 Precompiled (`rattery::precompile` at build time, `App::from_precompiled` at
 run time): the compile step becomes a deserialisation, 1.1 ms instead of 49 ms
 cold for the bench component, and needs no compile cache on the user's

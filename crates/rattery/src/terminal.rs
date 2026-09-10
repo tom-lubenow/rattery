@@ -265,6 +265,12 @@ pub struct EventQueue {
     events: Mutex<VecDeque<Event>>,
     capacity: usize,
     paste_bytes: usize,
+    /// Merge a pointer movement or resize into an unconsumed one of the
+    /// same kind: only the latest position matters, and it keeps a slow
+    /// frame from turning a burst of movement into a backlog.
+    coalesce: std::sync::atomic::AtomicBool,
+    coalesced: std::sync::atomic::AtomicU64,
+    last_push: Mutex<Option<Instant>>,
     notify: Notify,
     kill: Mutex<KillDetector>,
 }
@@ -275,6 +281,9 @@ impl EventQueue {
             events: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
             paste_bytes,
+            coalesce: std::sync::atomic::AtomicBool::new(true),
+            last_push: Mutex::new(None),
+            coalesced: std::sync::atomic::AtomicU64::new(0),
             notify: Notify::new(),
             kill: Mutex::new(KillDetector {
                 presses: VecDeque::new(),
@@ -294,13 +303,38 @@ impl EventQueue {
             text.truncate(cut);
         }
         self.kill.lock().unwrap().observe(&event);
+        *self.last_push.lock().unwrap() = Some(Instant::now());
         let mut events = self.events.lock().unwrap();
-        if events.len() >= self.capacity {
-            events.pop_front();
+        if self.coalesce.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(last) = events.back_mut()
+            && same_position_kind(last, &event)
+        {
+            *last = event;
+            self.coalesced
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            if events.len() >= self.capacity {
+                events.pop_front();
+            }
+            events.push_back(event);
         }
-        events.push_back(event);
         drop(events);
         self.notify.notify_one();
+    }
+
+    pub fn set_coalesce(&self, yes: bool) {
+        self.coalesce
+            .store(yes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// When the last event was queued.
+    pub fn last_push(&self) -> Option<Instant> {
+        *self.last_push.lock().unwrap()
+    }
+
+    /// Events merged into a newer one of the same kind so far.
+    pub fn coalesced(&self) -> u64 {
+        self.coalesced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn drain(&self) -> Vec<Event> {
@@ -316,6 +350,20 @@ impl EventQueue {
             }
             notified.await;
         }
+    }
+}
+
+/// Two events where the later one supersedes the earlier: pointer movement
+/// (hover) or a resize. Drags are not merged: a selection or a painting
+/// gesture may need every position.
+fn same_position_kind(a: &Event, b: &Event) -> bool {
+    use crate::bindings::terminal::MouseEventKind as K;
+    match (a, b) {
+        (Event::Mouse(x), Event::Mouse(y)) => {
+            matches!((&x.kind, &y.kind), (K::Moved, K::Moved)) && x.modifiers == y.modifiers
+        }
+        (Event::Resize(_), Event::Resize(_)) => true,
+        _ => false,
     }
 }
 
@@ -337,8 +385,17 @@ pub struct Stats {
     pub flush_time: Duration,
     /// Events handed to the app.
     pub events: u64,
+    /// Pointer movements and resizes merged into a newer one before the app
+    /// read them.
+    pub events_coalesced: u64,
     /// When the first `draw` arrived, relative to the app starting.
     pub first_draw: Option<Duration>,
+    /// When the last `draw` arrived, relative to the app starting.
+    pub last_draw: Option<Duration>,
+    /// When the last input event was queued, relative to the app starting.
+    /// `last_draw - last_event` is the app's lag behind its input at the
+    /// end of the run.
+    pub last_event: Option<Duration>,
     /// The most linear memory the app had in use at once, in bytes.
     pub memory_peak: usize,
     /// Log records delivered to the embedder.
@@ -488,7 +545,13 @@ impl TerminalHost {
 
     /// Counters since the terminal was opened.
     pub fn stats(&self) -> Stats {
-        self.stats.clone()
+        let mut stats = self.stats.clone();
+        stats.events_coalesced = self.queue.coalesced();
+        stats.last_event = self
+            .queue
+            .last_push()
+            .map(|t| t.saturating_duration_since(self.started));
+        stats
     }
 
     /// Restart the clock behind `Stats::first_draw` (used before each run).
@@ -545,6 +608,7 @@ impl TerminalHost {
             self.stats.first_draw = Some(t.duration_since(self.started));
         }
         self.stats.draws += 1;
+        self.stats.last_draw = Some(self.started.elapsed());
         self.stats.cells += updates.len() as u64;
         self.stats.cells_rejected += rejected;
         self.stats.draw_time += t.elapsed();
@@ -719,7 +783,50 @@ async fn read_input(queue: Arc<EventQueue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::terminal::{Cell, Color, Modifier};
+    use crate::bindings::terminal::{
+        Cell, Color, Modifier, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn mouse(kind: MouseEventKind, column: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    #[test]
+    fn hover_and_resize_coalesce_but_drags_and_keys_do_not() {
+        let queue = EventQueue::new(Arc::new(Interrupter::new()), 16, 1024);
+        queue.push(mouse(MouseEventKind::Moved, 1));
+        queue.push(mouse(MouseEventKind::Moved, 2));
+        queue.push(mouse(MouseEventKind::Moved, 3));
+        queue.push(mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        queue.push(mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+        queue.push(Event::Resize(Size {
+            width: 10,
+            height: 1,
+        }));
+        queue.push(Event::Resize(Size {
+            width: 20,
+            height: 2,
+        }));
+        queue.push(mouse(MouseEventKind::Moved, 6));
+        let events = queue.drain();
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(events[0], mouse(MouseEventKind::Moved, 3));
+        assert_eq!(events[1], mouse(MouseEventKind::Drag(MouseButton::Left), 4));
+        assert_eq!(events[2], mouse(MouseEventKind::Drag(MouseButton::Left), 5));
+        assert!(matches!(events[3], Event::Resize(Size { width: 20, .. })));
+        assert_eq!(events[4], mouse(MouseEventKind::Moved, 6));
+        assert_eq!(queue.coalesced(), 3);
+
+        queue.set_coalesce(false);
+        queue.push(mouse(MouseEventKind::Moved, 1));
+        queue.push(mouse(MouseEventKind::Moved, 2));
+        assert_eq!(queue.drain().len(), 2);
+    }
 
     fn host(phases: Arc<Mutex<Vec<Phase>>>) -> TerminalHost {
         let interrupter = Arc::new(Interrupter::new());

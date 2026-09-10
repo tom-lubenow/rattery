@@ -10,6 +10,10 @@
 //!   to measure request latency through the host (needs `--origin`).
 //! - `evil`: tries to inject escape sequences through cells, the title, and
 //!   stdout, then exits; the host must contain all of it.
+//! - `hover`: a tiled layout that highlights the tile under the pointer and
+//!   redraws on every event, the way a tiling widget library does; feed it
+//!   mouse movement (`sweep` in a headless script) and it reports how many
+//!   events it saw and how many frames it drew, until `q`.
 //! - `storage`: exercises origin-scoped storage and logging: bumps a run
 //!   counter, tries to exceed the quota, logs a record with an escape sequence
 //!   in it, then floods the log to hit the rate limit.
@@ -27,12 +31,16 @@ mod bench {
     struct Params {
         frames: usize,
         mode: String,
+        /// `hover`: render the layout this many times per frame, to stand in
+        /// for a heavier UI.
+        work: usize,
     }
 
     fn params() -> Params {
         let mut params = Params {
             frames: 100,
             mode: "full".into(),
+            work: 1,
         };
         if let Some(location) = rattery_app::location()
             && let Some((_, query)) = location.split_once('?')
@@ -41,6 +49,7 @@ mod bench {
                 match pair.split_once('=') {
                     Some(("frames", n)) => params.frames = n.parse().unwrap_or(params.frames),
                     Some(("mode", m)) => params.mode = m.to_owned(),
+                    Some(("work", n)) => params.work = n.parse().unwrap_or(1).max(1),
                     _ => {}
                 }
             }
@@ -123,9 +132,57 @@ mod bench {
     }
 
     pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
-        let Params { frames, mode } = params();
+        let Params { frames, mode, work } = params();
         if mode == "http" {
             return http_bench(frames).await;
+        }
+        if mode == "hover" {
+            use bench_app::hover::Tiles;
+            use rattery_app::event;
+            let mut hover = None;
+            let mut events = 0usize;
+            let mut mouse_events = 0usize;
+            let mut durations = Vec::new();
+            let mut frame = 0usize;
+            loop {
+                let t = Instant::now();
+                terminal.draw(|f| {
+                    for _ in 1..work {
+                        // Rendered and discarded: the cost without the cells.
+                        let mut scratch = f.buffer_mut().clone();
+                        rattery_app::ratatui::widgets::Widget::render(
+                            Tiles { hover, frame },
+                            f.area(),
+                            &mut scratch,
+                        );
+                    }
+                    f.render_widget(Tiles { hover, frame }, f.area())
+                })?;
+                durations.push(t.elapsed());
+                frame += 1;
+                match event::next().await {
+                    Event::Mouse(m) => {
+                        events += 1;
+                        mouse_events += 1;
+                        hover = Some((m.column, m.row));
+                    }
+                    Event::Key(k) if k.code == KeyCode::Char('q') => break,
+                    _ => events += 1,
+                }
+            }
+            durations.sort();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            let pct = |p: f64| durations[((durations.len() - 1) as f64 * p) as usize];
+            let total: std::time::Duration = durations.iter().sum();
+            println!(
+                "bench mode=hover work={work} frames={frame} events={events} mouse_events={mouse_events} avg_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} draw_total_ms={:.1}",
+                ms(total / frame.max(1) as u32),
+                ms(pct(0.5)),
+                ms(pct(0.95)),
+                ms(*durations.last().unwrap()),
+                ms(total)
+            );
+            return Ok(());
         }
         if mode == "storage" {
             use rattery_app::storage;

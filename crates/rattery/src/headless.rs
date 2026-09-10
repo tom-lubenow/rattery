@@ -19,10 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use ratatui::backend::TestBackend;
+use ratatui::backend::{Backend, TestBackend};
 
 use crate::bindings::terminal::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, Size, Update,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+    MouseEventKind, Size, Update,
 };
 use crate::terminal::{EventQueue, Screen};
 
@@ -41,6 +42,17 @@ pub enum ScriptCommand {
         height: u16,
     },
     Snapshot,
+    /// A pointer movement to (column, row).
+    MouseMove {
+        column: u16,
+        row: u16,
+    },
+    /// `steps` pointer movements along the screen's diagonal, one every
+    /// `interval`: a hover benchmark's input.
+    Sweep {
+        steps: usize,
+        interval: Duration,
+    },
     /// Tell the app an update is available (with this version string), as
     /// the watcher would. The app's `reload()` then restarts the same
     /// component, which is enough to test the handling.
@@ -100,6 +112,25 @@ fn parse_line(line: &str) -> Result<ScriptCommand> {
         }
         "snapshot" => ScriptCommand::Snapshot,
         "update" => ScriptCommand::Update((!rest.is_empty()).then(|| rest.to_owned())),
+        "mouse" => {
+            let (x, y) = rest
+                .strip_prefix("move")
+                .and_then(|r| r.trim().split_once(char::is_whitespace))
+                .context("expected `mouse move X Y`")?;
+            ScriptCommand::MouseMove {
+                column: x.trim().parse().context("bad column")?,
+                row: y.trim().parse().context("bad row")?,
+            }
+        }
+        "sweep" => {
+            let (steps, ms) = rest
+                .split_once(char::is_whitespace)
+                .context("expected `sweep STEPS MS`")?;
+            ScriptCommand::Sweep {
+                steps: steps.trim().parse().context("bad step count")?,
+                interval: Duration::from_millis(ms.trim().parse().context("bad interval")?),
+            }
+        }
         other => bail!("unknown command {other:?}"),
     })
 }
@@ -165,6 +196,15 @@ fn key_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
     })
 }
 
+fn mouse_move(column: u16, row: u16) -> Event {
+    Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
 /// Feed the script to the app.
 pub async fn run_script(
     script: Script,
@@ -199,6 +239,18 @@ pub async fn run_script(
                 version,
                 deadline_ms: None,
             })),
+            ScriptCommand::MouseMove { column, row } => queue.push(mouse_move(column, row)),
+            ScriptCommand::Sweep { steps, interval } => {
+                let size = backend.lock().unwrap().size().unwrap_or_default();
+                for step in 0..steps {
+                    let t = step as f64 / steps.max(1) as f64;
+                    queue.push(mouse_move(
+                        (t * size.width.saturating_sub(1) as f64) as u16,
+                        (t * size.height.saturating_sub(1) as f64) as u16,
+                    ));
+                    tokio::time::sleep(interval).await;
+                }
+            }
         }
     }
 }
@@ -210,7 +262,7 @@ mod tests {
     #[test]
     fn parses_commands() {
         let script = Script::parse(
-            "# comment\nsleep 250\nkey ctrl-c\nkey Q\nkey f12\nkey -\ntype hi\nresize 100 30\nsnapshot\n",
+            "# comment\nsleep 250\nkey ctrl-c\nkey Q\nkey f12\nkey -\ntype hi\nresize 100 30\nsnapshot\nmouse move 3 4\nsweep 10 5\nupdate v2\n",
         )
         .unwrap();
         assert_eq!(
@@ -239,6 +291,12 @@ mod tests {
                     height: 30
                 },
                 ScriptCommand::Snapshot,
+                ScriptCommand::MouseMove { column: 3, row: 4 },
+                ScriptCommand::Sweep {
+                    steps: 10,
+                    interval: Duration::from_millis(5),
+                },
+                ScriptCommand::Update(Some("v2".into())),
             ]
         );
     }

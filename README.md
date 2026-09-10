@@ -284,6 +284,13 @@ within 1.5 seconds interrupts an unresponsive app. Raw mode and the alternate sc
 are always restored, including on panic, and every background task is stopped before
 the terminal is handed back. See `docs/security.md`.
 
+**Input.** Pointer movements and resizes the app has not read yet are merged into
+the newest one, so a frame slower than the pointer never turns a burst of movement
+into a backlog the app spends seconds draining; clicks, drags, scrolls, and keys are
+delivered in full. `docs/perf.md` has the hover benchmark (`cargo xtask hover`), and
+one finding worth repeating: build apps in release. At opt-level 0 the same widgets
+run about nine times slower inside the component.
+
 **Stats.** `Report::timings` and `Report::stats` (the `--stats` flag prints them) carry
 phase timings (load, compile, instantiate, first frame) and terminal counters. `cargo
 xtask bench` runs a rendering and request latency benchmark; see `docs/perf.md`.

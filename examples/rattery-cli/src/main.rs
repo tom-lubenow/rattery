@@ -81,6 +81,11 @@ struct Cli {
     #[arg(long, value_name = "SECS|none", default_value = "0", requires = "watch", value_parser = parse_reload)]
     reload_grace: ReloadPolicy,
 
+    /// Deliver every pointer movement and resize instead of merging unread
+    /// ones (for measuring).
+    #[arg(long)]
+    no_coalesce: bool,
+
     /// Do not report mouse events to the app.
     #[arg(long)]
     no_mouse: bool,
@@ -149,6 +154,9 @@ Headless scripts are one command per line; blank lines and # comments are ignore
   paste some text    a bracketed paste
   resize 100 30      columns rows; the app receives a resize event
   snapshot           capture the screen; printed when the app ends
+  mouse move 10 5    pointer movement to column 10, row 5
+  sweep 400 5        400 movements along the diagonal, 5 ms apart
+  update v2          announce an update (the app may call reload)
 ";
 
 #[tokio::main]
@@ -162,6 +170,7 @@ async fn main() -> Result<()> {
     let mut app = App::from_source(&cli.source)?
         .allow_all_origins(cli.allow_all_origins)
         .mouse(!cli.no_mouse)
+        .coalesce_input(!cli.no_coalesce)
         .cache(!cli.no_cache)
         .cookies(if cli.no_cookies {
             CookiePolicy::Disabled
@@ -293,16 +302,23 @@ async fn main() -> Result<()> {
         let per =
             |total: Duration, n: u64| ms(total.checked_div(n.max(1) as u32).unwrap_or_default());
         eprintln!(
-            "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {}, logs {} ({} dropped)",
+            "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {} ({} coalesced), logs {} ({} dropped)",
             s.draws,
             s.cells,
             per(s.draw_time, s.draws),
             s.flushes,
             per(s.flush_time, s.flushes),
             s.events,
+            s.events_coalesced,
             s.logs,
             s.logs_dropped
         );
+        if let (Some(draw), Some(event)) = (s.last_draw, s.last_event) {
+            eprintln!(
+                "  lag at end: {} (last draw after last event)",
+                ms(draw.saturating_sub(event))
+            );
+        }
     }
     if let Some(abi) = needs_abi.lock().unwrap().take() {
         eprintln!(

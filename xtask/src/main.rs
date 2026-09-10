@@ -29,6 +29,17 @@ enum Task {
         #[arg(long, default_value_t = 200)]
         frames: usize,
     },
+    /// The hover benchmark: a tiled layout redrawn on every pointer movement,
+    /// natively and as a component (release, and a true opt-level 0 build),
+    /// with and without input coalescing. See docs/perf.md.
+    Hover {
+        /// Pointer movements per run.
+        #[arg(long, default_value_t = 400)]
+        steps: usize,
+        /// Milliseconds between movements.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
     /// Build, serve, watch, rebuild. Run `rattery --watch <url>` next to it.
     Dev {
         /// The app package to build for wasm32-wasip2.
@@ -47,6 +58,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Task::Dev { app, server, bind } => dev(&app, &server, &bind),
         Task::Bench { frames } => bench(frames),
+        Task::Hover { steps, interval } => hover(steps, interval),
     }
 }
 
@@ -219,6 +231,135 @@ fn bench(frames: usize) -> Result<()> {
     let size = std::fs::metadata(&app).map(|m| m.len()).unwrap_or(0);
     println!("component size (release): {} KB", size / 1024);
     Ok(())
+}
+
+fn hover(steps: usize, interval: u64) -> Result<()> {
+    let root = root();
+    for args in [
+        &[
+            "build",
+            "-p",
+            "bench-app",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+        ][..],
+        &[
+            "build",
+            "-p",
+            "bench-app",
+            "--target",
+            "wasm32-wasip2",
+            "--target-dir",
+            "target/opt0",
+            "--config",
+            "profile.dev.package.\"*\".opt-level=0",
+        ],
+        &["build", "-p", "rattery-cli", "-p", "bench-app", "--release"],
+    ] {
+        if !cargo(args)? {
+            bail!("build failed: cargo {}", args.join(" "));
+        }
+    }
+    let script = root.join("target/hover-script.txt");
+    std::fs::write(
+        &script,
+        format!("sleep 1500\nsweep {steps} {interval}\nkey q\n"),
+    )?;
+    println!();
+    println!(
+        "{:<34} {:>7} {:>7} {:>9} {:>9} {:>10}",
+        "run (200x50)", "events", "frames", "frame ms", "host µs", "lag at end"
+    );
+    for work in [1, 10] {
+        let output = Command::new(root.join("target/release/hover-native"))
+            .args([steps.to_string(), "200x50".into(), work.to_string()])
+            .output()
+            .context("failed to run hover-native")?;
+        let line = String::from_utf8_lossy(&output.stdout);
+        println!(
+            "{:<34} {:>7} {:>7} {:>9} {:>9} {:>10}",
+            format!("native work={work}"),
+            "-",
+            steps,
+            field(&line, "avg_ms"),
+            "-",
+            "-"
+        );
+    }
+    let host = root.join("target/release/rattery");
+    let builds = [
+        (
+            "release",
+            root.join("target/wasm32-wasip2/release/bench-app.wasm"),
+        ),
+        (
+            "opt-level 0",
+            root.join("target/opt0/wasm32-wasip2/debug/bench-app.wasm"),
+        ),
+    ];
+    for (label, app) in &builds {
+        for work in [1, 10] {
+            for coalesce in [true, false] {
+                let mut cmd = Command::new(&host);
+                cmd.args([
+                    "--headless",
+                    "200x50",
+                    "--timeout",
+                    "300",
+                    "--stats",
+                    "--no-cookies",
+                ])
+                .arg("--script")
+                .arg(&script)
+                .arg("--location")
+                .arg(format!("bench://local/app.wasm?mode=hover&work={work}"));
+                if !coalesce {
+                    cmd.arg("--no-coalesce");
+                }
+                let output = cmd.arg(app).output().context("failed to run rattery")?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let name = format!(
+                    "{label} work={work} {}",
+                    if coalesce { "coalesced" } else { "every event" }
+                );
+                let Some(line) = stdout.lines().find(|l| l.starts_with("bench ")) else {
+                    println!("{name:<34} failed: {}", stderr.lines().last().unwrap_or(""));
+                    continue;
+                };
+                let draws = stderr
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("draws "))
+                    .unwrap_or("");
+                let host_avg = draws
+                    .split_once(" avg on host")
+                    .and_then(|(before, _)| before.rsplit([' ', '(']).next())
+                    .unwrap_or("?");
+                let lag = stderr
+                    .lines()
+                    .find_map(|l| l.trim_start().strip_prefix("lag at end: "))
+                    .and_then(|l| l.split_whitespace().next())
+                    .unwrap_or("?");
+                println!(
+                    "{name:<34} {:>7} {:>7} {:>9} {:>9} {:>10}",
+                    field(line, "mouse_events"),
+                    field(line, "frames"),
+                    field(line, "avg_ms"),
+                    host_avg,
+                    lag
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn field(line: &str, key: &str) -> String {
+    line.split_whitespace()
+        .find_map(|kv| kv.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+        .unwrap_or("?")
+        .to_owned()
 }
 
 fn root() -> PathBuf {

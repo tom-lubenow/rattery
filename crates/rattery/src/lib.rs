@@ -635,6 +635,7 @@ pub struct App {
     pub(crate) allow_origins: Vec<String>,
     pub(crate) allow_all_origins: bool,
     pub(crate) mouse: bool,
+    pub(crate) coalesce_input: bool,
     pub(crate) cache: bool,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) location: Option<String>,
@@ -658,6 +659,7 @@ impl App {
             allow_origins: Vec::new(),
             allow_all_origins: false,
             mouse: true,
+            coalesce_input: true,
             cache: true,
             env: Vec::new(),
             location: None,
@@ -751,6 +753,17 @@ impl App {
     }
 
     /// Report mouse events to the app (default: yes).
+    /// Merge pointer movements and resizes the app has not read yet into the
+    /// newest one (default on): only the latest position matters, and it
+    /// keeps a slow frame from turning a burst of movement into a backlog.
+    /// Drags and everything else are always delivered in full. Off, every
+    /// event is delivered, which is only useful for measuring what that
+    /// costs.
+    pub fn coalesce_input(mut self, yes: bool) -> Self {
+        self.coalesce_input = yes;
+        self
+    }
+
     pub fn mouse(mut self, yes: bool) -> Self {
         self.mouse = yes;
         self

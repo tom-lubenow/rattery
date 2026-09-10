@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 (2026-09-10)
+
+- Input coalescing: a pointer movement or resize the app has not read yet
+  is replaced by the newer one (`App::coalesce_input`, default on), so a
+  frame slower than the pointer no longer builds a backlog. Drags, clicks,
+  scrolls, and keys are delivered in full. `Stats::events_coalesced`,
+  `Stats::last_draw`, `Stats::last_event` (their difference is the lag at
+  the end of a run). Headless scripts gain `mouse move X Y` and
+  `sweep STEPS MS`; the bench app gains a `hover` mode with a `work`
+  multiplier and a native baseline binary; `cargo xtask hover` runs the
+  matrix. See the mouse movement section of `docs/perf.md`.
+
 ## 0.3.2 (2026-09-10)
 
 - ABI transitions: component fetches send a `rattery-abi` request header

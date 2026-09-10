@@ -1017,3 +1017,53 @@ async fn the_server_can_demand_an_abi() {
     assert!(!phases.contains(&Phase::Reloading), "{phases:?}");
     let _ = std::fs::remove_file(&flag);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hover_input_is_coalesced_when_frames_fall_behind() {
+    require_wasip2!();
+    // A heavy frame (the layout rendered ten times) against a 200 Hz sweep:
+    // without coalescing the app drains a backlog long after the pointer
+    // stopped; with it, the lag is about one frame.
+    let run = |coalesce: bool| async move {
+        App::from_path(guest("bench-app"))
+            .location("bench://local/app.wasm?mode=hover&work=10")
+            .cookies(CookiePolicy::Ephemeral)
+            .coalesce_input(coalesce)
+            .headless(HeadlessOptions {
+                width: 200,
+                height: 50,
+                script: Script::parse("sleep 1500\nsweep 200 5\nkey q").unwrap(),
+                timeout: Some(Duration::from_secs(60)),
+            })
+            .run()
+            .await
+            .unwrap()
+    };
+    let merged = run(true).await;
+    let text = dump(&merged);
+    assert_eq!(merged.status, AppStatus::Exited(0), "{text}");
+    assert!(merged.stdout.contains("bench mode=hover work=10"), "{text}");
+    let lag = |r: &Report| r.stats.last_draw.unwrap() - r.stats.last_event.unwrap();
+    assert!(merged.stats.events_coalesced > 0, "{:?}", merged.stats);
+    assert!(
+        merged.stats.events + merged.stats.events_coalesced >= 200,
+        "every movement was either delivered or merged\n{:?}",
+        merged.stats
+    );
+    assert!(
+        lag(&merged) < Duration::from_millis(500),
+        "{:?}",
+        merged.stats
+    );
+
+    let all = run(false).await;
+    assert_eq!(all.status, AppStatus::Exited(0), "{}", dump(&all));
+    assert_eq!(all.stats.events_coalesced, 0);
+    assert!(all.stats.draws >= 200, "{:?}", all.stats);
+    assert!(
+        lag(&all) > lag(&merged),
+        "delivering everything should lag more: {:?} vs {:?}",
+        lag(&all),
+        lag(&merged)
+    );
+}

@@ -184,6 +184,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             (None, term)
         }
     };
+    term.queue().set_coalesce(app.coalesce_input);
     term.set_phase_hook(on_phase.clone());
     let snapshots = term.snapshots();
     let screen_source = term.test_backend();
