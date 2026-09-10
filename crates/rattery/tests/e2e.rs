@@ -9,7 +9,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use rattery::{
-    App, AppStatus, CookiePolicy, HeadlessOptions, LogLevel, Phase, Report, Script, StoragePolicy,
+    App, AppStatus, CookiePolicy, HeadlessOptions, LogLevel, Phase, ReloadPolicy, Report, Script,
+    StoragePolicy,
 };
 
 fn workspace_root() -> PathBuf {
@@ -476,22 +477,46 @@ async fn watch_reloads_when_the_served_component_changes() {
             .unwrap();
     }
 
+    // Deferred policy: the app hears about the update and gets three seconds
+    // to act on it; the counter app only shows a banner, so the host reloads
+    // it when the deadline passes.
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
     let run = tokio::spawn(
         App::from_url(format!("{}/app.wasm", server.url))
             .unwrap()
             .watch(true)
+            .reload_policy(ReloadPolicy::Deferred {
+                grace: Duration::from_secs(3),
+            })
+            .on_phase(move |phase| {
+                if matches!(phase, Phase::UpdateAvailable { .. } | Phase::Reloading) {
+                    seen.lock().unwrap().push(phase);
+                }
+            })
             .cookies(CookiePolicy::Ephemeral)
-            .headless(headless("sleep 2500\nsnapshot", 16))
+            .headless(headless("sleep 2500\nsnapshot\nsleep 4000\nsnapshot", 16))
             .run(),
     );
     tokio::time::sleep(Duration::from_secs(4)).await;
-    // Publish a different app; the running one is replaced in place.
+    // Publish a different app; the running one is told, then replaced.
     std::fs::copy(guest("spin-app"), &served).unwrap();
 
     let report = run.await.unwrap().unwrap();
     let text = dump(&report);
     assert_eq!(report.status, AppStatus::TimedOut, "{text}");
     assert!(report.snapshots[0].contains("rattery counter"), "{text}");
+    let banner = &report.snapshots[1];
+    assert!(
+        banner.contains("rattery counter") && banner.contains("available: R reloads, forced in"),
+        "the app should still be running with the banner up\n{text}"
+    );
+    let phases = phases.lock().unwrap();
+    assert!(
+        matches!(phases.first(), Some(Phase::UpdateAvailable { version: Some(v) }) if !v.is_empty()),
+        "{phases:?}"
+    );
+    assert!(phases.contains(&Phase::Reloading), "{phases:?}");
     assert!(
         report
             .final_screen
@@ -760,4 +785,39 @@ async fn run_err(app: App) -> String {
         .await
         .expect_err("should fail");
     format!("{err:#}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_reloads_itself_when_it_is_ready() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let dir = std::env::temp_dir().join(format!("rattery-e2e-reload-{}", std::process::id()));
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    // The headless `update` command plays the watcher; `R` is the app's
+    // reload key. The launch counter in storage proves a new instance ran.
+    let report = App::from_path(guest("counter-app"))
+        .origin(&server.url)
+        .cookies(CookiePolicy::Ephemeral)
+        .storage(StoragePolicy::Dir(dir.clone()))
+        .on_phase(move |phase| seen.lock().unwrap().push(format!("{phase:?}")))
+        .headless(headless(
+            "sleep 2500\nupdate v2\nsleep 400\nsnapshot\nkey R\nsleep 2500\nsnapshot\nkey q",
+            20,
+        ))
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::Exited(0), "{text}");
+    let before = &report.snapshots[0];
+    assert!(before.contains("update v2 available: R reloads"), "{text}");
+    assert!(before.contains("launch 1"), "{text}");
+    let after = &report.snapshots[1];
+    assert!(!after.contains("available"), "{text}");
+    assert!(after.contains("launch 2"), "{text}");
+    let phases = phases.lock().unwrap().join("\n");
+    assert!(phases.contains("Reloading"), "{phases}");
+    assert_eq!(phases.matches("Ready").count(), 2, "{phases}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

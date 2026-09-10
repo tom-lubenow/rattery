@@ -222,7 +222,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bench-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "http",
@@ -580,7 +580,7 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "counter-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "counter-shared",
  "futures",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "counter-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "counter-shared"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures",
  "rattery-app",
@@ -2704,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "rattery"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "rattery-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
@@ -2753,14 +2753,14 @@ dependencies = [
 
 [[package]]
 name = "rattery-build"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rattery",
 ]
 
 [[package]]
 name = "rattery-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "rattery-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3394,7 +3394,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "spin-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rattery-app",
 ]
@@ -5135,7 +5135,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",

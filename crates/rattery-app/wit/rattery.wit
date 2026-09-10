@@ -5,7 +5,7 @@
 /// terminal. It is deliberately shaped like ratatui's `Backend` trait plus a
 /// crossterm-style event stream, so the guest never emits escape sequences and
 /// the host never needs to know what a widget is.
-package rattery:tui@0.2.0;
+package rattery:tui@0.3.0;
 
 interface terminal {
     // ---- rendering types -------------------------------------------------
@@ -201,6 +201,17 @@ interface terminal {
         modifiers: key-modifiers,
     }
 
+    /// A newer version of the app is available from where it was loaded.
+    record update {
+        /// The server's validator for the new version (an ETag or date),
+        /// for display; it is opaque.
+        version: option<string>,
+        /// How long the app has before the host reloads it anyway, if the
+        /// host has a deadline. Absent when the app has all the time it
+        /// wants.
+        deadline-ms: option<u64>,
+    }
+
     variant event {
         focus-gained,
         focus-lost,
@@ -208,6 +219,9 @@ interface terminal {
         mouse(mouse-event),
         paste(string),
         resize(size),
+        /// Handle it by saving state (see `storage`) and calling `reload`
+        /// when convenient.
+        update-available(update),
     }
 
     // ---- rendering (mirrors ratatui's Backend trait) ---------------------
@@ -250,6 +264,10 @@ interface terminal {
     /// embedders that want a readiness signal beyond "a frame was drawn"
     /// wait for this.
     ready: func();
+
+    /// Restart the app in place on the newest version the host has. Never
+    /// returns: the instance is torn down and a new one is started.
+    reload: func();
 
     enum log-level {
         trace,

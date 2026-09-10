@@ -182,8 +182,15 @@ impl Interrupter {
         self.reason.lock().unwrap().take()
     }
 
+    /// Resolves once a reason is set. A permit left over from an earlier
+    /// run (the guest ended before this was polled) does not count.
     pub async fn notified(&self) {
-        self.notify.notified().await
+        loop {
+            self.notify.notified().await;
+            if self.is_fired() {
+                return;
+            }
+        }
     }
 }
 

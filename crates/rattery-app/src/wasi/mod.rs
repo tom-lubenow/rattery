@@ -44,6 +44,16 @@ pub fn ready() {
     bindings::terminal::ready()
 }
 
+/// Restart the app in place on the newest version the host has (the one an
+/// [`Event::UpdateAvailable`](crate::event::Event::UpdateAvailable) announced,
+/// or the current one). Never returns: the host tears this instance down and
+/// starts a new one, so save anything that matters to
+/// [`storage`](crate::storage) first.
+pub fn reload() -> ! {
+    bindings::terminal::reload();
+    unreachable!("the host reinstantiates the app on reload")
+}
+
 /// Timers that cooperate with the runtime.
 pub mod time {
     use std::time::Duration;

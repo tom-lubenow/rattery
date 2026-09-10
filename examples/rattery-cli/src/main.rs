@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use rattery::{
-    App, AppStatus, CookiePolicy, HeadlessOptions, Phase, Script, StoragePolicy, sanitize,
+    App, AppStatus, CookiePolicy, HeadlessOptions, Phase, ReloadPolicy, Script, StoragePolicy,
+    sanitize,
 };
 
 /// Run a ratatui app delivered as a WASI component, sandboxed like a web page.
@@ -73,6 +74,13 @@ struct Cli {
     #[arg(long)]
     watch: bool,
 
+    /// With --watch: how a new version is applied. `0` (the default here)
+    /// replaces the app at once; `none` tells the app and lets it reload
+    /// itself when ready; SECS tells the app and reloads it anyway after
+    /// that long.
+    #[arg(long, value_name = "SECS|none", default_value = "0", requires = "watch", value_parser = parse_reload)]
+    reload_grace: ReloadPolicy,
+
     /// Do not report mouse events to the app.
     #[arg(long)]
     no_mouse: bool,
@@ -107,6 +115,16 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .ok_or_else(|| format!("expected KEY=VALUE, got {s:?}"))
+}
+
+fn parse_reload(s: &str) -> Result<ReloadPolicy, String> {
+    Ok(match s {
+        "none" => ReloadPolicy::AppControlled,
+        "0" => ReloadPolicy::Immediate,
+        secs => ReloadPolicy::Deferred {
+            grace: Duration::from_secs_f64(secs.parse().map_err(|e| format!("bad seconds: {e}"))?),
+        },
+    })
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
@@ -163,7 +181,8 @@ async fn main() -> Result<()> {
         } else {
             StoragePolicy::Persistent
         })
-        .watch(cli.watch);
+        .watch(cli.watch)
+        .reload_policy(cli.reload_grace);
     if let Some(path) = cli.log_file {
         let file = std::fs::OpenOptions::new()
             .append(true)

@@ -193,6 +193,11 @@ Router::new()
     .route("/api/{*rest}", any(rattery_app::server_fn::axum::handle_server_fn))
 ```
 
+Updates work as they do on the web: when the host finds a new version it sends
+`Event::UpdateAvailable`, and the app calls `rattery_app::reload()` when it is a good
+moment (after saving a draft to storage, say); under the default policy the host
+reloads it anyway once a grace period passes.
+
 Two more things a browser gives a page, the host gives an app. `rattery_app::storage`
 is `localStorage`: a small key-value store scoped to the app's origin that survives
 runs, with a quota (`get`, `set`, `remove`, `keys`, `clear`, `usage`, plus
@@ -224,7 +229,7 @@ rattery <URL or path>
         [--origin URL] [--allow-origin URL]... [--allow-all-origins]
         [--incognito | --no-cookies | --cookie-jar FILE]
         [--storage-dir DIR | --no-storage] [--log-file FILE]
-        [--watch] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
+        [--watch [--reload-grace SECS|none]] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
         [--headless COLSxROWS [--script FILE] [--timeout SECS]]
 ```
 
@@ -253,8 +258,14 @@ has no origin and so gets ephemeral storage.
 `--log-file` appends them to a file you can `tail -f` in another terminal while the
 app has the screen.
 
-**Reload.** `--watch` polls the URL with `If-None-Match` and restarts the app in place
-when the server publishes a new component.
+**Reload.** `--watch` polls the URL with `If-None-Match`. What happens when a new
+component appears is a `ReloadPolicy`, the way a browser leaves reloading to the page:
+`Immediate` replaces the app at once (the dev loop; `--reload-grace 0`), `AppControlled`
+delivers `Event::UpdateAvailable` and waits for the app to call
+`rattery_app::reload()` (`none`), and `Deferred` does the same but reloads anyway once
+the grace period passes (the library default, five minutes; the event carries the
+deadline). An app can save its state to storage first, and the server should keep the
+old routes working for the grace period, since the old app keeps calling them.
 
 **Safety.** Everything the app sends toward the terminal is validated: control
 characters and malformed symbols never reach the screen or the title, cells outside

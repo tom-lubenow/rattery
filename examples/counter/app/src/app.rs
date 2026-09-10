@@ -41,6 +41,8 @@ struct App {
     /// How many times this app has been launched from this origin, kept in
     /// the host's origin-scoped storage.
     launches: u64,
+    /// A newer version the host told us about; `R` reloads into it.
+    update: Option<Update>,
     quit: bool,
 }
 
@@ -231,6 +233,10 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
 
         match event {
             Event::Wake => app.settle(),
+            Event::UpdateAvailable(update) => {
+                rattery_app::log::info!("update available: {update:?}");
+                app.update = Some(update);
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -241,6 +247,9 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
                     app.start(adjust_count(-1))
                 }
                 KeyCode::Char('r') => app.start(fetch_snapshot()),
+                // Nothing to save here: the count lives on the server and the
+                // launch counter is already in storage.
+                KeyCode::Char('R') => rattery_app::reload(),
                 KeyCode::Char('s') => app.start(slow_snapshot(2000)),
                 KeyCode::Char('w') => app.ping(),
                 KeyCode::Char('u') => app.upload_file(),
@@ -271,13 +280,29 @@ fn ui(frame: &mut Frame, app: &App) {
     } else {
         Span::from("  idle").dim()
     };
+    // The update banner takes the header's spare line, like a browser's
+    // "new version available" bar.
+    let banner = match &app.update {
+        Some(update) => {
+            let version = update.version.as_deref().unwrap_or("new");
+            let deadline = match update.deadline {
+                Some(d) => format!(", forced in {}s", d.as_secs()),
+                None => String::new(),
+            };
+            Line::from(format!(" update {version} available: R reloads{deadline}").yellow())
+        }
+        None => Line::from(""),
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            format!(" {} ", app.title).bold().reversed(),
-            "  served from ".dim(),
-            origin.cyan(),
-            status,
-        ]))
+        Paragraph::new(vec![
+            Line::from(vec![
+                format!(" {} ", app.title).bold().reversed(),
+                "  served from ".dim(),
+                origin.cyan(),
+                status,
+            ]),
+            banner,
+        ])
         .block(Block::new().borders(Borders::BOTTOM)),
         header,
     );

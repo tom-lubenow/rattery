@@ -116,6 +116,14 @@ every mode is restored in reverse order. The panic hook installed for that
 wraps the previous hook; it is put back on exit, and if the run panics, the
 panic is caught, the hook restored, and the panic resumed.
 
+A reload never happens behind the app's back unless the embedder asks for
+that: `ReloadPolicy::Immediate` replaces it at once, `AppControlled` only
+delivers `Event::UpdateAvailable`, and `Deferred` (the default) delivers the
+event with its deadline and forces the reload when the deadline passes. The
+first deadline stands across further updates, so a stream of deploys cannot
+postpone it. The version string in the event is the server's validator,
+sanitised and cut to 256 bytes.
+
 `Phase::Ready` fires after the first frame has been validated, drawn, and
 flushed successfully. An app that wants a stronger signal calls
 `rattery_app::ready()` when its data is loaded and a real screen is up, which

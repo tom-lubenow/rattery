@@ -110,7 +110,7 @@ pub use terminal::{Screen, Stats};
 /// It names the WIT package version of the terminal and websocket
 /// interfaces, the component-model async ABI, and the WASI HTTP version the
 /// guest runtime uses. Any change to these is a new identifier.
-pub const ABI: &str = "rattery:tui@0.2.0;cm-async;wasi:http@0.3.0";
+pub const ABI: &str = "rattery:tui@0.3.0;cm-async;wasi:http@0.3.0";
 
 /// The bytes of the app that `rattery-build` compiled in `build.rs`:
 /// `include_bytes!(env!("RATTERY_APP_WASM"))`. Pass a variable name for an
@@ -184,7 +184,7 @@ pub fn inspect_with(bytes: &[u8], limits: &Limits) -> Result<ComponentInfo> {
         .collect();
     let terminal_ok = imports
         .iter()
-        .any(|i| i.starts_with("rattery:tui/terminal@0.2."));
+        .any(|i| i.starts_with("rattery:tui/terminal@0.3."));
     let compatible = terminal_ok && exports.iter().any(|e| e == "run");
     let extension_imports = imports
         .iter()
@@ -403,7 +403,13 @@ pub enum Phase {
         target: String,
         message: String,
     },
-    /// A new component is being loaded in place.
+    /// The watcher found a newer component. Under
+    /// [`ReloadPolicy::Immediate`] the reload follows at once; otherwise the
+    /// app has been told and decides. `version` is the server's validator,
+    /// sanitised.
+    UpdateAvailable { version: Option<String> },
+    /// A new component is being loaded in place: the app asked with
+    /// `rattery_app::reload()`, or the policy decided.
     Reloading,
     /// The app ended.
     Exited(AppStatus),
@@ -445,6 +451,29 @@ pub enum StoragePolicy {
     Ephemeral,
     /// Every write fails with `disabled`.
     Disabled,
+}
+
+/// What happens when [`App::watch`] finds a newer component. A browser never
+/// reloads a page under the user; the page learns of the update and reloads
+/// itself. The same choice is the embedder's here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadPolicy {
+    /// Replace the running app at once. Right for the dev loop.
+    Immediate,
+    /// Tell the app (`Event::UpdateAvailable`) and let it call
+    /// `rattery_app::reload()` when it is ready, however long that takes.
+    AppControlled,
+    /// Tell the app, with the deadline, and reload it anyway once `grace`
+    /// has passed. The default, with five minutes.
+    Deferred { grace: Duration },
+}
+
+impl Default for ReloadPolicy {
+    fn default() -> Self {
+        ReloadPolicy::Deferred {
+            grace: Duration::from_secs(300),
+        }
+    }
 }
 
 /// Options for running without a real terminal.
@@ -570,6 +599,7 @@ pub struct App {
     pub(crate) cookies: CookiePolicy,
     pub(crate) storage: StoragePolicy,
     pub(crate) watch: bool,
+    pub(crate) reload: ReloadPolicy,
     pub(crate) headless: Option<HeadlessOptions>,
     pub(crate) limits: Limits,
     pub(crate) on_phase: Option<PhaseHook>,
@@ -592,6 +622,7 @@ impl App {
             cookies: CookiePolicy::Persistent,
             storage: StoragePolicy::Persistent,
             watch: false,
+            reload: ReloadPolicy::default(),
             headless: None,
             limits: Limits::default(),
             on_phase: None,
@@ -720,6 +751,14 @@ impl App {
     /// and restart the app in place whenever one is published.
     pub fn watch(mut self, yes: bool) -> Self {
         self.watch = yes;
+        self
+    }
+
+    /// What to do when [`watch`](App::watch) finds a new version; see
+    /// [`ReloadPolicy`]. Whatever the policy, an app may reload itself at
+    /// any time with `rattery_app::reload()`.
+    pub fn reload_policy(mut self, policy: ReloadPolicy) -> Self {
+        self.reload = policy;
         self
     }
 

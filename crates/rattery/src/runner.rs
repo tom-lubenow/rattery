@@ -14,9 +14,11 @@ use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::{HostState, HostStateConfig};
 use crate::storage::Storage;
+use crate::terminal::{EventQueue, PhaseHook};
 use crate::terminal::{Interrupt, Interrupter, Screen, Session, Tasks, TerminalHost};
 use crate::{
-    App, AppStatus, CookiePolicy, Phase, Report, Source, StoragePolicy, bindings, headless,
+    App, AppStatus, CookiePolicy, Phase, ReloadPolicy, Report, Source, StoragePolicy, bindings,
+    headless,
 };
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(750);
@@ -182,8 +184,17 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     let snapshots = term.snapshots();
     let screen_source = term.test_backend();
 
-    // In watch mode, poll for a new component and reload in place.
-    let updates: Arc<Mutex<Option<Loaded>>> = Arc::default();
+    // In watch mode, poll for a new component; the policy says whether the
+    // app is replaced at once or told and left to reload itself.
+    let updates = Arc::new(Updates {
+        policy: app.reload,
+        queue: term.queue(),
+        interrupter: interrupter.clone(),
+        on_phase: on_phase.clone(),
+        message_bytes: limits.message_bytes,
+        pending: Mutex::new(None),
+        deadline: Mutex::new(None),
+    });
     if app.watch {
         match &app.source {
             Source::Url(url) => tasks.spawn(watch_url(
@@ -193,7 +204,6 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
                 loaded.last_modified.clone(),
                 limits.clone(),
                 updates.clone(),
-                interrupter.clone(),
             )),
             Source::Resolver(resolver) => tasks.spawn(watch_resolver(
                 resolver.clone(),
@@ -201,7 +211,6 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
                 loaded.etag.clone(),
                 limits.clone(),
                 updates.clone(),
-                interrupter.clone(),
             )),
             _ => {}
         }
@@ -294,7 +303,9 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
 
         let reason = interrupter.take_reason();
         if reason == Some(Interrupt::Reload) {
-            if let Some(next) = updates.lock().unwrap().take() {
+            // Without a pending update (the app reloaded itself, or the
+            // headless `update` command was used) the same component restarts.
+            if let Some(next) = updates.take() {
                 match compile(&engine, &next) {
                     Ok(compiled) => component = compiled,
                     Err(err) => append_bounded(
@@ -462,14 +473,94 @@ fn wasi_ctx(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The newest component the watcher found, and how the app hears about it.
+struct Updates {
+    policy: ReloadPolicy,
+    queue: Arc<EventQueue>,
+    interrupter: Arc<Interrupter>,
+    on_phase: Option<PhaseHook>,
+    message_bytes: usize,
+    pending: Mutex<Option<Loaded>>,
+    /// The forced reload under `ReloadPolicy::Deferred`: when, and the task
+    /// that fires it. The first update's deadline stands for later ones, so a
+    /// stream of deploys cannot postpone the reload forever.
+    deadline: Mutex<Option<(std::time::Instant, tokio::task::JoinHandle<()>)>>,
+}
+
+impl Updates {
+    fn offer(&self, next: Loaded) {
+        // The validator comes from the server: keep it printable and short.
+        let version = next
+            .etag
+            .clone()
+            .or_else(|| next.last_modified.clone())
+            .map(|v| truncate(crate::sanitize::text(&v), self.message_bytes.min(256)));
+        *self.pending.lock().unwrap() = Some(next);
+        if let Some(hook) = &self.on_phase {
+            hook(Phase::UpdateAvailable {
+                version: version.clone(),
+            });
+        }
+        let deadline_ms = match self.policy {
+            ReloadPolicy::Immediate => {
+                self.interrupter.fire(Interrupt::Reload);
+                return;
+            }
+            ReloadPolicy::AppControlled => None,
+            ReloadPolicy::Deferred { grace } => {
+                let mut deadline = self.deadline.lock().unwrap();
+                let at = match &*deadline {
+                    Some((at, task)) if !task.is_finished() => *at,
+                    _ => {
+                        let at = std::time::Instant::now() + grace;
+                        let interrupter = self.interrupter.clone();
+                        let task = tokio::spawn(async move {
+                            tokio::time::sleep(grace).await;
+                            interrupter.fire(Interrupt::Reload);
+                        });
+                        *deadline = Some((at, task));
+                        at
+                    }
+                };
+                Some(
+                    at.saturating_duration_since(std::time::Instant::now())
+                        .as_millis() as u64,
+                )
+            }
+        };
+        self.queue.push(bindings::terminal::Event::UpdateAvailable(
+            bindings::terminal::Update {
+                version,
+                deadline_ms,
+            },
+        ));
+    }
+
+    /// The pending update, for the reload that is now happening; the
+    /// deadline for it is moot.
+    fn take(&self) -> Option<Loaded> {
+        if let Some((_, task)) = self.deadline.lock().unwrap().take() {
+            task.abort();
+        }
+        self.pending.lock().unwrap().take()
+    }
+}
+
+impl Drop for Updates {
+    fn drop(&mut self) {
+        if let Some((_, task)) = self.deadline.get_mut().unwrap().take() {
+            task.abort();
+        }
+    }
+}
+
 async fn watch_url(
     url: url::Url,
     mut current: Vec<u8>,
     mut etag: Option<String>,
     mut last_modified: Option<String>,
     limits: crate::Limits,
-    updates: Arc<Mutex<Option<Loaded>>>,
-    interrupter: Arc<Interrupter>,
+    updates: Arc<Updates>,
 ) {
     let Ok(client) = loader::client(&limits) else {
         return;
@@ -490,8 +581,7 @@ async fn watch_url(
             current = next.bytes.clone();
             etag = next.etag.clone();
             last_modified = next.last_modified.clone();
-            *updates.lock().unwrap() = Some(next);
-            interrupter.fire(Interrupt::Reload);
+            updates.offer(next);
         }
     }
 }
@@ -501,8 +591,7 @@ async fn watch_resolver(
     mut current: Vec<u8>,
     mut version: Option<String>,
     limits: crate::Limits,
-    updates: Arc<Mutex<Option<Loaded>>>,
-    interrupter: Arc<Interrupter>,
+    updates: Arc<Updates>,
 ) {
     loop {
         tokio::time::sleep(WATCH_INTERVAL).await;
@@ -511,8 +600,7 @@ async fn watch_resolver(
         {
             current = next.bytes.clone();
             version = next.etag.clone();
-            *updates.lock().unwrap() = Some(next);
-            interrupter.fire(Interrupt::Reload);
+            updates.offer(next);
         }
     }
 }

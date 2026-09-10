@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use ratatui::backend::TestBackend;
 
 use crate::bindings::terminal::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, Size,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, Size, Update,
 };
 use crate::terminal::{EventQueue, Screen};
 
@@ -41,6 +41,10 @@ pub enum ScriptCommand {
         height: u16,
     },
     Snapshot,
+    /// Tell the app an update is available (with this version string), as
+    /// the watcher would. The app's `reload()` then restarts the same
+    /// component, which is enough to test the handling.
+    Update(Option<String>),
 }
 
 /// A list of [`ScriptCommand`]s.
@@ -95,6 +99,7 @@ fn parse_line(line: &str) -> Result<ScriptCommand> {
             }
         }
         "snapshot" => ScriptCommand::Snapshot,
+        "update" => ScriptCommand::Update((!rest.is_empty()).then(|| rest.to_owned())),
         other => bail!("unknown command {other:?}"),
     })
 }
@@ -190,6 +195,10 @@ pub async fn run_script(
                 let screen = Screen::from_backend(&backend.lock().unwrap());
                 snapshots.lock().unwrap().push(screen);
             }
+            ScriptCommand::Update(version) => queue.push(Event::UpdateAvailable(Update {
+                version,
+                deadline_ms: None,
+            })),
         }
     }
 }

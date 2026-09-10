@@ -377,6 +377,13 @@ impl terminal::Host for HostState {
         Ok(())
     }
 
+    async fn reload(&mut self) -> wasmtime::Result<()> {
+        // The runner sees the interrupt reason and starts a new instance;
+        // the trap just ends this one without running any more guest code.
+        self.interrupter.fire(Interrupt::Reload);
+        Err(wasmtime::Error::msg("the app asked to be reloaded"))
+    }
+
     async fn log(
         &mut self,
         level: terminal::LogLevel,

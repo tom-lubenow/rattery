@@ -114,6 +114,10 @@ impl From<t::Event> for Event {
             t::Event::Mouse(m) => Event::Mouse(m.into()),
             t::Event::Paste(s) => Event::Paste(s),
             t::Event::Resize(s) => Event::Resize(s.width, s.height),
+            t::Event::UpdateAvailable(u) => Event::UpdateAvailable(crate::event::Update {
+                version: u.version,
+                deadline: u.deadline_ms.map(std::time::Duration::from_millis),
+            }),
         }
     }
 }

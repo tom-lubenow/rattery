@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-09-10)
+
+WIT package `rattery:tui@0.3.0`; `ABI` is now
+`rattery:tui@0.3.0;cm-async;wasi:http@0.3.0`. Apps and hosts must move
+together.
+
+- App-controlled reload: the watcher's update reaches the app as
+  `Event::UpdateAvailable` (version, deadline) and the app restarts itself
+  with `rattery_app::reload()`. `App::reload_policy` picks `Immediate`,
+  `AppControlled`, or `Deferred { grace }` (the default, five minutes);
+  `Phase::UpdateAvailable`; headless scripts gain `update [VERSION]`; the
+  example CLI gains `--reload-grace`.
 
 - WIT `rattery:tui@0.2.0` gains `terminal.log` and a `storage` interface
   (origin-scoped key-value storage: `get`, `set`, `remove`, `keys`, `clear`,
@@ -15,6 +26,7 @@
   (unsafe: native code), `rattery::embed_precompiled!`, and
   `rattery_build::App::precompile(true)` behind the `precompile` feature of
   `rattery-build`, which exports `RATTERY_APP_CWASM`. The counter shim uses it.
+  Publish order is now rattery-macros, rattery-app, rattery, rattery-build.
 
 ## 0.2.0 (2026-09-09)
 
