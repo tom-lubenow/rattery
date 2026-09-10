@@ -456,6 +456,20 @@ async fn memory_limit_is_enforced() {
     }
 }
 
+/// Tests that swap components on a wall-clock timer must not pay for a cold
+/// wasmtime compile inside the timed window (seconds on a CI runner): run
+/// each component once first, which is cheap when the cache is warm.
+async fn warm_compile_cache() {
+    for package in ["counter-app", "spin-app"] {
+        App::from_path(guest(package))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("", 1))
+            .run()
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_reloads_when_the_served_component_changes() {
     require_wasip2!();
@@ -468,14 +482,7 @@ async fn watch_reloads_when_the_served_component_changes() {
     // The swap below is on a wall-clock timer, so make sure neither component
     // needs a cold compile inside the timed window: run each once (cheap when
     // wasmtime's cache is warm, a few seconds when it is not).
-    for package in ["counter-app", "spin-app"] {
-        App::from_path(guest(package))
-            .cookies(CookiePolicy::Ephemeral)
-            .headless(headless("", 1))
-            .run()
-            .await
-            .unwrap();
-    }
+    warm_compile_cache().await;
 
     // Deferred policy: the app hears about the update and gets three seconds
     // to act on it; the counter app only shows a banner, so the host reloads
@@ -832,14 +839,7 @@ async fn a_broken_update_never_interrupts_the_app() {
     let served = dir.join("app.wasm");
     std::fs::copy(guest("counter-app"), &served).unwrap();
     let server = Server::start_serving(&served);
-    for package in ["counter-app", "spin-app"] {
-        App::from_path(guest(package))
-            .cookies(CookiePolicy::Ephemeral)
-            .headless(headless("", 1))
-            .run()
-            .await
-            .unwrap();
-    }
+    warm_compile_cache().await;
 
     let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
     let seen = phases.clone();
@@ -1078,7 +1078,7 @@ async fn an_update_is_withdrawn_when_the_server_reverts() {
     let served = dir.join("app.wasm");
     std::fs::copy(guest("counter-app"), &served).unwrap();
     let server = Server::start_serving(&served);
-    let _ = guest("spin-app");
+    warm_compile_cache().await;
 
     let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
     let seen = phases.clone();
@@ -1089,12 +1089,12 @@ async fn an_update_is_withdrawn_when_the_server_reverts() {
             .reload_policy(ReloadPolicy::AppControlled)
             .on_phase(move |phase| seen.lock().unwrap().push(phase))
             .cookies(CookiePolicy::Ephemeral)
-            .headless(headless("sleep 4500\nsnapshot\nsleep 3000\nsnapshot", 9))
+            .headless(headless("sleep 5500\nsnapshot\nsleep 3500\nsnapshot", 11))
             .run(),
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
     std::fs::copy(guest("spin-app"), &served).unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
     // Rolled back: the server serves the running version again.
     std::fs::copy(guest("counter-app"), &served).unwrap();
 
@@ -1136,7 +1136,7 @@ async fn server_replies_hint_at_new_versions_without_polling() {
     let served = dir.join("app.wasm");
     std::fs::copy(guest("counter-app"), &served).unwrap();
     let server = Server::start_serving(&served);
-    let _ = guest("spin-app");
+    warm_compile_cache().await;
 
     let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
     let seen = phases.clone();
@@ -1149,8 +1149,8 @@ async fn server_replies_hint_at_new_versions_without_polling() {
             .on_phase(move |phase| seen.lock().unwrap().push(phase))
             .cookies(CookiePolicy::Ephemeral)
             .headless(headless(
-                "sleep 2500\nsnapshot\nsleep 1500\nkey k\nsleep 2000\nsnapshot\nkey R\nsleep 2500\nsnapshot",
-                12,
+                "sleep 2500\nsnapshot\nsleep 1500\nkey k\nsleep 3000\nsnapshot\nkey R\nsleep 3000\nsnapshot",
+                14,
             ))
             .run(),
     );
@@ -1189,6 +1189,7 @@ async fn the_embedder_handle_and_the_app_can_check_and_reload() {
     let path = dir.join("app.wasm");
     std::fs::copy(guest("counter-app"), &path).unwrap();
     let spin = std::fs::read(guest("spin-app")).unwrap();
+    warm_compile_cache().await;
 
     let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
     let seen = phases.clone();
