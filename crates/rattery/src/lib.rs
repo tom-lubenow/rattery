@@ -112,6 +112,32 @@ pub use terminal::{Screen, Stats};
 /// guest runtime uses. Any change to these is a new identifier.
 pub const ABI: &str = "rattery:tui@0.3.0;cm-async;wasi:http@0.3.0";
 
+/// The request header sent with every component fetch, carrying [`ABI`], so
+/// a server can serve the build that matches the host or answer
+/// `426 Upgrade Required` (with the ABI it needs in the same header of the
+/// response) during a transition.
+pub const ABI_HEADER: &str = "rattery-abi";
+
+/// The rattery ABI a component targets, from its imports: `rattery:tui@X`.
+pub(crate) fn abi_of<'a>(imports: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    imports
+        .into_iter()
+        .find_map(|i| i.strip_prefix("rattery:tui/terminal@"))
+        .map(|version| format!("rattery:tui@{version}"))
+}
+
+/// The ABI a component or server needs when it is not one this host
+/// provides. Versions match on major.minor; patch levels resolve.
+pub(crate) fn abi_mismatch(required: &str) -> Option<String> {
+    let minor = |abi: &str| -> Option<String> {
+        let version = abi.split(';').next()?.strip_prefix("rattery:tui@")?;
+        let mut parts = version.split('.');
+        Some(format!("{}.{}", parts.next()?, parts.next()?))
+    };
+    (minor(required) != minor(ABI))
+        .then(|| required.split(';').next().unwrap_or(required).to_owned())
+}
+
 /// The bytes of the app that `rattery-build` compiled in `build.rs`:
 /// `include_bytes!(env!("RATTERY_APP_WASM"))`. Pass a variable name for an
 /// app built with a custom [`env`](https://docs.rs/rattery-build).
@@ -150,6 +176,9 @@ pub struct ComponentInfo {
     /// Imports outside the WASI and rattery namespaces: extensions the host
     /// must provide for the component to instantiate.
     pub extension_imports: Vec<String>,
+    /// The rattery ABI the component targets (`rattery:tui@X`), if it
+    /// imports the terminal interface at all.
+    pub abi: Option<String>,
 }
 
 /// Validate a component against this host without running it: it must be a
@@ -182,9 +211,10 @@ pub fn inspect_with(bytes: &[u8], limits: &Limits) -> Result<ComponentInfo> {
         .exports(&engine)
         .map(|(name, _)| name.to_owned())
         .collect();
-    let terminal_ok = imports
-        .iter()
-        .any(|i| i.starts_with("rattery:tui/terminal@0.3."));
+    let abi = abi_of(imports.iter().map(String::as_str));
+    let terminal_ok = abi
+        .as_deref()
+        .is_some_and(|abi| abi_mismatch(abi).is_none());
     let compatible = terminal_ok && exports.iter().any(|e| e == "run");
     let extension_imports = imports
         .iter()
@@ -196,6 +226,7 @@ pub fn inspect_with(bytes: &[u8], limits: &Limits) -> Result<ComponentInfo> {
         exports,
         compatible,
         extension_imports,
+        abi,
     })
 }
 
@@ -411,7 +442,14 @@ pub enum Phase {
     /// The watcher found a newer component that does not compile or does not
     /// link against this host, so it was not offered; the app keeps running
     /// and the watcher keeps polling for the next version.
-    UpdateRejected { reason: String },
+    UpdateRejected {
+        reason: String,
+        /// Set when the rejection is an ABI transition: the component (or,
+        /// for a `426 Upgrade Required` answer, the server) needs a rattery
+        /// ABI this host does not provide, e.g. `rattery:tui@0.4.0`. The
+        /// embedder should tell the user to upgrade the host.
+        requires_abi: Option<String>,
+    },
     /// A new component is being loaded in place: the app asked with
     /// `rattery_app::reload()`, or the policy decided.
     Reloading,
@@ -784,6 +822,11 @@ impl App {
     pub fn on_phase(mut self, hook: impl Fn(Phase) + Send + Sync + 'static) -> Self {
         self.on_phase = Some(Arc::new(hook));
         self
+    }
+
+    /// Remove and return the phase hook set so far, to wrap it in another.
+    pub fn take_phase_hook(&mut self) -> Option<Arc<dyn Fn(Phase) + Send + Sync>> {
+        self.on_phase.take()
     }
 
     /// A [`RequestPolicy`] applied to every outbound HTTP request and

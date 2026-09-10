@@ -122,7 +122,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     }
     // Resolve the component's imports now, so one built against another ABI
     // fails here with a readable error rather than after the terminal is up.
-    let mut instance_pre = link(&linker, &component, &loaded.description)?;
+    let mut instance_pre = link(&engine, &linker, &component, &loaded.description)?;
     let mut previous_instance: Option<AppPre<HostState>> = None;
 
     let interrupter = Arc::new(Interrupter::new());
@@ -199,6 +199,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         on_phase: on_phase.clone(),
         message_bytes: limits.message_bytes,
         pending: Mutex::new(None),
+        last_rejection: Mutex::new(None),
         deadline: Mutex::new(None),
     });
     if app.watch {
@@ -456,8 +457,17 @@ pub fn precompile(component: &[u8], target: Option<&str>) -> Result<Vec<u8>> {
         .context("the bytes are not a valid component")
 }
 
+/// The rattery ABI `component` needs when it is not this host's.
+fn requires_abi(engine: &Engine, component: &Component) -> Option<String> {
+    let ty = component.component_type();
+    crate::abi_of(ty.imports(engine).map(|(name, _)| name))
+        .and_then(|abi| crate::abi_mismatch(&abi))
+}
+
 /// Resolve every import against the host's linker without running anything.
+/// An ABI transition is named as such in the error.
 fn link(
+    engine: &Engine,
     linker: &Linker<HostState>,
     component: &Component,
     description: &str,
@@ -466,7 +476,13 @@ fn link(
         .instantiate_pre(component)
         .and_then(AppPre::new)
         .map_err(anyhow::Error::from)
-        .with_context(|| format!("{description} cannot run on this host (ABI {})", crate::ABI))
+        .with_context(|| match requires_abi(engine, component) {
+            Some(required) => format!(
+                "{description} was built for {required}; this host provides {}; upgrade the host",
+                crate::ABI
+            ),
+            None => format!("{description} cannot run on this host (ABI {})", crate::ABI),
+        })
 }
 
 fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {
@@ -518,6 +534,9 @@ struct Updates {
     on_phase: Option<PhaseHook>,
     message_bytes: usize,
     pending: Mutex<Option<AppPre<HostState>>>,
+    /// The last rejection reported, so a server that keeps answering the
+    /// same way is reported once, not every poll.
+    last_rejection: Mutex<Option<String>>,
     /// The forced reload under `ReloadPolicy::Deferred`: when, and the task
     /// that fires it. The first update's deadline stands for later ones, so a
     /// stream of deploys cannot postpone the reload forever.
@@ -531,22 +550,46 @@ impl Updates {
     async fn validate(self: &Arc<Self>, next: Loaded) {
         let updates = self.clone();
         let validated = tokio::task::spawn_blocking(move || {
-            let component = compile(&updates.engine, &next)?;
-            let instance = link(&updates.linker, &component, &next.description)?;
-            Ok::<_, anyhow::Error>((next, instance))
+            let component = compile(&updates.engine, &next).map_err(|err| (err, None))?;
+            let requires = requires_abi(&updates.engine, &component);
+            match link(
+                &updates.engine,
+                &updates.linker,
+                &component,
+                &next.description,
+            ) {
+                Ok(instance) => Ok((next, instance)),
+                Err(err) => Err((err, requires)),
+            }
         })
         .await;
         match validated {
             Ok(Ok((next, instance))) => self.offer(next, instance),
-            Ok(Err(err)) => self.reject(format!("{err:#}")),
-            Err(err) => self.reject(format!("validation failed: {err}")),
+            Ok(Err((err, requires))) => self.reject(format!("{err:#}"), requires),
+            Err(err) => self.reject(format!("validation failed: {err}"), None),
         }
     }
 
-    fn reject(&self, reason: String) {
+    /// A fetch that failed for a reason worth reporting: the server has no
+    /// build for this host.
+    fn fetch_failed(&self, err: &anyhow::Error) {
+        if let Some(upgrade) = err.downcast_ref::<loader::UpgradeRequired>() {
+            self.reject(upgrade.to_string(), upgrade.required.clone());
+        }
+    }
+
+    fn reject(&self, reason: String, requires_abi: Option<String>) {
+        let reason = truncate(crate::sanitize::text(&reason), self.message_bytes);
+        let mut last = self.last_rejection.lock().unwrap();
+        if last.as_deref() == Some(reason.as_str()) {
+            return;
+        }
+        *last = Some(reason.clone());
+        drop(last);
         if let Some(hook) = &self.on_phase {
             hook(Phase::UpdateRejected {
-                reason: truncate(crate::sanitize::text(&reason), self.message_bytes),
+                reason,
+                requires_abi,
             });
         }
     }
@@ -640,11 +683,15 @@ async fn watch_url(
         )
         .await;
         // A server that is down or mid-restart just gets polled again.
-        if let Ok(Some(next)) = fetched {
-            current = next.bytes.clone();
-            etag = next.etag.clone();
-            last_modified = next.last_modified.clone();
-            updates.validate(next).await;
+        match fetched {
+            Ok(Some(next)) => {
+                current = next.bytes.clone();
+                etag = next.etag.clone();
+                last_modified = next.last_modified.clone();
+                updates.validate(next).await;
+            }
+            Ok(None) => {}
+            Err(err) => updates.fetch_failed(&err),
         }
     }
 }

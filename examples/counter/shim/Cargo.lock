@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "rattery"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "rattery-build"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rattery",
 ]

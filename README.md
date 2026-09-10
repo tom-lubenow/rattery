@@ -267,6 +267,14 @@ the grace period passes (the library default, five minutes; the event carries th
 deadline). An app can save its state to storage first, and the server should keep the
 old routes working for the grace period, since the old app keeps calling them.
 
+**ABI transitions.** Every component fetch carries a `rattery-abi` header with the
+host's `rattery::ABI`, so a server can serve the build that matches each client during
+a transition, or answer `426 Upgrade Required` with the ABI it needs in the same
+header. A component that needs another ABI, or such an answer, is never applied to a
+running app: it surfaces as `Phase::UpdateRejected` with `requires_abi` set, and at
+startup as an error naming both versions. The counter shim prints an upgrade hint on
+exit; `--require-abi-file` on the example server demonstrates the server side.
+
 **Safety.** Everything the app sends toward the terminal is validated: control
 characters and malformed symbols never reach the screen or the title, cells outside
 the screen are dropped, and guest output is rendered with escapes shown rather than

@@ -30,11 +30,19 @@ struct Args {
         default_value = "target/wasm32-wasip2/debug/counter-app.wasm"
     )]
     app: PathBuf,
+
+    /// ABI negotiation demo: while this file exists, its contents name the
+    /// rattery ABI a client must have (a prefix such as `rattery:tui@0.4`);
+    /// other clients get `426 Upgrade Required`. A real deployment would
+    /// serve the build matching the client's `rattery-abi` header instead.
+    #[arg(long)]
+    require_abi_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     app_path: Arc<PathBuf>,
+    require_abi_file: Option<Arc<PathBuf>>,
 }
 
 #[tokio::main]
@@ -44,6 +52,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         app_path: Arc::new(args.app.clone()),
+        require_abi_file: args.require_abi_file.clone().map(Arc::new),
     };
 
     let router = Router::new()
@@ -71,6 +80,26 @@ async fn index() -> &'static str {
 
 /// Serve the component with an ETag so `rattery --watch` can poll cheaply.
 async fn serve_app(State(state): State<AppState>, request: Request) -> Response {
+    if let Some(required) = state
+        .require_abi_file
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    {
+        let required = required.trim().to_owned();
+        let client = request
+            .headers()
+            .get("rattery-abi")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !client.starts_with(&required) {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                [("rattery-abi", required.clone())],
+                format!("this app needs a client with rattery ABI {required}; yours is {client:?}"),
+            )
+                .into_response();
+        }
+    }
     let metadata = match tokio::fs::metadata(&*state.app_path).await {
         Ok(metadata) => metadata,
         Err(err) => return app_missing(&state, err),

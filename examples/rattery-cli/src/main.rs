@@ -232,6 +232,24 @@ async fn main() -> Result<()> {
         });
     }
 
+    let needs_abi: std::sync::Arc<Mutex<Option<String>>> = Default::default();
+    {
+        let seen = needs_abi.clone();
+        let previous = app.take_phase_hook();
+        app = app.on_phase(move |phase| {
+            if let Phase::UpdateRejected {
+                requires_abi: Some(abi),
+                ..
+            } = &phase
+            {
+                *seen.lock().unwrap() = Some(abi.clone());
+            }
+            if let Some(previous) = &previous {
+                previous(phase);
+            }
+        });
+    }
+
     let report = app.run().await?;
 
     for (index, screen) in report.snapshots.iter().enumerate() {
@@ -284,6 +302,12 @@ async fn main() -> Result<()> {
             s.events,
             s.logs,
             s.logs_dropped
+        );
+    }
+    if let Some(abi) = needs_abi.lock().unwrap().take() {
+        eprintln!(
+            "a newer version of this app needs rattery ABI {abi}; this host provides {}",
+            rattery::ABI
         );
     }
     match &report.status {

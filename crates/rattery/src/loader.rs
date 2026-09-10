@@ -134,6 +134,38 @@ pub fn origin_of(url: &Url) -> String {
     url.origin().ascii_serialization()
 }
 
+/// The server answered `426 Upgrade Required` to a component fetch: it has
+/// no build for this host's ABI.
+#[derive(Debug, Clone)]
+pub struct UpgradeRequired {
+    /// The ABI the server named in its `rattery-abi` response header.
+    pub required: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for UpgradeRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.required {
+            Some(required) => write!(
+                f,
+                "the server requires ABI {required}; this host provides {}; upgrade the host",
+                crate::ABI
+            )?,
+            None => write!(
+                f,
+                "the server requires an upgrade of the host ({})",
+                crate::ABI
+            )?,
+        }
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UpgradeRequired {}
+
 /// Fetch `url` unless the server says it is unchanged. `previous` lets us
 /// detect changes even from servers that send no validators.
 pub async fn fetch_if_changed(
@@ -144,7 +176,9 @@ pub async fn fetch_if_changed(
     previous: Option<&[u8]>,
     limits: &Limits,
 ) -> Result<Option<Loaded>> {
-    let mut request = client.get(url.clone());
+    let mut request = client
+        .get(url.clone())
+        .header(crate::ABI_HEADER, crate::ABI);
     if let Some(etag) = etag {
         request = request.header(IF_NONE_MATCH, etag);
     }
@@ -157,6 +191,21 @@ pub async fn fetch_if_changed(
         .with_context(|| format!("failed to fetch {url}"))?;
     if response.status() == StatusCode::NOT_MODIFIED {
         return Ok(None);
+    }
+    if response.status() == StatusCode::UPGRADE_REQUIRED {
+        // Both the header and the body come from the server: bound them.
+        let required = response
+            .headers()
+            .get(crate::ABI_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| crate::sanitize::text(v).chars().take(256).collect());
+        let body = response.text().await.unwrap_or_default();
+        let message: String = crate::sanitize::text(body.trim())
+            .chars()
+            .take(256)
+            .collect();
+        return Err(anyhow::Error::new(UpgradeRequired { required, message })
+            .context(format!("failed to fetch {url}")));
     }
     let response = response
         .error_for_status()

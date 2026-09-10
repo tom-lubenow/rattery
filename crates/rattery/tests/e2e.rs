@@ -854,7 +854,10 @@ async fn a_broken_update_never_interrupts_the_app() {
     tokio::time::sleep(Duration::from_secs(4)).await;
     // Garbage goes out first: the running app must not notice.
     std::fs::write(&served, b"this is not a component").unwrap();
-    tokio::time::sleep(Duration::from_millis(4500)).await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    // Then a component built for a future ABI.
+    std::fs::write(&served, future_abi_component()).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     // A real component afterwards still gets picked up.
     std::fs::copy(guest("spin-app"), &served).unwrap();
 
@@ -878,8 +881,16 @@ async fn a_broken_update_never_interrupts_the_app() {
     let phases = phases.lock().unwrap();
     let rejected = phases
         .iter()
-        .position(|p| matches!(p, Phase::UpdateRejected { reason } if reason.contains("not a valid component")))
+        .position(|p| matches!(p, Phase::UpdateRejected { reason, requires_abi: None } if reason.contains("not a valid component")))
         .unwrap_or_else(|| panic!("{phases:?}"));
+    assert!(
+        phases.iter().any(|p| matches!(
+            p,
+            Phase::UpdateRejected { reason, requires_abi: Some(abi) }
+                if abi == "rattery:tui@0.9.0" && reason.contains("upgrade the host")
+        )),
+        "{phases:?}"
+    );
     let reloaded = phases.iter().position(|p| *p == Phase::Reloading).unwrap();
     assert!(rejected < reloaded, "{phases:?}");
     assert_eq!(
@@ -888,4 +899,121 @@ async fn a_broken_update_never_interrupts_the_app() {
         "{phases:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The counter app with its rattery imports renamed to a future version:
+/// the same length, so the binary stays well-formed, and a host of today
+/// cannot link it.
+fn future_abi_component() -> Vec<u8> {
+    let mut bytes = std::fs::read(guest("counter-app")).unwrap();
+    for interface in ["terminal", "websocket", "storage"] {
+        let from = format!("rattery:tui/{interface}@0.3.0");
+        let to = format!("rattery:tui/{interface}@0.9.0");
+        let mut at = 0;
+        while let Some(pos) = bytes[at..]
+            .windows(from.len())
+            .position(|w| w == from.as_bytes())
+        {
+            let start = at + pos;
+            bytes[start..start + to.len()].copy_from_slice(to.as_bytes());
+            at = start + to.len();
+        }
+    }
+    bytes
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_component_for_another_abi_is_refused_before_the_terminal() {
+    require_wasip2!();
+    let future = future_abi_component();
+    let info = rattery::inspect(&future).unwrap();
+    assert_eq!(info.abi.as_deref(), Some("rattery:tui@0.9.0"), "{info:?}");
+    assert!(!info.compatible, "{info:?}");
+    assert!(
+        rattery::inspect(&std::fs::read(guest("counter-app")).unwrap())
+            .unwrap()
+            .compatible
+    );
+
+    let err = run_err(App::from_bytes(future)).await;
+    assert!(
+        err.contains("built for rattery:tui@0.9.0") && err.contains("upgrade the host"),
+        "{err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_can_demand_an_abi() {
+    require_wasip2!();
+    let flag = std::env::temp_dir().join(format!("rattery-abi-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&flag);
+    let server = Server::start(&["--require-abi-file", flag.to_str().unwrap()]);
+    let url = format!("{}/app.wasm", server.url);
+
+    // Without the flag file the server serves everyone.
+    let client = reqwest::Client::new();
+    let ok = client.get(&url).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // With it, the client's `rattery-abi` header decides.
+    std::fs::write(&flag, "rattery:tui@9.0\n").unwrap();
+    let refused = client
+        .get(&url)
+        .header(rattery::ABI_HEADER, rattery::ABI)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 426);
+    assert_eq!(refused.headers()[rattery::ABI_HEADER], "rattery:tui@9.0");
+    let served = client
+        .get(&url)
+        .header(rattery::ABI_HEADER, "rattery:tui@9.0.1;cm-async")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(served.status(), 200);
+
+    // The host at startup: a clear error naming both sides.
+    let err = run_err(App::from_url(&url).unwrap()).await;
+    assert!(
+        err.contains("requires ABI rattery:tui@9.0") && err.contains("upgrade the host"),
+        "{err}"
+    );
+
+    // A running app is told once and left alone.
+    std::fs::remove_file(&flag).unwrap();
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let flag2 = flag.clone();
+    let run = tokio::spawn(
+        App::from_url(&url)
+            .unwrap()
+            .watch(true)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("sleep 2500\nsnapshot\nsleep 3500\nsnapshot", 8))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::write(&flag2, "rattery:tui@9.0\n").unwrap();
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(report.snapshots[1].contains("rattery counter"), "{text}");
+    let phases = phases.lock().unwrap();
+    let rejections: Vec<_> = phases
+        .iter()
+        .filter(|p| matches!(p, Phase::UpdateRejected { .. }))
+        .collect();
+    assert_eq!(
+        rejections.len(),
+        1,
+        "reported once, not every poll\n{phases:?}"
+    );
+    assert!(
+        matches!(rejections[0], Phase::UpdateRejected { requires_abi: Some(abi), .. } if abi == "rattery:tui@9.0"),
+        "{rejections:?}"
+    );
+    assert!(!phases.contains(&Phase::Reloading), "{phases:?}");
+    let _ = std::fs::remove_file(&flag);
 }

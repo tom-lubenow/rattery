@@ -137,7 +137,14 @@ arrives as `Phase::AppReady`.
 version, the component-model async ABI, and the WASI HTTP version. Record it
 in release metadata, and run `rattery::inspect` on externally obtained bytes
 before shipping them; it reports imports, exports, extension imports the host
-must provide, and whether the component targets this ABI. A precompiled
+must provide, the rattery ABI it targets, and whether that is this host's.
+Versions match on major.minor. A component for another ABI is refused at
+link time, before the terminal is touched at startup and before a running
+app is told about an update (`Phase::UpdateRejected` with `requires_abi`).
+Component fetches carry the `rattery-abi` request header; a server may
+answer `426 Upgrade Required` naming the ABI it needs in the same header,
+which is reported the same way, once per distinct answer. Header and body
+of such an answer are sanitised and cut to 256 bytes. A precompiled
 component (`rattery::precompile`, `App::from_precompiled`) is native code and
 is trusted as such: wasmtime checks its header, engine settings, and target
 triple, not its contents, so precompile at build time and embed the result;

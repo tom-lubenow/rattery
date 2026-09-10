@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 (2026-09-10)
+
+- ABI transitions: component fetches send a `rattery-abi` request header
+  with the host's `ABI`; a `426 Upgrade Required` answer (with the required
+  ABI in the same response header) is understood. `Phase::UpdateRejected`
+  gains `requires_abi`, set when a rejected update or such an answer needs a
+  rattery ABI this host does not provide; the same rejection is reported
+  once, not every poll. Startup errors name both ABIs. `ComponentInfo::abi`.
+  `App::take_phase_hook` for wrapping a hook. The counter shim and the
+  example CLI print an upgrade hint on exit; the example server has
+  `--require-abi-file` to demonstrate the server side.
+
 ## 0.3.1 (2026-09-10)
 
 - A new component found by the watcher is compiled and linked before the app
