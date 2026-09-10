@@ -9,7 +9,7 @@ use wasmtime::{Cache, Config, Engine, Store, UpdateDeadline};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtx, WasiCtxBuilder};
 
-use crate::bindings::App as GuestApp;
+use crate::bindings::{App as GuestApp, AppPre};
 use crate::http::{CookieJar, OriginPolicy};
 use crate::loader::{self, Loaded};
 use crate::state::{HostState, HostStateConfig};
@@ -103,7 +103,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
 
     // Compile before touching the terminal so errors print normally.
     let t = std::time::Instant::now();
-    let mut component = compile(&engine, &loaded)?;
+    let component = compile(&engine, &loaded)?;
     timings.compile = t.elapsed();
     phase(Phase::Compiled);
 
@@ -120,6 +120,10 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     for extension in app.extensions {
         extension(&mut linker).context("a host extension failed to register")?;
     }
+    // Resolve the component's imports now, so one built against another ABI
+    // fails here with a readable error rather than after the terminal is up.
+    let mut instance_pre = link(&linker, &component, &loaded.description)?;
+    let mut previous_instance: Option<AppPre<HostState>> = None;
 
     let interrupter = Arc::new(Interrupter::new());
     let mut tasks = Tasks::default();
@@ -187,6 +191,8 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     // In watch mode, poll for a new component; the policy says whether the
     // app is replaced at once or told and left to reload itself.
     let updates = Arc::new(Updates {
+        engine: engine.clone(),
+        linker: linker.clone(),
         policy: app.reload,
         queue: term.queue(),
         interrupter: interrupter.clone(),
@@ -262,10 +268,12 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             Some(reason) => Err(wasmtime::Error::msg(format!("interrupted: {reason:?}"))),
         });
 
+        let instantiated = std::sync::atomic::AtomicBool::new(false);
         let outcome = {
             let run = async {
                 let t = std::time::Instant::now();
-                let guest = GuestApp::instantiate_async(&mut store, &component, &linker).await?;
+                let guest: GuestApp = instance_pre.instantiate_async(&mut store).await?;
+                instantiated.store(true, std::sync::atomic::Ordering::Relaxed);
                 timings.instantiate = t.elapsed();
                 phase(Phase::Instantiated);
                 store
@@ -304,17 +312,31 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         let reason = interrupter.take_reason();
         if reason == Some(Interrupt::Reload) {
             // Without a pending update (the app reloaded itself, or the
-            // headless `update` command was used) the same component restarts.
+            // headless `update` command was used) the same component
+            // restarts. A pending one was compiled and linked by the watcher.
             if let Some(next) = updates.take() {
-                match compile(&engine, &next) {
-                    Ok(compiled) => component = compiled,
-                    Err(err) => append_bounded(
-                        &mut stderr_all,
-                        &format!("rattery: reload skipped: {err:#}\n"),
-                        limits.guest_output_bytes,
-                    ),
-                }
+                previous_instance = Some(std::mem::replace(&mut instance_pre, next));
             }
+            let _ = term.reset();
+            phase(Phase::Reloading);
+            continue;
+        }
+        // A freshly reloaded component that could not even be instantiated
+        // (a resource limit, say) is not worth ending the run over: go back
+        // to the one that worked, once.
+        if let (false, Some(Err(err)), Some(previous)) = (
+            instantiated.load(std::sync::atomic::Ordering::Relaxed),
+            &outcome,
+            previous_instance.take(),
+        ) {
+            append_bounded(
+                &mut stderr_all,
+                &format!(
+                    "rattery: the new version failed to start, keeping the previous one: {err:#}\n"
+                ),
+                limits.guest_output_bytes,
+            );
+            instance_pre = previous;
             let _ = term.reset();
             phase(Phase::Reloading);
             continue;
@@ -434,6 +456,19 @@ pub fn precompile(component: &[u8], target: Option<&str>) -> Result<Vec<u8>> {
         .context("the bytes are not a valid component")
 }
 
+/// Resolve every import against the host's linker without running anything.
+fn link(
+    linker: &Linker<HostState>,
+    component: &Component,
+    description: &str,
+) -> Result<AppPre<HostState>> {
+    linker
+        .instantiate_pre(component)
+        .and_then(AppPre::new)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("{description} cannot run on this host (ABI {})", crate::ABI))
+}
+
 fn compile(engine: &Engine, loaded: &Loaded) -> Result<Component> {
     if loaded.precompiled {
         // SAFETY: the embedder vouched for these bytes by using
@@ -475,12 +510,14 @@ fn wasi_ctx(
 #[allow(clippy::too_many_arguments)]
 /// The newest component the watcher found, and how the app hears about it.
 struct Updates {
+    engine: Engine,
+    linker: Linker<HostState>,
     policy: ReloadPolicy,
     queue: Arc<EventQueue>,
     interrupter: Arc<Interrupter>,
     on_phase: Option<PhaseHook>,
     message_bytes: usize,
-    pending: Mutex<Option<Loaded>>,
+    pending: Mutex<Option<AppPre<HostState>>>,
     /// The forced reload under `ReloadPolicy::Deferred`: when, and the task
     /// that fires it. The first update's deadline stands for later ones, so a
     /// stream of deploys cannot postpone the reload forever.
@@ -488,14 +525,40 @@ struct Updates {
 }
 
 impl Updates {
-    fn offer(&self, next: Loaded) {
+    /// Compile and link a fetched component off the async runtime. A
+    /// component that fails is reported and never offered, so a broken
+    /// deploy cannot interrupt the running app.
+    async fn validate(self: &Arc<Self>, next: Loaded) {
+        let updates = self.clone();
+        let validated = tokio::task::spawn_blocking(move || {
+            let component = compile(&updates.engine, &next)?;
+            let instance = link(&updates.linker, &component, &next.description)?;
+            Ok::<_, anyhow::Error>((next, instance))
+        })
+        .await;
+        match validated {
+            Ok(Ok((next, instance))) => self.offer(next, instance),
+            Ok(Err(err)) => self.reject(format!("{err:#}")),
+            Err(err) => self.reject(format!("validation failed: {err}")),
+        }
+    }
+
+    fn reject(&self, reason: String) {
+        if let Some(hook) = &self.on_phase {
+            hook(Phase::UpdateRejected {
+                reason: truncate(crate::sanitize::text(&reason), self.message_bytes),
+            });
+        }
+    }
+
+    fn offer(&self, next: Loaded, instance: AppPre<HostState>) {
         // The validator comes from the server: keep it printable and short.
         let version = next
             .etag
             .clone()
             .or_else(|| next.last_modified.clone())
             .map(|v| truncate(crate::sanitize::text(&v), self.message_bytes.min(256)));
-        *self.pending.lock().unwrap() = Some(next);
+        *self.pending.lock().unwrap() = Some(instance);
         if let Some(hook) = &self.on_phase {
             hook(Phase::UpdateAvailable {
                 version: version.clone(),
@@ -538,7 +601,7 @@ impl Updates {
 
     /// The pending update, for the reload that is now happening; the
     /// deadline for it is moot.
-    fn take(&self) -> Option<Loaded> {
+    fn take(&self) -> Option<AppPre<HostState>> {
         if let Some((_, task)) = self.deadline.lock().unwrap().take() {
             task.abort();
         }
@@ -581,7 +644,7 @@ async fn watch_url(
             current = next.bytes.clone();
             etag = next.etag.clone();
             last_modified = next.last_modified.clone();
-            updates.offer(next);
+            updates.validate(next).await;
         }
     }
 }
@@ -600,7 +663,7 @@ async fn watch_resolver(
         {
             current = next.bytes.clone();
             version = next.etag.clone();
-            updates.offer(next);
+            updates.validate(next).await;
         }
     }
 }

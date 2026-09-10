@@ -408,6 +408,10 @@ pub enum Phase {
     /// app has been told and decides. `version` is the server's validator,
     /// sanitised.
     UpdateAvailable { version: Option<String> },
+    /// The watcher found a newer component that does not compile or does not
+    /// link against this host, so it was not offered; the app keeps running
+    /// and the watcher keeps polling for the next version.
+    UpdateRejected { reason: String },
     /// A new component is being loaded in place: the app asked with
     /// `rattery_app::reload()`, or the policy decided.
     Reloading,

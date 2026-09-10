@@ -122,7 +122,9 @@ delivers `Event::UpdateAvailable`, and `Deferred` (the default) delivers the
 event with its deadline and forces the reload when the deadline passes. The
 first deadline stands across further updates, so a stream of deploys cannot
 postpone it. The version string in the event is the server's validator,
-sanitised and cut to 256 bytes.
+sanitised and cut to 256 bytes. A new component is compiled and linked
+against the host before the app is told about it; one that fails becomes
+`Phase::UpdateRejected` and the running app is left alone.
 
 `Phase::Ready` fires after the first frame has been validated, drawn, and
 flushed successfully. An app that wants a stronger signal calls

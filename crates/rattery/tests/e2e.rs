@@ -821,3 +821,71 @@ async fn the_app_reloads_itself_when_it_is_ready() {
     assert_eq!(phases.matches("Ready").count(), 2, "{phases}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_broken_update_never_interrupts_the_app() {
+    require_wasip2!();
+    let dir = std::env::temp_dir().join(format!("rattery-broken-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let served = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &served).unwrap();
+    let server = Server::start_serving(&served);
+    for package in ["counter-app", "spin-app"] {
+        App::from_path(guest(package))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("", 1))
+            .run()
+            .await
+            .unwrap();
+    }
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let run = tokio::spawn(
+        App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .watch(true)
+            .reload_policy(ReloadPolicy::Immediate)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("sleep 2500\nsnapshot\nsleep 5000\nsnapshot", 16))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Garbage goes out first: the running app must not notice.
+    std::fs::write(&served, b"this is not a component").unwrap();
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    // A real component afterwards still gets picked up.
+    std::fs::copy(guest("spin-app"), &served).unwrap();
+
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(report.snapshots[0].contains("rattery counter"), "{text}");
+    let later = &report.snapshots[1];
+    assert!(
+        later.contains("rattery counter") && later.contains("launch 1"),
+        "the app should have run on undisturbed\n{text}"
+    );
+    assert!(
+        report
+            .final_screen
+            .as_ref()
+            .unwrap()
+            .contains("spinning forever"),
+        "{text}"
+    );
+    let phases = phases.lock().unwrap();
+    let rejected = phases
+        .iter()
+        .position(|p| matches!(p, Phase::UpdateRejected { reason } if reason.contains("not a valid component")))
+        .unwrap_or_else(|| panic!("{phases:?}"));
+    let reloaded = phases.iter().position(|p| *p == Phase::Reloading).unwrap();
+    assert!(rejected < reloaded, "{phases:?}");
+    assert_eq!(
+        phases.iter().filter(|p| **p == Phase::Reloading).count(),
+        1,
+        "{phases:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

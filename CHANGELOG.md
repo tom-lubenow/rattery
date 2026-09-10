@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 (2026-09-10)
+
+- A new component found by the watcher is compiled and linked before the app
+  hears about it. One that fails is reported as `Phase::UpdateRejected` and
+  never interrupts the running app; the watcher keeps polling. Before, the
+  app was torn down first and a broken deploy could end the run.
+- A component that compiles but does not link against this host (another
+  ABI) now fails at startup with a readable error, before the terminal is
+  touched. If a reloaded component fails to instantiate, the previous one is
+  restored instead of ending the run.
+
 ## 0.3.0 (2026-09-10)
 
 WIT package `rattery:tui@0.3.0`; `ABI` is now
