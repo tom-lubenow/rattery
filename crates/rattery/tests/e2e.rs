@@ -1209,15 +1209,40 @@ async fn the_embedder_handle_and_the_app_can_check_and_reload() {
 
     // The app's own check (`c`) re-reads the file: nothing new yet.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    // Offering the running bytes is not an update.
+    // Offering the running bytes is not an update; garbage is an error
+    // that names the problem and leaves the state alone.
     let same = std::fs::read(&path).unwrap();
-    assert_eq!(handle.offer(same, Some("same".into())).await.unwrap(), None);
+    assert_eq!(
+        handle.offer(same, Some("same".into())).await.unwrap(),
+        rattery::Offer::Current
+    );
+    let err = handle
+        .offer(b"not a component".to_vec(), Some("bad".into()))
+        .await
+        .unwrap_err();
+    let rejection = err
+        .downcast_ref::<rattery::Rejection>()
+        .expect("a rejection");
+    assert!(
+        rejection.reason.contains("not a valid component"),
+        "{rejection:?}"
+    );
+    assert_eq!(rejection.requires_abi, None);
+    assert_eq!(handle.pending_update(), None);
     tokio::time::sleep(Duration::from_millis(3000)).await;
     // Now the file changes; the embedder's check finds it.
     std::fs::write(&path, &spin).unwrap();
     let info = handle.check_update().await.unwrap().expect("an update");
     assert_eq!(info.reload_after, None, "app-controlled: {info:?}");
-    assert_eq!(handle.pending_update(), Some(info));
+    assert_eq!(handle.pending_update(), Some(info.clone()));
+    // Offering the same bytes again changes nothing.
+    assert_eq!(
+        handle.offer(spin.clone(), None).await.unwrap(),
+        rattery::Offer::Unchanged(info)
+    );
+    // A broken candidate afterwards does not disturb the pending update.
+    assert!(handle.offer(b"garbage".to_vec(), None).await.is_err());
+    assert!(handle.pending_update().is_some());
     assert!(handle.reload());
     tokio::time::sleep(Duration::from_millis(2000)).await;
     assert!(handle.shutdown());

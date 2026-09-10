@@ -105,7 +105,7 @@ pub use http::{
 pub use runner::precompile;
 pub use state::HostState;
 pub use terminal::{Screen, Stats};
-pub use update::VERSION_HEADER as APP_VERSION_HEADER;
+pub use update::{Offer, Rejection, VERSION_HEADER as APP_VERSION_HEADER};
 
 /// The contract this host speaks, for release metadata and [`inspect`].
 ///
@@ -578,19 +578,18 @@ impl AppHandle {
     }
 
     /// Ask the source for a newer component now; returns the pending update
-    /// afterwards.
+    /// afterwards. A candidate that fails validation is the error, as a
+    /// [`Rejection`] (downcast it for the ABI it needs).
     pub async fn check_update(&self) -> Result<Option<UpdateInfo>> {
         self.updates()?.check().await
     }
 
     /// Offer a component the embedder obtained itself (a push channel, a
-    /// package). Validated like any update; the running version's bytes
-    /// withdraw a pending update.
-    pub async fn offer(
-        &self,
-        bytes: Vec<u8>,
-        version: Option<String>,
-    ) -> Result<Option<UpdateInfo>> {
+    /// package). Validated like any update; the outcome says whether it is
+    /// now pending, already was, or is the running version (which withdraws
+    /// a pending update). A candidate that fails validation is the error,
+    /// as a [`Rejection`].
+    pub async fn offer(&self, bytes: Vec<u8>, version: Option<String>) -> Result<Offer> {
         let loaded = loader::Loaded {
             precompiled: false,
             description: "an offered component".into(),
@@ -600,7 +599,10 @@ impl AppHandle {
             etag: version,
             last_modified: None,
         };
-        Ok(self.updates()?.offer(loaded).await)
+        self.updates()?
+            .offer(loaded)
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     /// The pending update, with its deadlines as of now.

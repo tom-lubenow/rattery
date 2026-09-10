@@ -56,18 +56,72 @@ struct Deadline {
     task: JoinHandle<()>,
 }
 
-struct Inner {
-    running: Running,
-    /// Validators of the newest component fetched (pending if any, else
-    /// running), so polls stay conditional.
+/// What a conditional fetch sends back to the server.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Validators {
     etag: Option<String>,
     last_modified: Option<String>,
+}
+
+impl Validators {
+    fn of(loaded: &Loaded) -> Self {
+        Self {
+            etag: loaded.etag.clone(),
+            last_modified: loaded.last_modified.clone(),
+        }
+    }
+}
+
+/// A fetched candidate that failed validation. Remembered so polls stay
+/// conditional on it (it is not downloaded again while the server keeps
+/// serving it) and so a version hint naming it does not trigger a check.
+struct Rejected {
+    validators: Validators,
+    version: Option<String>,
+}
+
+struct Inner {
+    running: Running,
     pending: Option<Pending>,
+    /// Validators of the newest accepted fetch from the source: the pending
+    /// update if there is one, else the running version.
+    newest: Validators,
+    rejected: Option<Rejected>,
     deadline: Option<Deadline>,
     /// The last rejection reported, so a server that keeps answering the
     /// same way is reported once, not every check.
     last_rejection: Option<String>,
 }
+
+/// What became of an offered component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offer {
+    /// It is now the pending update.
+    Pending(UpdateInfo),
+    /// It already was the pending update.
+    Unchanged(UpdateInfo),
+    /// It is the running version. A pending update, if there was one, is
+    /// withdrawn.
+    Current,
+}
+
+/// A candidate did not compile or does not link against this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// Sanitised and bounded.
+    pub reason: String,
+    /// Set when the candidate needs a rattery ABI this host does not
+    /// provide.
+    pub requires_abi: Option<String>,
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Rejection {}
 
 pub struct UpdatesConfig {
     pub engine: Engine,
@@ -116,9 +170,12 @@ impl Updates {
             checking: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner {
                 running: config.running,
-                etag: config.etag,
-                last_modified: config.last_modified,
                 pending: None,
+                newest: Validators {
+                    etag: config.etag,
+                    last_modified: config.last_modified,
+                },
+                rejected: None,
                 deadline: None,
                 last_rejection: None,
             }),
@@ -141,16 +198,25 @@ impl Updates {
     }
 
     /// Ask the source for a newer component now. Validates what it finds
-    /// and returns the pending state afterwards.
+    /// and returns the pending state afterwards; a candidate that fails
+    /// validation is the error.
     pub async fn check(self: &Arc<Self>) -> Result<Option<UpdateInfo>> {
         let _one_at_a_time = self.checking.lock().await;
-        let (etag, last_modified, newest) = {
+        let (validators, newest_bytes) = {
             let inner = self.inner.lock().unwrap();
-            let newest = inner
+            let newest_bytes = inner
                 .pending
                 .as_ref()
                 .map_or_else(|| inner.running.bytes.clone(), |p| p.bytes.clone());
-            (inner.etag.clone(), inner.last_modified.clone(), newest)
+            // While a rejected candidate stands, ask conditionally on it
+            // (no re-download while the server keeps serving it) and take
+            // whatever else comes back in full, so the bookkeeping can
+            // clear the rejection once the server moves on.
+            let validators = inner
+                .rejected
+                .as_ref()
+                .map_or_else(|| inner.newest.clone(), |r| r.validators.clone());
+            (validators, inner.rejected.is_none().then_some(newest_bytes))
         };
         let fetched = match &self.source {
             Source::Url(url) => {
@@ -164,56 +230,94 @@ impl Updates {
                 loader::fetch_if_changed(
                     client,
                     url,
-                    etag.as_deref(),
-                    last_modified.as_deref(),
-                    Some(&newest),
+                    validators.etag.as_deref(),
+                    validators.last_modified.as_deref(),
+                    newest_bytes.as_deref().map(Vec::as_slice),
                     &self.limits,
                 )
                 .await
             }
-            Source::Path(path) => loader::read_if_changed(path, &newest, &self.limits).await,
+            Source::Path(path) => {
+                loader::read_if_changed(
+                    path,
+                    newest_bytes.as_deref().map_or(&[][..], Vec::as_slice),
+                    &self.limits,
+                )
+                .await
+            }
             Source::Resolver(resolver) => {
-                loader::resolve_if_changed(resolver, etag.as_deref(), &newest, &self.limits).await
+                loader::resolve_if_changed(
+                    resolver,
+                    validators.etag.as_deref(),
+                    newest_bytes.as_deref().map_or(&[][..], Vec::as_slice),
+                    &self.limits,
+                )
+                .await
             }
             Source::Bytes(_) | Source::Precompiled(_) => Ok(None),
         };
         match fetched {
-            Ok(Some(loaded)) => {
-                {
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.etag = loaded.etag.clone();
-                    inner.last_modified = loaded.last_modified.clone();
-                }
-                Ok(self.offer(loaded).await)
-            }
+            Ok(Some(loaded)) => match self.offer_from(loaded, true).await {
+                Ok(Offer::Pending(info) | Offer::Unchanged(info)) => Ok(Some(info)),
+                Ok(Offer::Current) => Ok(None),
+                Err(rejection) => Err(anyhow::Error::new(rejection)),
+            },
             Ok(None) => Ok(self.pending()),
             Err(err) => {
                 if let Some(upgrade) = err.downcast_ref::<UpgradeRequired>() {
-                    self.reject(upgrade.to_string(), upgrade.required.clone());
+                    self.report_rejection(upgrade.to_string(), upgrade.required.clone());
                 }
                 Err(err)
             }
         }
     }
 
-    /// A component from anywhere (the source, or the embedder). The same
-    /// bytes as the running app withdraw a pending update; the same bytes
-    /// as the pending one change nothing; anything else is validated off
-    /// the runtime and, if it passes, becomes the pending update.
-    pub async fn offer(self: &Arc<Self>, loaded: Loaded) -> Option<UpdateInfo> {
+    /// A component from the embedder. See [`Updates::offer_from`].
+    pub async fn offer(self: &Arc<Self>, loaded: Loaded) -> Result<Offer, Rejection> {
+        self.offer_from(loaded, false).await
+    }
+
+    /// A candidate component. The running version's bytes withdraw a
+    /// pending update; the pending update's bytes change nothing; anything
+    /// else is validated off the runtime and becomes the pending update or
+    /// a rejection. `from_source` says the validators are the source's and
+    /// may steer the next conditional fetch. Every state change happens in
+    /// one step once the outcome is known, so a failed candidate leaves the
+    /// running and pending state, and the validators, exactly as they were.
+    async fn offer_from(
+        self: &Arc<Self>,
+        loaded: Loaded,
+        from_source: bool,
+    ) -> Result<Offer, Rejection> {
+        let validators = from_source.then(|| Validators::of(&loaded));
         {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             if *inner.running.bytes == loaded.bytes {
+                if let Some(validators) = validators {
+                    inner.newest = validators;
+                }
+                inner.rejected = None;
+                let withdrawn = inner.pending.take().is_some();
+                if let Some(deadline) = inner.deadline.take() {
+                    deadline.task.abort();
+                }
                 drop(inner);
-                self.withdraw();
-                return None;
+                if withdrawn {
+                    self.phase(Phase::UpdateWithdrawn);
+                    self.queue.push(t::Event::UpdateChanged);
+                }
+                return Ok(Offer::Current);
             }
             if inner
                 .pending
                 .as_ref()
                 .is_some_and(|p| *p.bytes == loaded.bytes)
             {
-                return info_of(&inner);
+                if let Some(validators) = validators {
+                    inner.newest = validators;
+                }
+                inner.rejected = None;
+                return Ok(Offer::Unchanged(info_of(&inner).expect("pending")));
             }
         }
         let version = loaded.etag.clone().or_else(|| loaded.last_modified.clone());
@@ -236,22 +340,34 @@ impl Updates {
             }
         })
         .await;
-        match validated {
-            Ok(Ok((bytes, instance))) => Some(self.set_pending(Pending {
-                bytes: Arc::new(bytes),
-                instance,
+        let (err, requires_abi) = match validated {
+            Ok(Ok((bytes, instance))) => {
+                let info = self.set_pending(
+                    Pending {
+                        bytes: Arc::new(bytes),
+                        instance,
+                        version,
+                        shown,
+                    },
+                    validators,
+                );
+                return Ok(Offer::Pending(info));
+            }
+            Ok(Err((err, requires))) => (format!("{err:#}"), requires),
+            Err(err) => (format!("validation failed: {err}"), None),
+        };
+        let reason = truncate(crate::sanitize::text(&err), self.limits.message_bytes);
+        if let Some(validators) = validators {
+            self.inner.lock().unwrap().rejected = Some(Rejected {
+                validators,
                 version,
-                shown,
-            })),
-            Ok(Err((err, requires))) => {
-                self.reject(format!("{err:#}"), requires);
-                None
-            }
-            Err(err) => {
-                self.reject(format!("validation failed: {err}"), None);
-                None
-            }
+            });
         }
+        self.report_rejection(reason.clone(), requires_abi.clone());
+        Err(Rejection {
+            reason,
+            requires_abi,
+        })
     }
 
     /// A pretend update on the running component itself, so the handling
@@ -266,13 +382,19 @@ impl Updates {
                 shown,
             }
         };
-        self.set_pending(pending);
+        self.set_pending(pending, None);
     }
 
-    fn set_pending(&self, pending: Pending) -> UpdateInfo {
+    /// The candidate passed: it is the pending update, the validators (if
+    /// from the source) describe it, and no rejection stands.
+    fn set_pending(&self, pending: Pending, validators: Option<Validators>) -> UpdateInfo {
         let shown = pending.shown.clone();
         let mut inner = self.inner.lock().unwrap();
         inner.pending = Some(pending);
+        if let Some(validators) = validators {
+            inner.newest = validators;
+        }
+        inner.rejected = None;
         match self.policy {
             ReloadPolicy::Immediate => {}
             ReloadPolicy::AppControlled => {}
@@ -322,21 +444,6 @@ impl Updates {
         info
     }
 
-    /// The newest component is the running one again: forget the pending
-    /// update and its deadline.
-    pub fn withdraw(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.pending.take().is_none() {
-            return;
-        }
-        if let Some(deadline) = inner.deadline.take() {
-            deadline.task.abort();
-        }
-        drop(inner);
-        self.phase(Phase::UpdateWithdrawn);
-        self.queue.push(t::Event::UpdateChanged);
-    }
-
     /// The pending update, with the deadlines as of now.
     pub fn pending(&self) -> Option<UpdateInfo> {
         info_of(&self.inner.lock().unwrap())
@@ -367,7 +474,11 @@ impl Updates {
                 || inner
                     .pending
                     .as_ref()
-                    .is_some_and(|p| p.version.as_deref() == Some(version));
+                    .is_some_and(|p| p.version.as_deref() == Some(version))
+                || inner
+                    .rejected
+                    .as_ref()
+                    .is_some_and(|r| r.version.as_deref() == Some(version));
             if known || matches!(self.source, Source::Bytes(_) | Source::Precompiled(_)) {
                 return;
             }
@@ -381,7 +492,8 @@ impl Updates {
         });
     }
 
-    fn reject(&self, reason: String, requires_abi: Option<String>) {
+    /// Tell the embedder, once per distinct reason.
+    fn report_rejection(&self, reason: String, requires_abi: Option<String>) {
         let reason = truncate(crate::sanitize::text(&reason), self.limits.message_bytes);
         let mut inner = self.inner.lock().unwrap();
         if inner.last_rejection.as_deref() == Some(reason.as_str()) {

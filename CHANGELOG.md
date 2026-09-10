@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 (2026-09-10)
+
+- Update bookkeeping is transactional: the fetch validators, the pending
+  slot, and the running slot change together, in one step, once a
+  candidate's outcome is known. A rejected candidate leaves all of them as
+  they were, is remembered so polls stay conditional on it and version
+  hints naming it are ignored, and is forgotten once the source moves on.
+- `AppHandle::offer` returns an [`Offer`] (`Pending`, `Unchanged`,
+  `Current`) instead of an `Option`, and a candidate that fails validation
+  is an error carrying a [`Rejection`] (reason, required ABI), for both
+  `offer` and `check_update`; the app's `update::check()` sees the reason
+  too.
+
 ## 0.4.0 (2026-09-10)
 
 WIT package `rattery:tui@0.4.0`; `ABI` is now
