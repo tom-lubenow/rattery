@@ -609,6 +609,12 @@ impl AppHandle {
             .map_err(anyhow::Error::new)
     }
 
+    /// Whether the run has started and not yet ended: the point from which
+    /// the other methods take effect.
+    pub fn is_live(&self) -> bool {
+        self.inner.updates.get().is_some_and(|u| !u.is_closed())
+    }
+
     /// The pending update, with its deadlines as of now.
     pub fn pending_update(&self) -> Option<UpdateInfo> {
         self.inner.updates.get().and_then(|u| u.pending())

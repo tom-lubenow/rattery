@@ -1329,18 +1329,30 @@ async fn the_cpu_budget_survives_reloads() {
 async fn a_shutdown_is_not_lost_behind_a_pending_reload() {
     require_wasip2!();
     let server = Server::start(&[]);
+    warm_compile_cache().await;
     let mut app = App::from_path(guest("counter-app"))
         .origin(&server.url)
         .cookies(CookiePolicy::Ephemeral)
         .headless(headless("sleep 30000", 30));
     let handle = app.handle();
+    assert!(!handle.is_live());
     let run = tokio::spawn(app.run());
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // The handle takes effect once the run has compiled and linked the app.
+    let started = std::time::Instant::now();
+    while !handle.is_live() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the run never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(2000)).await;
     assert!(handle.reload());
     assert!(handle.shutdown(), "a shutdown overrides the reload");
     let report = run.await.unwrap().unwrap();
     assert_eq!(report.status, AppStatus::Stopped, "{}", dump(&report));
     // The handle is inert once the run is over.
+    assert!(!handle.is_live());
     assert!(!handle.reload());
     assert!(!handle.shutdown());
     assert!(handle.check_update().await.is_err());
