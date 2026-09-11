@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.2 (2026-09-10)
+
+Fixes from an adversarial review of the update model.
+
+- The CPU budget is carried across reloads instead of refilled; guest
+  reloads are limited to one per 500 ms and guest update checks to one
+  fetch per second.
+- `Interrupt` reasons have a priority: a shutdown, kill, or timeout is
+  never dropped behind a pending reload (`AppHandle::shutdown` reports
+  whether it took effect); a failed instantiation after a reload no longer
+  swallows an interrupt that landed meanwhile, and restores the running
+  slot when it falls back.
+- A `426` body is read no further than can be shown.
+- A rejected candidate is compared by its bytes, so sources without
+  validators (files, resolvers, servers without ETags) do not download and
+  compile it again every poll; the same bytes under a new ETag are recorded
+  instead of downloaded on every poll and treated as unknown by version
+  hints; the rejection dedupe resets whenever a candidate is accepted.
+- Offers from the embedder and checks are serialised, validation included,
+  and the outcome is decided again after validation, so a slower candidate
+  cannot overwrite a newer pending update or re-announce the running one.
+- The deadline task fires only while its own update is still pending
+  (checked under the lock), measures idleness from key, mouse, and paste
+  events only, and the runner takes the pending update before clearing
+  the reload reason.
+- Version hints are honoured only from the app's own origin and start at
+  most one check at a time; `update-changed` is a sticky flag that a full
+  input queue cannot evict; the update state is closed when the run ends,
+  so an `AppHandle` outliving it is inert and holds no engine or task.
+- New tests for each of the above scenarios.
+
 ## 0.4.1 (2026-09-10)
 
 - Update bookkeeping is transactional: the fetch validators, the pending

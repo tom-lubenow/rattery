@@ -32,6 +32,8 @@ pub struct RunParts {
     pub storage: Storage,
     pub ext: HashMap<TypeId, Box<dyn Any + Send>>,
     pub memory_peak: usize,
+    /// Carried across reloads: a reload does not refill the budget.
+    pub cpu: CpuBudget,
     /// Reaps finished connection tasks continuously; `close` + `wait` it.
     pub websocket_tasks: tokio_util::task::TaskTracker,
 }
@@ -165,6 +167,8 @@ pub struct HostStateConfig {
     pub interrupter: Arc<Interrupter>,
     pub on_phase: Option<PhaseHook>,
     pub ext: HashMap<TypeId, Box<dyn Any + Send>>,
+    /// The budget as the previous instance left it, on a reload.
+    pub cpu: Option<CpuBudget>,
 }
 
 impl HostState {
@@ -181,6 +185,7 @@ impl HostState {
             interrupter,
             on_phase,
             ext,
+            cpu,
         } = config;
         let limiter = AggregateLimiter::new(&limits);
         let websocket_slots = Arc::new(tokio::sync::Semaphore::new(limits.websockets));
@@ -212,10 +217,10 @@ impl HostState {
             updates,
             limits,
             limiter,
-            cpu: CpuBudget {
+            cpu: cpu.unwrap_or(CpuBudget {
                 ticks: 0,
                 budget_ticks,
-            },
+            }),
             interrupter,
             on_phase,
             websocket_slots,
@@ -238,6 +243,7 @@ impl HostState {
             ext: self.ext,
             memory_peak: self.limiter.memory_peak(),
             websocket_tasks,
+            cpu: self.cpu,
         }
     }
 
@@ -468,7 +474,7 @@ impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
             let state = view.get();
             (state.updates.clone(), state.limits.message_bytes)
         });
-        Ok(match updates.check().await {
+        Ok(match updates.check_throttled().await {
             Ok(info) => Ok(info.map(update::to_wit)),
             Err(err) => Err(crate::runner::truncate(
                 crate::sanitize::text(&format!("{err:#}")),

@@ -567,6 +567,7 @@ impl WasiHttpHooks for OriginHooks {
         let request_body_bytes = self.request_body_bytes;
         let response_body_bytes = self.response_body_bytes;
         let updates = self.updates.clone();
+        let app_origin = self.policy.app_origin().map(str::to_owned);
 
         Box::new(async move {
             let permit = concurrency
@@ -588,6 +589,7 @@ impl WasiHttpHooks for OriginHooks {
             // The server names the component version it serves; one the
             // host does not know means a deploy happened.
             if let Some(updates) = &updates
+                && url.as_ref().map(crate::loader::origin_of) == app_origin
                 && let Some(version) = response
                     .headers()
                     .get(crate::update::VERSION_HEADER)

@@ -39,8 +39,9 @@ pub enum Availability {
     Watched,
     /// The host checks when the app calls [`check`].
     OnRequest,
-    /// The component is embedded in the host binary; updating means
-    /// updating the host.
+    /// The host has nowhere to look (the component is embedded in it), so
+    /// [`check`] finds nothing. The host's embedder may still hand it a
+    /// version, which arrives as `UpdateChanged` like any other.
     Unavailable,
 }
 

@@ -150,6 +150,19 @@ pub enum Interrupt {
     Limit(String),
 }
 
+impl Interrupt {
+    /// What may override what: a kill beats everything, a reload nothing.
+    fn priority(&self) -> u8 {
+        match self {
+            Interrupt::Kill => 5,
+            Interrupt::Shutdown => 4,
+            Interrupt::Timeout => 3,
+            Interrupt::Limit(_) => 2,
+            Interrupt::Reload => 1,
+        }
+    }
+}
+
 /// Stops a running app from anywhere. The reason is checked by the epoch
 /// callback on the next tick, which traps an app busy in wasm; the
 /// notification unblocks the host if the app is waiting inside a host call.
@@ -166,13 +179,26 @@ impl Interrupter {
         }
     }
 
-    pub fn fire(&self, reason: Interrupt) {
+    /// Set the reason, unless a more important one already stands: a
+    /// shutdown or kill is never lost behind a pending reload. Returns
+    /// whether `reason` now stands.
+    pub fn fire(&self, reason: Interrupt) -> bool {
         let mut slot = self.reason.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(reason);
-        }
+        let stands = match &*slot {
+            Some(current) if current.priority() >= reason.priority() => false,
+            _ => {
+                *slot = Some(reason);
+                true
+            }
+        };
         drop(slot);
         self.notify.notify_one();
+        stands
+    }
+
+    /// The reason that stands, without clearing it.
+    pub fn reason(&self) -> Option<Interrupt> {
+        self.reason.lock().unwrap().clone()
     }
 
     pub fn is_fired(&self) -> bool {
@@ -273,6 +299,12 @@ pub struct EventQueue {
     coalesce: std::sync::atomic::AtomicBool,
     coalesced: std::sync::atomic::AtomicU64,
     last_push: Mutex<Option<Instant>>,
+    /// The last key, mouse, or paste event: what "idle" is measured from.
+    /// Focus, resize, and host-injected events do not count.
+    last_input: Mutex<Option<Instant>>,
+    /// `update-changed` is a sticky flag, not a queue entry: it cannot be
+    /// evicted by a burst of input, and is delivered once per change.
+    update_changed: std::sync::atomic::AtomicBool,
     notify: Notify,
     kill: Mutex<KillDetector>,
 }
@@ -285,6 +317,8 @@ impl EventQueue {
             paste_bytes,
             coalesce: std::sync::atomic::AtomicBool::new(true),
             last_push: Mutex::new(None),
+            last_input: Mutex::new(None),
+            update_changed: std::sync::atomic::AtomicBool::new(false),
             coalesced: std::sync::atomic::AtomicU64::new(0),
             notify: Notify::new(),
             kill: Mutex::new(KillDetector {
@@ -305,7 +339,11 @@ impl EventQueue {
             text.truncate(cut);
         }
         self.kill.lock().unwrap().observe(&event);
-        *self.last_push.lock().unwrap() = Some(Instant::now());
+        let now = Instant::now();
+        *self.last_push.lock().unwrap() = Some(now);
+        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+            *self.last_input.lock().unwrap() = Some(now);
+        }
         let mut events = self.events.lock().unwrap();
         if self.coalesce.load(std::sync::atomic::Ordering::Relaxed)
             && let Some(last) = events.back_mut()
@@ -334,13 +372,35 @@ impl EventQueue {
         *self.last_push.lock().unwrap()
     }
 
+    /// When the user last typed, clicked, or pasted.
+    pub fn last_input(&self) -> Option<Instant> {
+        *self.last_input.lock().unwrap()
+    }
+
+    /// Tell the app the pending update changed. Delivered after the input
+    /// already queued, once, however many times it is set before then.
+    pub fn push_update_changed(&self) {
+        self.update_changed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_one();
+    }
+
+    fn take_update_changed(&self) -> bool {
+        self.update_changed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Events merged into a newer one of the same kind so far.
     pub fn coalesced(&self) -> u64 {
         self.coalesced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn drain(&self) -> Vec<Event> {
-        self.events.lock().unwrap().drain(..).collect()
+        let mut events: Vec<Event> = self.events.lock().unwrap().drain(..).collect();
+        if self.take_update_changed() {
+            events.push(Event::UpdateChanged);
+        }
+        events
     }
 
     /// Wait for the next event. Backs `terminal.next-event`.
@@ -349,6 +409,9 @@ impl EventQueue {
             let notified = self.notify.notified();
             if let Some(event) = self.events.lock().unwrap().pop_front() {
                 return event;
+            }
+            if self.take_update_changed() {
+                return Event::UpdateChanged;
             }
             notified.await;
         }
@@ -796,6 +859,58 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::empty(),
         })
+    }
+
+    #[test]
+    fn a_more_important_interrupt_overrides_a_pending_reload() {
+        let interrupter = Interrupter::new();
+        assert!(interrupter.fire(Interrupt::Reload));
+        assert!(!interrupter.fire(Interrupt::Reload));
+        assert!(interrupter.fire(Interrupt::Shutdown));
+        assert!(
+            !interrupter.fire(Interrupt::Reload),
+            "a reload never beats a shutdown"
+        );
+        assert!(!interrupter.fire(Interrupt::Timeout));
+        assert!(interrupter.fire(Interrupt::Kill));
+        assert_eq!(interrupter.reason(), Some(Interrupt::Kill));
+        assert_eq!(interrupter.take_reason(), Some(Interrupt::Kill));
+        assert!(interrupter.fire(Interrupt::Timeout));
+    }
+
+    #[test]
+    fn update_changed_is_sticky_and_only_input_counts_as_activity() {
+        let queue = EventQueue::new(Arc::new(Interrupter::new()), 2, 1024);
+        queue.push_update_changed();
+        queue.push_update_changed();
+        // A burst beyond the capacity evicts queued events, never the flag.
+        queue.push(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+        queue.push(mouse(MouseEventKind::Down(MouseButton::Left), 2));
+        queue.push(mouse(MouseEventKind::Down(MouseButton::Left), 3));
+        let events = queue.drain();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(
+            events[2],
+            Event::UpdateChanged,
+            "delivered once, after the input"
+        );
+        assert!(queue.drain().is_empty());
+
+        let queue = EventQueue::new(Arc::new(Interrupter::new()), 16, 1024);
+        assert!(queue.last_input().is_none());
+        queue.push(Event::FocusGained);
+        queue.push(Event::Resize(Size {
+            width: 1,
+            height: 1,
+        }));
+        queue.push_update_changed();
+        assert!(
+            queue.last_input().is_none(),
+            "host and focus events are not activity"
+        );
+        assert!(queue.last_push().is_some());
+        queue.push(mouse(MouseEventKind::Moved, 1));
+        assert!(queue.last_input().is_some());
     }
 
     #[test]

@@ -59,7 +59,9 @@ ordinary TUI and can be tightened for untrusted apps.
 |---|---|---|
 | linear memory | 256 MiB in aggregate across all memories | a custom `ResourceLimiter`; growth beyond it traps |
 | host resources held (streams, bodies, sockets) | 4096 | `ResourceTable` capacity |
-| CPU time | unlimited | epoch ticks every 10 ms while the guest executes; over budget stops the app with `AppStatus::LimitExceeded` |
+| CPU time | unlimited | epoch ticks every 10 ms while the guest executes, in total across reloads; over budget stops the app with `AppStatus::LimitExceeded` |
+| reloads | one per 500 ms | a guest that reloads in a loop waits for the interval |
+| update checks asked for by the app | one fetch per second | closer calls get the current state |
 | component size | 64 MiB | checked before download completes and before compile |
 | download time | 60 s | HTTP client timeout |
 | input event queue | 1024 | oldest events dropped |
@@ -123,8 +125,12 @@ reload after a grace period at the first idle moment, and at a hard limit
 regardless. The first deadline stands across further updates, so a stream of
 deploys cannot postpone it, and a rollback withdraws the pending update
 rather than reloading the app onto the version it already runs. A version
-hint on a server reply only triggers a check; the bytes still come from the
-app's source. The version string in the event is the server's validator,
+hint on a server reply only triggers a check, only from the app's own
+origin, and only one at a time; the bytes still come from the app's source.
+A `426` body is read no further than the 256 characters that can be shown.
+The `update-changed` event is a sticky flag rather than a queue entry, so a
+burst of input cannot evict it. Kill, shutdown, and timeout take priority
+over a pending reload. The version string in the event is the server's validator,
 sanitised and cut to 256 bytes. A new component is compiled and linked
 against the host before the app is told about it; one that fails becomes
 `Phase::UpdateRejected` and the running app is left alone.

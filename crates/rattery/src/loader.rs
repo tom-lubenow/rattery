@@ -33,10 +33,10 @@ pub async fn load(source: &Source, limits: &Limits) -> Result<Loaded> {
     match source {
         Source::Url(url) => {
             let client = client(limits)?;
-            let fetched = fetch_if_changed(&client, url, None, None, None, limits)
-                .await?
-                .expect("an unconditional fetch always yields a body");
-            Ok(fetched)
+            match fetch_if_changed(&client, url, None, None, None, limits).await? {
+                Fetch::New(loaded) => Ok(loaded),
+                _ => unreachable!("an unconditional fetch always yields a body"),
+            }
         }
         Source::Path(path) => {
             let metadata = tokio::fs::metadata(path)
@@ -167,6 +167,19 @@ impl std::fmt::Display for UpgradeRequired {
 
 impl std::error::Error for UpgradeRequired {}
 
+/// The outcome of a conditional fetch.
+pub enum Fetch {
+    /// `304`, or nothing to compare against changed.
+    NotModified,
+    /// `200` with exactly `previous` again, under these validators: the
+    /// caller should remember them, or the next fetch downloads it again.
+    Same {
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+    New(Loaded),
+}
+
 /// Fetch `url` unless the server says it is unchanged. `previous` lets us
 /// detect changes even from servers that send no validators.
 pub async fn fetch_if_changed(
@@ -176,7 +189,7 @@ pub async fn fetch_if_changed(
     last_modified: Option<&str>,
     previous: Option<&[u8]>,
     limits: &Limits,
-) -> Result<Option<Loaded>> {
+) -> Result<Fetch> {
     let mut request = client
         .get(url.clone())
         .header(crate::ABI_HEADER, crate::ABI);
@@ -191,7 +204,7 @@ pub async fn fetch_if_changed(
         .await
         .with_context(|| format!("failed to fetch {url}"))?;
     if response.status() == StatusCode::NOT_MODIFIED {
-        return Ok(None);
+        return Ok(Fetch::NotModified);
     }
     if response.status() == StatusCode::UPGRADE_REQUIRED {
         // Both the header and the body come from the server: bound them.
@@ -200,8 +213,16 @@ pub async fn fetch_if_changed(
             .get(crate::ABI_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(|v| crate::sanitize::text(v).chars().take(256).collect());
-        let body = response.text().await.unwrap_or_default();
-        let message: String = crate::sanitize::text(body.trim())
+        // Read no more of the body than can be shown.
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(Ok(chunk)) = stream.next().await {
+            body.extend_from_slice(&chunk[..chunk.len().min(1024 - body.len())]);
+            if body.len() >= 1024 {
+                break;
+            }
+        }
+        let message: String = crate::sanitize::text(String::from_utf8_lossy(&body).trim())
             .chars()
             .take(256)
             .collect();
@@ -234,9 +255,12 @@ pub async fn fetch_if_changed(
         bytes.extend_from_slice(&chunk);
     }
     if previous.is_some_and(|previous| previous == bytes.as_slice()) {
-        return Ok(None);
+        return Ok(Fetch::Same {
+            etag,
+            last_modified,
+        });
     }
-    Ok(Some(Loaded {
+    Ok(Fetch::New(Loaded {
         precompiled: false,
         bytes,
         origin: Some(origin_of(&final_url)),

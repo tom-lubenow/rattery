@@ -553,8 +553,9 @@ struct HandleInner {
 }
 
 /// Control over a running app from any task: check for updates, offer a
-/// component, reload, shut down. From [`App::handle`]; inert until the run
-/// starts.
+/// component, reload, shut down. From [`App::handle`]; bound to that one
+/// run: inert until it starts, and inert again once it has ended (the
+/// methods return `false` or an error then).
 #[derive(Clone, Default)]
 pub struct AppHandle {
     inner: Arc<HandleInner>,
@@ -585,10 +586,13 @@ impl AppHandle {
     }
 
     /// Offer a component the embedder obtained itself (a push channel, a
-    /// package). Validated like any update; the outcome says whether it is
-    /// now pending, already was, or is the running version (which withdraws
-    /// a pending update). A candidate that fails validation is the error,
-    /// as a [`Rejection`].
+    /// package): component bytes, not precompiled native code. Validated
+    /// like any update; the outcome says whether it is now pending, already
+    /// was, or is the running version (which withdraws a pending update). A
+    /// candidate that fails validation is the error, as a [`Rejection`].
+    /// Works for every source, including an embedded one whose
+    /// `update-availability` tells the app the host itself has nowhere to
+    /// look.
     pub async fn offer(&self, bytes: Vec<u8>, version: Option<String>) -> Result<Offer> {
         let loaded = loader::Loaded {
             precompiled: false,
@@ -622,11 +626,11 @@ impl AppHandle {
     }
 
     fn fire(&self, interrupt: terminal::Interrupt) -> bool {
+        if self.inner.updates.get().is_none_or(|u| u.is_closed()) {
+            return false;
+        }
         match self.inner.interrupter.get() {
-            Some(interrupter) => {
-                interrupter.fire(interrupt);
-                true
-            }
+            Some(interrupter) => interrupter.fire(interrupt),
             None => false,
         }
     }

@@ -15,16 +15,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tom-lubenow/rattery"
 
 [workspace.dependencies]
-rattery = { path = "crates/rattery", version = "0.4.1" }
-rattery-app = { path = "crates/rattery-app", version = "0.4.1" }
-rattery-build = { path = "crates/rattery-build", version = "0.4.1" }
-rattery-macros = { path = "crates/rattery-macros", version = "0.4.1" }
+rattery = { path = "crates/rattery", version = "0.4.2" }
+rattery-app = { path = "crates/rattery-app", version = "0.4.2" }
+rattery-build = { path = "crates/rattery-build", version = "0.4.2" }
+rattery-macros = { path = "crates/rattery-macros", version = "0.4.2" }
 ratatui = { version = "0.30", default-features = false }
 server_fn = { version = "0.8", default-features = false }
 server_fn_macro = { version = "0.8", default-features = false }

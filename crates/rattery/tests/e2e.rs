@@ -493,10 +493,12 @@ async fn watch_reloads_when_the_served_component_changes() {
         App::from_url(format!("{}/app.wasm", server.url))
             .unwrap()
             .watch(true)
+            // The hard limit is beyond the run: the reload seen below is the
+            // idle one.
             .reload_policy(ReloadPolicy::Deferred {
                 grace: Duration::from_secs(3),
                 idle: Duration::from_secs(1),
-                hard_limit: Duration::from_secs(10),
+                hard_limit: Duration::from_secs(60),
             })
             .on_phase(move |phase| {
                 if matches!(phase, Phase::UpdateAvailable { .. } | Phase::Reloading) {
@@ -1275,5 +1277,174 @@ async fn the_embedder_handle_and_the_app_can_check_and_reload() {
         phases.contains(&Phase::Exited(AppStatus::Stopped)),
         "{phases:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cpu_budget_survives_reloads() {
+    require_wasip2!();
+    // Each instance burns some guest CPU (20 full-screen frames, tens of
+    // milliseconds here, more on a slow machine), then reloads itself; a
+    // budget of 1.5 s must end the run after a few instances, not be
+    // refilled by every restart.
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let report = App::from_path(guest("bench-app"))
+        .location("bench://local/app.wasm?mode=full&frames=20&reload=1")
+        .cookies(CookiePolicy::Ephemeral)
+        .limits(rattery::Limits {
+            cpu_time: Some(Duration::from_millis(1500)),
+            ..rattery::Limits::default()
+        })
+        .on_phase(move |phase| seen.lock().unwrap().push(phase))
+        .headless(HeadlessOptions {
+            width: 200,
+            height: 50,
+            script: Script::parse("sleep 30000").unwrap(),
+            timeout: Some(Duration::from_secs(30)),
+        })
+        .run()
+        .await
+        .unwrap();
+    let text = dump(&report);
+    assert!(
+        matches!(report.status, AppStatus::LimitExceeded(_)),
+        "{text}"
+    );
+    let reloads = phases
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|p| **p == Phase::Reloading)
+        .count();
+    assert!((1..=60).contains(&reloads), "reloads: {reloads}\n{text}");
+    assert!(
+        report.timings.total < Duration::from_secs(28),
+        "the budget, not the timeout, ended it: {:?}",
+        report.timings.total
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shutdown_is_not_lost_behind_a_pending_reload() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let mut app = App::from_path(guest("counter-app"))
+        .origin(&server.url)
+        .cookies(CookiePolicy::Ephemeral)
+        .headless(headless("sleep 30000", 30));
+    let handle = app.handle();
+    let run = tokio::spawn(app.run());
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(handle.reload());
+    assert!(handle.shutdown(), "a shutdown overrides the reload");
+    let report = run.await.unwrap().unwrap();
+    assert_eq!(report.status, AppStatus::Stopped, "{}", dump(&report));
+    // The handle is inert once the run is over.
+    assert!(!handle.reload());
+    assert!(!handle.shutdown());
+    assert!(handle.check_update().await.is_err());
+    assert!(handle.pending_update().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_bytes_under_a_new_etag_are_not_an_update() {
+    require_wasip2!();
+    let dir = std::env::temp_dir().join(format!("rattery-retag-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let served = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &served).unwrap();
+    let server = Server::start_serving(&served);
+    warm_compile_cache().await;
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    let run = tokio::spawn(
+        App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .watch(true)
+            .reload_policy(ReloadPolicy::Immediate)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("sleep 6000\nkey k\nsleep 1000\nsnapshot", 8))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A re-copy: identical bytes, a new modification time, so a new ETag.
+    let bytes = std::fs::read(&served).unwrap();
+    std::fs::write(&served, &bytes).unwrap();
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(
+        report.snapshots[0].contains("launch 1"),
+        "never reloaded\n{text}"
+    );
+    let phases = phases.lock().unwrap();
+    assert!(
+        !phases
+            .iter()
+            .any(|p| matches!(p, Phase::UpdateAvailable { .. } | Phase::Reloading)),
+        "{phases:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_candidate_on_a_file_source_is_reported_once_and_then_forgotten() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    let dir = std::env::temp_dir().join(format!("rattery-filereject-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("app.wasm");
+    std::fs::copy(guest("counter-app"), &path).unwrap();
+    warm_compile_cache().await;
+
+    let phases = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = phases.clone();
+    // A file source has no validators: the rejected bytes themselves must
+    // keep the watcher from compiling the same garbage every poll.
+    let run = tokio::spawn(
+        App::from_path(&path)
+            .origin(&server.url)
+            .watch(true)
+            .reload_policy(ReloadPolicy::Immediate)
+            .on_phase(move |phase| seen.lock().unwrap().push(phase))
+            .cookies(CookiePolicy::Ephemeral)
+            .headless(headless("sleep 5500\nsnapshot", 10))
+            .run(),
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    std::fs::write(&path, b"this is not a component").unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    std::fs::write(&path, b"this is not a component either").unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    std::fs::copy(guest("spin-app"), &path).unwrap();
+
+    let report = run.await.unwrap().unwrap();
+    let text = dump(&report);
+    assert_eq!(report.status, AppStatus::TimedOut, "{text}");
+    assert!(report.snapshots[0].contains("rattery counter"), "{text}");
+    assert!(
+        report
+            .final_screen
+            .as_ref()
+            .unwrap()
+            .contains("spinning forever"),
+        "{text}"
+    );
+    let phases = phases.lock().unwrap();
+    let rejections = phases
+        .iter()
+        .filter(|p| matches!(p, Phase::UpdateRejected { .. }))
+        .count();
+    // One report per distinct candidate (the parse error echoes the bytes,
+    // so the two garbage files are two reasons); a watcher that recompiled
+    // the same garbage every 750 ms would report far more.
+    assert!(
+        (1..=2).contains(&rejections),
+        "one report per candidate, not per poll\n{phases:?}"
+    );
+    assert!(phases.contains(&Phase::Reloading), "{phases:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

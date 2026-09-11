@@ -34,6 +34,9 @@ mod bench {
         /// `hover`: render the layout this many times per frame, to stand in
         /// for a heavier UI.
         work: usize,
+        /// Call `reload()` after the frames instead of exiting: a guest that
+        /// tries to outlive its CPU budget by restarting.
+        reload: bool,
     }
 
     fn params() -> Params {
@@ -41,6 +44,7 @@ mod bench {
             frames: 100,
             mode: "full".into(),
             work: 1,
+            reload: false,
         };
         if let Some(location) = rattery_app::location()
             && let Some((_, query)) = location.split_once('?')
@@ -50,6 +54,7 @@ mod bench {
                     Some(("frames", n)) => params.frames = n.parse().unwrap_or(params.frames),
                     Some(("mode", m)) => params.mode = m.to_owned(),
                     Some(("work", n)) => params.work = n.parse().unwrap_or(1).max(1),
+                    Some(("reload", v)) => params.reload = v == "1",
                     _ => {}
                 }
             }
@@ -132,7 +137,12 @@ mod bench {
     }
 
     pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
-        let Params { frames, mode, work } = params();
+        let Params {
+            frames,
+            mode,
+            work,
+            reload,
+        } = params();
         if mode == "http" {
             return http_bench(frames).await;
         }
@@ -279,6 +289,9 @@ mod bench {
             ms(*durations.last().unwrap()),
             frames as f64 / total.as_secs_f64().max(1e-9)
         );
+        if reload {
+            rattery_app::update::reload();
+        }
         Ok(())
     }
 }

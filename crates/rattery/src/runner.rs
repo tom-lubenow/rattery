@@ -25,6 +25,17 @@ use crate::{
 /// responsive, and the CPU budget is charged.
 pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 
+/// The instance a reload replaced, kept for one iteration so a new version
+/// that cannot even be instantiated can be backed out of.
+struct Previous {
+    instance: AppPre<HostState>,
+    bytes: Arc<Vec<u8>>,
+    version: Option<String>,
+}
+
+/// The least time between two instances of the app.
+const RELOAD_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
 pub async fn run(app: App) -> Result<Report> {
     // If anything inside panics, the terminal is restored by the session's
     // drop and the panic hook is put back here, before the panic continues.
@@ -120,7 +131,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     // Resolve the component's imports now, so one built against another ABI
     // fails here with a readable error rather than after the terminal is up.
     let mut instance_pre = link(&engine, &linker, &component, &loaded.description)?;
-    let mut previous_instance: Option<AppPre<HostState>> = None;
+    let mut previous_instance: Option<Previous> = None;
 
     let interrupter = Arc::new(Interrupter::new());
     let mut tasks = Tasks::default();
@@ -245,9 +256,13 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     let mut stderr_all = String::new();
     let mut stats;
     let mut ext = app.ext;
+    // The CPU budget follows the app across reloads.
+    let mut cpu = None;
 
     let status = loop {
         term.mark_started();
+        let instance_started = std::time::Instant::now();
+        let previous_running = updates.running();
         let stdout = MemoryOutputPipe::new(limits.guest_output_bytes);
         let stderr = MemoryOutputPipe::new(limits.guest_output_bytes);
         let wasi = wasi_ctx(
@@ -268,6 +283,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             interrupter: interrupter.clone(),
             on_phase: on_phase.clone(),
             ext: std::mem::take(&mut ext),
+            cpu: cpu.take(),
         });
         let mut store = Store::new(&engine, state);
         store.limiter(|state| state.limiter());
@@ -300,6 +316,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         term = parts.term;
         storage = parts.storage;
         ext = parts.ext;
+        cpu = Some(parts.cpu);
         stats = term.stats();
         stats.memory_peak = parts.memory_peak;
         // Sockets the app still held: their tasks were aborted when their
@@ -318,12 +335,31 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             limits.guest_output_bytes,
         );
 
+        // Take the pending update before clearing the reason, so the
+        // deadline task (which fires only while an update is pending) has
+        // nothing left to fire on in between.
+        let next = if interrupter.reason() == Some(Interrupt::Reload) {
+            updates.take()
+        } else {
+            None
+        };
         let reason = interrupter.take_reason();
         if reason == Some(Interrupt::Reload) {
             // Without a pending update the same component restarts. A
             // pending one was compiled and linked when it was offered.
-            if let Some(next) = updates.take() {
-                previous_instance = Some(std::mem::replace(&mut instance_pre, next));
+            if let Some(next) = next {
+                let (bytes, version) = previous_running.clone();
+                previous_instance = Some(Previous {
+                    instance: std::mem::replace(&mut instance_pre, next),
+                    bytes,
+                    version,
+                });
+            }
+            // A guest that reloads in a loop gets one instance per
+            // interval, not one per trap.
+            let since = instance_started.elapsed();
+            if since < RELOAD_MIN_INTERVAL {
+                tokio::time::sleep(RELOAD_MIN_INTERVAL - since).await;
             }
             let _ = term.reset();
             phase(Phase::Reloading);
@@ -331,12 +367,13 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         }
         // A freshly reloaded component that could not even be instantiated
         // (a resource limit, say) is not worth ending the run over: go back
-        // to the one that worked, once.
-        if let (false, Some(Err(err)), Some(previous)) = (
-            instantiated.load(std::sync::atomic::Ordering::Relaxed),
-            &outcome,
-            previous_instance.take(),
-        ) {
+        // to the one that worked, once. An interrupt that landed meanwhile
+        // still ends the run.
+        if reason.is_none()
+            && !instantiated.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(Err(err)) = &outcome
+            && let Some(previous) = previous_instance.take()
+        {
             append_bounded(
                 &mut stderr_all,
                 &format!(
@@ -344,7 +381,8 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
                 ),
                 limits.guest_output_bytes,
             );
-            instance_pre = previous;
+            updates.restore_running(previous.instance.clone(), previous.bytes, previous.version);
+            instance_pre = previous.instance;
             let _ = term.reset();
             phase(Phase::Reloading);
             continue;
@@ -376,6 +414,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     // Everything that ran alongside the app stops before the terminal is
     // handed back.
     tasks.shutdown().await;
+    updates.close();
     drop(term);
     drop(session);
     phase(Phase::Exited(status.clone()));
