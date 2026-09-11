@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check:
@@ -25,4 +26,20 @@ jobs:
       - run: cargo clippy --workspace --all-targets --features rattery-build/precompile -- -D warnings
       - run: cargo clippy -p counter-app -p spin-app -p bench-app --target wasm32-wasip2 -- -D warnings
       - run: cargo test --workspace --features rattery-build/precompile
+
+  shim:
+    name: build the counter shim (embeds a precompiled app)
+    runs-on: ubuntu-latest
+    env:
+      # The nested wasm build rattery-build runs; kept out of OUT_DIR so
+      # the cache below keeps it.
+      RATTERY_BUILD_TARGET_DIR: ${{ github.workspace }}/examples/counter/shim/target/rattery-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/counter/shim -> target
       - run: cargo build --manifest-path examples/counter/shim/Cargo.toml

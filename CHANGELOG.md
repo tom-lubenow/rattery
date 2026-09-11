@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `rattery-build` honours `RATTERY_BUILD_TARGET_DIR` for its nested wasm
+  build, so a CI cache can keep it; the repository's CI builds the shim in
+  a parallel, cached job.
+
 ## 0.4.2 (2026-09-10)
 
 Fixes from an adversarial review of the update model.

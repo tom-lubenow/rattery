@@ -332,7 +332,8 @@ let report = App::from_url("https://apps.example.com/dashboard/app.wasm")?
 features, or the dev profile), compiles it for `wasm32-wasip2` into a target directory
 under `OUT_DIR`, and exports the component's path as `RATTERY_APP_WASM`; changes under
 the app's `src` rebuild it. The nested build needs the target installed
-(`rustup target add wasm32-wasip2`).
+(`rustup target add wasm32-wasip2`). In CI, point `RATTERY_BUILD_TARGET_DIR` at a
+cached directory so the nested wasm build is not repeated every run.
 
 **Precompiled components.** With the `precompile` feature of `rattery-build`,
 `.precompile(true)` also compiles the component to native code for the shim's target

@@ -32,6 +32,11 @@
 //! let app = unsafe { rattery::App::from_precompiled(rattery::embed_precompiled!().to_vec()) };
 //! ```
 //!
+//! The nested build's target directory lives under `OUT_DIR`, which CI
+//! caches usually skip; set `RATTERY_BUILD_TARGET_DIR` to a cached path
+//! (say `target/rattery-build` of the shim) to keep the wasm dependency
+//! build between runs.
+//!
 //! The nested build needs the `wasm32-wasip2` target installed
 //! (`rustup target add wasm32-wasip2`).
 
@@ -126,8 +131,14 @@ impl App {
         );
 
         // A target directory of its own: the outer cargo holds the lock on
-        // the shim's, and the app is built for another target anyway.
-        let target_dir = out_dir.join("rattery-target");
+        // the shim's, and the app is built for another target anyway. Under
+        // OUT_DIR by default; RATTERY_BUILD_TARGET_DIR moves it somewhere a
+        // CI cache can keep.
+        println!("cargo:rerun-if-env-changed=RATTERY_BUILD_TARGET_DIR");
+        let target_dir = env::var_os("RATTERY_BUILD_TARGET_DIR")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| out_dir.join("rattery-target"));
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut cmd = Command::new(cargo);
         cmd.arg("build")
