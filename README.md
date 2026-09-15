@@ -231,7 +231,7 @@ rattery <URL or path>
         [--incognito | --no-cookies | --cookie-jar FILE]
         [--storage-dir DIR | --no-storage] [--log-file FILE]
         [--watch [--reload-grace SECS|none]] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
-        [--headless COLSxROWS [--script FILE] [--timeout SECS]]
+        [--headless COLSxROWS] [--script FILE] [--timeout SECS] [--stats [--stats-file FILE]]
 ```
 
 **Origin policy.** An app may reach its own origin: where it was loaded from (after
@@ -295,12 +295,17 @@ the terminal is handed back. See `docs/security.md`.
 **Input.** Pointer movements and resizes the app has not read yet are merged into
 the newest one, so a frame slower than the pointer never turns a burst of movement
 into a backlog the app spends seconds draining; clicks, drags, scrolls, and keys are
-delivered in full. `docs/perf.md` has the hover benchmark (`cargo xtask hover`), and
-one finding worth repeating: build apps in release. At opt-level 0 the same widgets
-run about nine times slower inside the component.
+delivered in full. `docs/perf.md` has the benchmarks: `cargo xtask perf` runs native ratatui and
+rattery on the same animation, click, drag, and hover workloads, in memory and on a
+pseudo-terminal (frames stay under 7 ms and input reaches the screen in 3 to 6 ms on
+both, with rattery 0.1 to 1 ms behind, which is Cranelift against LLVM), and one
+finding worth repeating: build apps in release. At opt-level 0 the same widgets run
+about nine times slower inside the component.
 
 **Stats.** `Report::timings` and `Report::stats` (the `--stats` flag prints them) carry
-phase timings (load, compile, instantiate, first frame) and terminal counters. `cargo
+phase timings (load, compile, instantiate, first frame), terminal counters, and
+input-to-frame latency samples for the run, so `rattery --stats` on a real terminal
+measures your own app under your own mouse and keyboard. `cargo
 xtask bench` runs a rendering and request latency benchmark; see `docs/perf.md`.
 
 **Headless.** `--headless 80x24 --script keys.txt` runs the app on an in-memory screen,

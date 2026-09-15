@@ -99,13 +99,18 @@ struct Cli {
     #[arg(long, value_name = "COLSxROWS", value_parser = parse_size)]
     headless: Option<(u16, u16)>,
 
-    /// Script of input to feed a headless run (see `rattery --help-script`).
-    #[arg(long, value_name = "FILE", requires = "headless")]
+    /// Script of input to feed the app (see `rattery --help-script`); on a
+    /// real terminal it is delivered alongside your own input.
+    #[arg(long, value_name = "FILE")]
     script: Option<PathBuf>,
 
-    /// Stop a headless run after this many seconds.
-    #[arg(long, value_name = "SECS", requires = "headless")]
+    /// Stop the app after this many seconds.
+    #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
+
+    /// Append the --stats report to this file as well as printing it.
+    #[arg(long, value_name = "FILE", requires = "stats")]
+    stats_file: Option<PathBuf>,
 
     /// Print the headless script format and exit.
     #[arg(long)]
@@ -157,6 +162,9 @@ Headless scripts are one command per line; blank lines and # comments are ignore
   resize 100 30      columns rows; the app receives a resize event
   snapshot           capture the screen; printed when the app ends
   mouse move 10 5    pointer movement to column 10, row 5
+  mouse down 10 5    left button pressed / released / dragged there
+  mouse up 10 5
+  mouse drag 12 5
   sweep 400 5        400 movements along the diagonal, 5 ms apart
   update v2          make an update pending (the app may reload onto it)
 ";
@@ -227,20 +235,28 @@ async fn main() -> Result<()> {
     for (key, value) in cli.env {
         app = app.env(key, value);
     }
+    let script = match &cli.script {
+        Some(path) => Script::parse(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+        )?,
+        None => Script::default(),
+    };
+    let timeout = cli.timeout.map(Duration::from_secs_f64);
     if let Some((width, height)) = cli.headless {
-        let script = match &cli.script {
-            Some(path) => Script::parse(
-                &std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read {}", path.display()))?,
-            )?,
-            None => Script::default(),
-        };
         app = app.headless(HeadlessOptions {
             width,
             height,
             script,
-            timeout: cli.timeout.map(Duration::from_secs_f64),
+            timeout,
         });
+    } else {
+        if cli.script.is_some() {
+            app = app.script(script);
+        }
+        if let Some(timeout) = timeout {
+            app = app.timeout(timeout);
+        }
     }
 
     let needs_abi: std::sync::Arc<Mutex<Option<String>>> = Default::default();
@@ -293,17 +309,17 @@ async fn main() -> Result<()> {
                 format!("{:.1}ms", d.as_secs_f64() * 1000.0)
             }
         };
-        eprintln!(
+        let mut lines = vec![format!(
             "rattery stats: load {}, compile {}, instantiate {}, first frame {}, total {}",
             ms(t.load),
             ms(t.compile),
             ms(t.instantiate),
             t.first_draw.map(ms).unwrap_or_else(|| "-".into()),
             ms(t.total)
-        );
+        )];
         let per =
             |total: Duration, n: u64| ms(total.checked_div(n.max(1) as u32).unwrap_or_default());
-        eprintln!(
+        lines.push(format!(
             "  draws {} ({} cells, {} avg on host), flushes {} ({} avg), events {} ({} coalesced), logs {} ({} dropped)",
             s.draws,
             s.cells,
@@ -314,12 +330,37 @@ async fn main() -> Result<()> {
             s.events_coalesced,
             s.logs,
             s.logs_dropped
-        );
+        ));
+        if let Some((avg, p50, p95, max)) = s.input_latency_summary() {
+            lines.push(format!(
+                "  input to frame: avg {} p50 {} p95 {} max {} ({} samples)",
+                ms(avg),
+                ms(p50),
+                ms(p95),
+                ms(max),
+                s.input_latency.len()
+            ));
+        }
         if let (Some(draw), Some(event)) = (s.last_draw, s.last_event) {
-            eprintln!(
+            lines.push(format!(
                 "  lag at end: {} (last draw after last event)",
                 ms(draw.saturating_sub(event))
-            );
+            ));
+        }
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        if let Some(path) = &cli.stats_file
+            && let Ok(mut file) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(path)
+        {
+            for line in &lines {
+                let _ = writeln!(file, "{line}");
+            }
+            // The guest's own output goes with it: benchmark lines live there.
+            let _ = write!(file, "{}", sanitize::text(&report.stdout));
         }
     }
     if let Some(abi) = needs_abi.lock().unwrap().take() {

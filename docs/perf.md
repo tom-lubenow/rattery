@@ -58,6 +58,78 @@ first frame 0.4 ms. Cold cache: compiling the 400 KB release component takes
 35 ms; compiling a 19 MB debug component takes 60 to 120 ms (wasmtime compiles
 in parallel). Host resident memory while running the benchmark: 16.5 MB.
 
+## Native against rattery: interactive workloads
+
+`cargo xtask perf` answers the question "does it feel like a native app":
+the same ratatui widgets, driven by the same synthetic input, rendered by
+a native binary and by the component, on an in-memory backend (pure
+render cost) and on a real pseudo-terminal (raw mode, alternate screen,
+every changed cell written out and consumed). Four workloads stand in for
+real apps: an animated dashboard (sparkline, gauge, scrolling log,
+spinner), a grid of buttons clicked, a divider dragged across two panes of
+wrapped text, and a hover grid. 200×50, 200 events 5 ms apart, 300
+animation frames; measured on the machine above:
+
+| workload | runner | frame avg | frame p95 | input avg | input p95 |
+|---|---|---|---|---|---|
+| animation, back to back | native, in memory | 0.23 ms | 0.28 ms | | |
+| | native, terminal | 0.21 ms | 0.22 ms | | |
+| | rattery, in memory | 0.31 ms | 0.31 ms | | |
+| | rattery, terminal | 0.33 ms | 0.35 ms | | |
+| animation at 60 Hz | native, in memory | 0.71 ms | 0.83 ms | interval p95 16.4 ms | 0 late |
+| | native, terminal | 0.78 ms | 0.93 ms | interval p95 16.4 ms | 0 late |
+| | rattery, in memory | 1.04 ms | 1.27 ms | interval p95 16.8 ms | 0 late |
+| | rattery, terminal | 1.15 ms | 1.39 ms | interval p95 16.8 ms | 0 late |
+| click | native, in memory | 3.02 ms | 4.51 ms | 3.0 ms | 4.5 ms |
+| | native, terminal | 2.77 ms | 4.30 ms | 2.8 ms | 4.3 ms |
+| | rattery, in memory | 3.97 ms | 6.10 ms | 4.1 ms | 6.2 ms |
+| | rattery, terminal | 3.86 ms | 5.98 ms | 4.0 ms | 6.1 ms |
+| drag | native, in memory | 0.76 ms | 0.92 ms | 0.8 ms | 0.9 ms |
+| | native, terminal | 0.88 ms | 1.01 ms | 0.9 ms | 1.0 ms |
+| | rattery, in memory | 1.34 ms | 1.63 ms | 1.5 ms | 1.9 ms |
+| | rattery, terminal | 1.44 ms | 1.73 ms | 1.5 ms | 1.9 ms |
+| hover | native, in memory | 2.04 ms | 2.21 ms | 2.0 ms | 2.2 ms |
+| | native, terminal | 1.97 ms | 2.15 ms | 2.0 ms | 2.1 ms |
+| | rattery, in memory | 2.47 ms | 2.70 ms | 2.6 ms | 2.9 ms |
+| | rattery, terminal | 2.51 ms | 2.78 ms | 2.9 ms | 3.2 ms |
+
+"Input" is input-to-frame latency: from an input event arriving to the end
+of the frame that shows it. The host measures it from the event being
+queued to the end of the first flush after the app read it; the native
+harness from the event's arrival to `draw` returning; the same thing, so
+the columns compare. (The host merges pointer bursts keeping the oldest
+timestamp, so a hover backlog is measured from the first movement.)
+
+What the table says:
+
+**Equivalent as far as a user can tell.** Every frame on every workload is
+under 7 ms, against a 16 ms frame budget, and the 60 Hz animation holds its
+cadence on both sides with no late frames; the component's timer adds under
+half a millisecond of jitter at the 95th percentile. Input reaches the
+screen within 3 to 6 ms either way.
+
+**The difference is the compiler, not the architecture.** rattery costs
+0.1 ms more per animation frame and 0.5 to 1 ms more per input frame,
+which is the same ratatui code running under Cranelift instead of LLVM
+(1.3× to 1.8× on these workloads, as in the hover section). The parts
+rattery adds around it are small and constant: the cell diff and terminal
+write on the host are 10 to 70 µs, and the event hop through the host
+queue is what separates the input column from the frame column, 0.1 to
+0.3 ms.
+
+**The terminal is not the bottleneck.** Writing the changed cells to a
+pseudo-terminal costs nothing measurable at this size on either side; the
+in-memory and terminal rows agree to within noise. A slow terminal
+emulator would slow both equally, since rattery emits the same cells the
+native app does.
+
+To measure your own app: `rattery --stats` on a real terminal prints the
+input-to-frame figures for your own mouse and keyboard when the app
+exits; `--script` feeds it recorded input on a real terminal too, and
+`--stats-file` keeps the report when the terminal is a pty. `cargo xtask
+perf --work 10` renders each layout ten times per frame for a heavier
+UI; `--no-pty` skips the terminal rows.
+
 ## Mouse movement and hover
 
 `cargo xtask hover` measures the case that makes a TUI feel slow rather than

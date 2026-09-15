@@ -225,8 +225,10 @@ name = "bench-app"
 version = "0.4.2"
 dependencies = [
  "bytes",
+ "crossterm",
  "http",
  "http-body-util",
+ "ratatui",
  "rattery-app",
  "wasip3",
 ]

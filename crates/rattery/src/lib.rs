@@ -771,6 +771,8 @@ pub struct App {
     pub(crate) watch: bool,
     pub(crate) reload: ReloadPolicy,
     pub(crate) headless: Option<HeadlessOptions>,
+    pub(crate) script: Option<Script>,
+    pub(crate) timeout: Option<Duration>,
     pub(crate) limits: Limits,
     pub(crate) on_phase: Option<PhaseHook>,
     pub(crate) request_policy: Option<Arc<dyn RequestPolicy>>,
@@ -797,6 +799,8 @@ impl App {
             reload: ReloadPolicy::default(),
             handle: None,
             headless: None,
+            script: None,
+            timeout: None,
             limits: Limits::default(),
             on_phase: None,
             request_policy: None,
@@ -953,6 +957,22 @@ impl App {
     }
 
     /// Run without touching the real terminal; see [`HeadlessOptions`].
+    /// Feed the app scripted input on the real terminal too (demos,
+    /// benchmarks); the user's own input is delivered alongside. `resize`
+    /// and `snapshot` commands are skipped there. Headless runs take their
+    /// script from [`HeadlessOptions`].
+    pub fn script(mut self, script: Script) -> Self {
+        self.script = Some(script);
+        self
+    }
+
+    /// Stop the app after this long on the real terminal, reporting
+    /// [`AppStatus::TimedOut`]. Headless runs use [`HeadlessOptions`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     pub fn headless(mut self, options: HeadlessOptions) -> Self {
         self.headless = Some(options);
         self

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Benchmarks against native ratatui: `cargo xtask perf` runs the same
+  animation, click, drag, and hover workloads (`examples/bench`, shared by
+  the component and a native `bench-native` binary) natively and in
+  rattery, in memory and on a pseudo-terminal, reporting frame time,
+  input-to-frame latency, and animation cadence jitter. See `docs/perf.md`.
+- `Stats::input_latency` (and `input_latency_summary`): input-to-frame
+  latency samples, from an input event being queued to the end of the
+  first flush after the app read it. The example CLI prints them with
+  `--stats` and `--stats-file` keeps the report.
+- Scripted input and timeouts on a real terminal: `App::script`,
+  `App::timeout`; the CLI's `--script` and `--timeout` no longer require
+  `--headless`. Scripts gain `mouse down|up|drag X Y`.
 - `rattery-build` honours `RATTERY_BUILD_TARGET_DIR` for its nested wasm
   build, so a CI cache can keep it; the repository's CI builds the shim in
   a parallel, cached job.

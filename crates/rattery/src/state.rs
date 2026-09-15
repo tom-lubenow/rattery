@@ -460,8 +460,8 @@ impl storage::Host for HostState {
 impl<U> terminal::HostWithStore<U> for HasSelf<HostState> {
     async fn next_event(store: &Accessor<U, Self>) -> wasmtime::Result<Event> {
         let queue = store.with(|mut view| view.get().term.queue());
-        let event = queue.next().await;
-        store.with(|mut view| view.get().term.note_event());
+        let (event, queued_at) = queue.next().await;
+        store.with(|mut view| view.get().term.note_event(queued_at));
         Ok(event)
     }
 

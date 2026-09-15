@@ -10,6 +10,10 @@ description = "Rendering benchmark for rattery; run with `cargo xtask bench`"
 [dependencies]
 rattery-app = { workspace = true }
 
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+crossterm = "0.29"
+ratatui = { workspace = true, features = ["crossterm_0_29"] }
+
 [target.'cfg(target_os = "wasi")'.dependencies]
 wasip3 = { version = "0.8", features = ["http-compat"] }
 http = { workspace = true }

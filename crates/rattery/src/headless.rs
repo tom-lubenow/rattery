@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use ratatui::backend::{Backend, TestBackend};
 
 use crate::bindings::terminal::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind, Size,
 };
 use crate::terminal::{EventQueue, Screen};
@@ -44,6 +44,19 @@ pub enum ScriptCommand {
     Snapshot,
     /// A pointer movement to (column, row).
     MouseMove {
+        column: u16,
+        row: u16,
+    },
+    /// Left button pressed, released, or dragged at (column, row).
+    MouseDown {
+        column: u16,
+        row: u16,
+    },
+    MouseUp {
+        column: u16,
+        row: u16,
+    },
+    MouseDrag {
         column: u16,
         row: u16,
     },
@@ -114,13 +127,21 @@ fn parse_line(line: &str) -> Result<ScriptCommand> {
         "snapshot" => ScriptCommand::Snapshot,
         "update" => ScriptCommand::Update((!rest.is_empty()).then(|| rest.to_owned())),
         "mouse" => {
-            let (x, y) = rest
-                .strip_prefix("move")
-                .and_then(|r| r.trim().split_once(char::is_whitespace))
-                .context("expected `mouse move X Y`")?;
-            ScriptCommand::MouseMove {
-                column: x.trim().parse().context("bad column")?,
-                row: y.trim().parse().context("bad row")?,
+            let (kind, xy) = rest
+                .split_once(char::is_whitespace)
+                .context("expected `mouse move|down|up|drag X Y`")?;
+            let (x, y) = xy
+                .trim()
+                .split_once(char::is_whitespace)
+                .context("expected `mouse move|down|up|drag X Y`")?;
+            let column = x.trim().parse().context("bad column")?;
+            let row = y.trim().parse().context("bad row")?;
+            match kind {
+                "move" => ScriptCommand::MouseMove { column, row },
+                "down" => ScriptCommand::MouseDown { column, row },
+                "up" => ScriptCommand::MouseUp { column, row },
+                "drag" => ScriptCommand::MouseDrag { column, row },
+                other => bail!("unknown mouse action {other:?}"),
             }
         }
         "sweep" => {
@@ -197,9 +218,9 @@ fn key_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
     })
 }
 
-fn mouse_move(column: u16, row: u16) -> Event {
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
     Event::Mouse(MouseEvent {
-        kind: MouseEventKind::Moved,
+        kind,
         column,
         row,
         modifiers: KeyModifiers::empty(),
@@ -210,10 +231,12 @@ fn mouse_move(column: u16, row: u16) -> Event {
 pub async fn run_script(
     script: Script,
     queue: Arc<EventQueue>,
-    backend: Arc<Mutex<TestBackend>>,
+    backend: Option<Arc<Mutex<TestBackend>>>,
     snapshots: Arc<Mutex<Vec<Screen>>>,
     updates: Arc<std::sync::OnceLock<Arc<crate::update::Updates>>>,
 ) {
+    // On a real terminal (no test backend) resizes and snapshots are
+    // skipped; everything else is delivered like typed input.
     for command in script.0 {
         match command {
             ScriptCommand::Sleep(duration) => tokio::time::sleep(duration).await,
@@ -230,26 +253,50 @@ pub async fn run_script(
             }
             ScriptCommand::Paste(text) => queue.push(Event::Paste(text)),
             ScriptCommand::Resize { width, height } => {
-                backend.lock().unwrap().resize(width, height);
-                queue.push(Event::Resize(Size { width, height }));
+                if let Some(backend) = &backend {
+                    backend.lock().unwrap().resize(width, height);
+                    queue.push(Event::Resize(Size { width, height }));
+                }
             }
             ScriptCommand::Snapshot => {
-                let screen = Screen::from_backend(&backend.lock().unwrap());
-                snapshots.lock().unwrap().push(screen);
+                if let Some(backend) = &backend {
+                    let screen = Screen::from_backend(&backend.lock().unwrap());
+                    snapshots.lock().unwrap().push(screen);
+                }
             }
             ScriptCommand::Update(version) => {
                 if let Some(updates) = updates.get() {
                     updates.offer_same(version);
                 }
             }
-            ScriptCommand::MouseMove { column, row } => queue.push(mouse_move(column, row)),
+            ScriptCommand::MouseMove { column, row } => {
+                queue.push(mouse(MouseEventKind::Moved, column, row))
+            }
+            ScriptCommand::MouseDown { column, row } => {
+                queue.push(mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+            }
+            ScriptCommand::MouseUp { column, row } => {
+                queue.push(mouse(MouseEventKind::Up(MouseButton::Left), column, row))
+            }
+            ScriptCommand::MouseDrag { column, row } => {
+                queue.push(mouse(MouseEventKind::Drag(MouseButton::Left), column, row))
+            }
             ScriptCommand::Sweep { steps, interval } => {
-                let size = backend.lock().unwrap().size().unwrap_or_default();
+                let (width, height) = match &backend {
+                    Some(backend) => backend
+                        .lock()
+                        .unwrap()
+                        .size()
+                        .map(|s| (s.width, s.height))
+                        .unwrap_or_default(),
+                    None => crossterm::terminal::size().unwrap_or_default(),
+                };
                 for step in 0..steps {
                     let t = step as f64 / steps.max(1) as f64;
-                    queue.push(mouse_move(
-                        (t * size.width.saturating_sub(1) as f64) as u16,
-                        (t * size.height.saturating_sub(1) as f64) as u16,
+                    queue.push(mouse(
+                        MouseEventKind::Moved,
+                        (t * width.saturating_sub(1) as f64) as u16,
+                        (t * height.saturating_sub(1) as f64) as u16,
                     ));
                     tokio::time::sleep(interval).await;
                 }
@@ -265,7 +312,7 @@ mod tests {
     #[test]
     fn parses_commands() {
         let script = Script::parse(
-            "# comment\nsleep 250\nkey ctrl-c\nkey Q\nkey f12\nkey -\ntype hi\nresize 100 30\nsnapshot\nmouse move 3 4\nsweep 10 5\nupdate v2\n",
+            "# comment\nsleep 250\nkey ctrl-c\nkey Q\nkey f12\nkey -\ntype hi\nresize 100 30\nsnapshot\nmouse move 3 4\nmouse down 1 2\nmouse drag 2 2\nmouse up 2 2\nsweep 10 5\nupdate v2\n",
         )
         .unwrap();
         assert_eq!(
@@ -295,6 +342,9 @@ mod tests {
                 },
                 ScriptCommand::Snapshot,
                 ScriptCommand::MouseMove { column: 3, row: 4 },
+                ScriptCommand::MouseDown { column: 1, row: 2 },
+                ScriptCommand::MouseDrag { column: 2, row: 2 },
+                ScriptCommand::MouseUp { column: 2, row: 2 },
                 ScriptCommand::Sweep {
                     steps: 10,
                     interval: Duration::from_millis(5),

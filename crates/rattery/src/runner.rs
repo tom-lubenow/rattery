@@ -163,6 +163,22 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
                 limits.paste_bytes,
                 &mut tasks,
             );
+            if let Some(script) = &app.script {
+                tasks.spawn(headless::run_script(
+                    script.clone(),
+                    term.queue(),
+                    None,
+                    term.snapshots(),
+                    updates_slot.clone(),
+                ));
+            }
+            if let Some(timeout) = app.timeout {
+                let interrupter = interrupter.clone();
+                tasks.spawn(async move {
+                    tokio::time::sleep(timeout).await;
+                    interrupter.fire(Interrupt::Timeout);
+                });
+            }
             (Some(session), term)
         }
         Some(options) => {
@@ -181,7 +197,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
             tasks.spawn(headless::run_script(
                 options.script.clone(),
                 term.queue(),
-                backend,
+                Some(backend),
                 term.snapshots(),
                 updates_slot.clone(),
             ));

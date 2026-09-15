@@ -10,10 +10,11 @@
 //!   to measure request latency through the host (needs `--origin`).
 //! - `evil`: tries to inject escape sequences through cells, the title, and
 //!   stdout, then exits; the host must contain all of it.
-//! - `hover`: a tiled layout that highlights the tile under the pointer and
-//!   redraws on every event, the way a tiling widget library does; feed it
-//!   mouse movement (`sweep` in a headless script) and it reports how many
-//!   events it saw and how many frames it drew, until `q`.
+//! - `hover`, `click`, `drag`: the interactive workloads in `workloads.rs`,
+//!   redrawn on every input event until `q`; per-frame timings reported.
+//!   Feed them a script (`bench-native --emit-script`, or `sweep`).
+//! - `anim`: the animated dashboard, `frames` frames back to back, or one
+//!   per `cadence` milliseconds with the interval jitter reported.
 //! - `storage`: exercises origin-scoped storage and logging: bumps a run
 //!   counter, tries to exceed the quota, logs a record with an escape sequence
 //!   in it, then floods the log to hit the rate limit.
@@ -37,6 +38,8 @@ mod bench {
         /// Call `reload()` after the frames instead of exiting: a guest that
         /// tries to outlive its CPU budget by restarting.
         reload: bool,
+        /// `anim`: milliseconds between frame starts (0: back to back).
+        cadence: u64,
     }
 
     fn params() -> Params {
@@ -45,6 +48,7 @@ mod bench {
             mode: "full".into(),
             work: 1,
             reload: false,
+            cadence: 0,
         };
         if let Some(location) = rattery_app::location()
             && let Some((_, query)) = location.split_once('?')
@@ -55,6 +59,7 @@ mod bench {
                     Some(("mode", m)) => params.mode = m.to_owned(),
                     Some(("work", n)) => params.work = n.parse().unwrap_or(1).max(1),
                     Some(("reload", v)) => params.reload = v == "1",
+                    Some(("cadence", n)) => params.cadence = n.parse().unwrap_or(0),
                     _ => {}
                 }
             }
@@ -136,63 +141,101 @@ mod bench {
         Ok(())
     }
 
+    /// The interactive workloads and the animation. Frame time is measured
+    /// in the guest around `terminal.draw`, which includes the boundary
+    /// crossing and the host's own draw and flush.
+    async fn workloads(
+        mut terminal: Terminal,
+        mode: bench_app::workloads::Mode,
+        frames: usize,
+        work: usize,
+        cadence: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use bench_app::workloads::{Input, Mode, Workload, summary};
+        use rattery_app::event;
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let mut w = Workload::new(mode, work, size.width);
+        let mut frame_times = Vec::new();
+        if mode == Mode::Anim {
+            let cadence = (cadence > 0).then(|| std::time::Duration::from_millis(cadence));
+            let mut intervals = Vec::new();
+            let started = Instant::now();
+            let mut last_start = None;
+            for i in 0..frames {
+                let start = Instant::now();
+                if let Some(last) = last_start {
+                    intervals.push(start - last);
+                }
+                last_start = Some(start);
+                w.tick();
+                terminal.draw(|f| w.render(f))?;
+                frame_times.push(start.elapsed());
+                if let Some(cadence) = cadence {
+                    let next = started + cadence * (i as u32 + 1);
+                    if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                        rattery_app::time::sleep(wait).await;
+                    }
+                }
+            }
+            let late = cadence.map_or(0, |c| intervals.iter().filter(|d| **d > c + c / 2).count());
+            println!(
+                "bench mode=anim cadence_ms={} work={work} frames={} {} {} late={late} total_ms={:.1}",
+                cadence.map_or(0, |c| c.as_millis() as u64),
+                frame_times.len(),
+                summary("frame", &mut frame_times),
+                summary("interval", &mut intervals),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            return Ok(());
+        }
+        let mut events = 0usize;
+        terminal.draw(|f| w.render(f))?;
+        loop {
+            let input = match event::next().await {
+                Event::Mouse(m) => {
+                    use rattery_app::event::MouseEventKind as K;
+                    match m.kind {
+                        K::Moved => Input::Move(m.column, m.row),
+                        K::Down(_) => Input::Down(m.column, m.row),
+                        K::Up(_) => Input::Up(m.column, m.row),
+                        K::Drag(_) => Input::Drag(m.column, m.row),
+                        _ => continue,
+                    }
+                }
+                Event::Key(k) if k.code == KeyCode::Char('q') => break,
+                _ => continue,
+            };
+            events += 1;
+            let t = Instant::now();
+            w.apply(input, area);
+            w.tick();
+            terminal.draw(|f| w.render(f))?;
+            frame_times.push(t.elapsed());
+        }
+        println!(
+            "bench mode={} work={work} frames={} events={events} toggles={} {}",
+            mode.name(),
+            frame_times.len(),
+            w.toggles,
+            summary("frame", &mut frame_times)
+        );
+        Ok(())
+    }
+
     pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn std::error::Error>> {
         let Params {
             frames,
             mode,
             work,
             reload,
+            cadence,
         } = params();
+        if let Some(workload) = bench_app::workloads::Mode::parse(&mode) {
+            return workloads(terminal, workload, frames, work, cadence).await;
+        }
         if mode == "http" {
             return http_bench(frames).await;
-        }
-        if mode == "hover" {
-            use bench_app::hover::Tiles;
-            use rattery_app::event;
-            let mut hover = None;
-            let mut events = 0usize;
-            let mut mouse_events = 0usize;
-            let mut durations = Vec::new();
-            let mut frame = 0usize;
-            loop {
-                let t = Instant::now();
-                terminal.draw(|f| {
-                    for _ in 1..work {
-                        // Rendered and discarded: the cost without the cells.
-                        let mut scratch = f.buffer_mut().clone();
-                        rattery_app::ratatui::widgets::Widget::render(
-                            Tiles { hover, frame },
-                            f.area(),
-                            &mut scratch,
-                        );
-                    }
-                    f.render_widget(Tiles { hover, frame }, f.area())
-                })?;
-                durations.push(t.elapsed());
-                frame += 1;
-                match event::next().await {
-                    Event::Mouse(m) => {
-                        events += 1;
-                        mouse_events += 1;
-                        hover = Some((m.column, m.row));
-                    }
-                    Event::Key(k) if k.code == KeyCode::Char('q') => break,
-                    _ => events += 1,
-                }
-            }
-            durations.sort();
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-            let pct = |p: f64| durations[((durations.len() - 1) as f64 * p) as usize];
-            let total: std::time::Duration = durations.iter().sum();
-            println!(
-                "bench mode=hover work={work} frames={frame} events={events} mouse_events={mouse_events} avg_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} draw_total_ms={:.1}",
-                ms(total / frame.max(1) as u32),
-                ms(pct(0.5)),
-                ms(pct(0.95)),
-                ms(*durations.last().unwrap()),
-                ms(total)
-            );
-            return Ok(());
         }
         if mode == "storage" {
             use rattery_app::storage;

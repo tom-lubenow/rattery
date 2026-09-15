@@ -40,6 +40,27 @@ enum Task {
         #[arg(long, default_value_t = 5)]
         interval: u64,
     },
+    /// Native ratatui against rattery on the interactive workloads
+    /// (animation, clicks, drags, hover): frame time, input-to-frame
+    /// latency, animation cadence jitter; on an in-memory backend and on a
+    /// real pseudo-terminal. See docs/perf.md.
+    Perf {
+        /// Input events per interactive run.
+        #[arg(long, default_value_t = 200)]
+        events: usize,
+        /// Milliseconds between input events.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Frames per animation run.
+        #[arg(long, default_value_t = 300)]
+        frames: usize,
+        /// Layout renders per frame, to stand in for a heavier UI.
+        #[arg(long, default_value_t = 1)]
+        work: usize,
+        /// Skip the pseudo-terminal runs (they need `script` from util-linux).
+        #[arg(long)]
+        no_pty: bool,
+    },
     /// Build, serve, watch, rebuild. Run `rattery --watch <url>` next to it.
     Dev {
         /// The app package to build for wasm32-wasip2.
@@ -59,6 +80,13 @@ fn main() -> Result<()> {
         Task::Dev { app, server, bind } => dev(&app, &server, &bind),
         Task::Bench { frames } => bench(frames),
         Task::Hover { steps, interval } => hover(steps, interval),
+        Task::Perf {
+            events,
+            interval,
+            frames,
+            work,
+            no_pty,
+        } => perf(events, interval, frames, work, !no_pty),
     }
 }
 
@@ -353,6 +381,244 @@ fn hover(steps: usize, interval: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One row of the perf table.
+struct Row {
+    name: String,
+    frames: String,
+    frame_avg: String,
+    frame_p95: String,
+    latency_avg: String,
+    latency_p95: String,
+    extra: String,
+}
+
+impl Row {
+    fn print(&self) {
+        println!(
+            "{:<32} {:>6} {:>9} {:>9} {:>9} {:>9}   {}",
+            self.name,
+            self.frames,
+            self.frame_avg,
+            self.frame_p95,
+            self.latency_avg,
+            self.latency_p95,
+            self.extra
+        );
+    }
+}
+
+fn perf(events: usize, interval: u64, frames: usize, work: usize, pty: bool) -> Result<()> {
+    let root = root();
+    for args in [
+        &[
+            "build",
+            "-p",
+            "bench-app",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+        ][..],
+        &["build", "-p", "rattery-cli", "-p", "bench-app", "--release"],
+    ] {
+        if !cargo(args)? {
+            bail!("build failed: cargo {}", args.join(" "));
+        }
+    }
+    let pty = pty
+        && Command::new("script")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    let native = root.join("target/release/bench-native");
+    let host = root.join("target/release/rattery");
+    let app = root.join("target/wasm32-wasip2/release/bench-app.wasm");
+    let scratch = root.join("target/perf");
+    std::fs::create_dir_all(&scratch)?;
+    let size = "200x50";
+
+    let heading = format!("workload / runner ({size})");
+    println!();
+    println!(
+        "{heading:<32} {:>6} {:>9} {:>9} {:>9} {:>9}   animation: interval p95, late frames",
+        "frames", "frame avg", "frame p95", "input avg", "input p95"
+    );
+    let runners: Vec<(&str, bool, bool)> = if pty {
+        vec![
+            ("native, in memory", false, false),
+            ("native, terminal", false, true),
+            ("rattery, in memory", true, false),
+            ("rattery, terminal", true, true),
+        ]
+    } else {
+        vec![
+            ("native, in memory", false, false),
+            ("rattery, in memory", true, false),
+        ]
+    };
+    let workloads: Vec<(&str, Option<u64>)> = vec![
+        ("anim", None),
+        ("anim", Some(16)),
+        ("click", None),
+        ("drag", None),
+        ("hover", None),
+    ];
+    for (mode, cadence) in &workloads {
+        let label = match cadence {
+            Some(ms) => format!("{mode} @ {ms} ms"),
+            None => mode.to_string(),
+        };
+        println!("{label}");
+        let script = scratch.join(format!("{mode}.txt"));
+        if *mode != "anim" {
+            let status = Command::new(&native)
+                .args(["--mode", mode, "--size", size, "--events"])
+                .arg(events.to_string())
+                .arg("--interval")
+                .arg(interval.to_string())
+                .arg("--emit-script")
+                .arg(&script)
+                .status()?;
+            if !status.success() {
+                bail!("bench-native could not write the script");
+            }
+        }
+        for (runner, rattery, terminal) in &runners {
+            let out = scratch.join("out.txt");
+            let _ = std::fs::remove_file(&out);
+            let mut cmd: Vec<String> = Vec::new();
+            if *rattery {
+                cmd.push(host.display().to_string());
+                if !*terminal {
+                    cmd.extend(["--headless".into(), size.into()]);
+                }
+                cmd.extend([
+                    "--stats".into(),
+                    "--stats-file".into(),
+                    out.display().to_string(),
+                    "--timeout".into(),
+                    "120".into(),
+                    "--no-cookies".into(),
+                ]);
+                if *mode != "anim" {
+                    cmd.extend(["--script".into(), script.display().to_string()]);
+                }
+                let query = match cadence {
+                    Some(ms) => format!("mode=anim&frames={frames}&cadence={ms}&work={work}"),
+                    None if *mode == "anim" => format!("mode=anim&frames={frames}&work={work}"),
+                    None => format!("mode={mode}&work={work}"),
+                };
+                cmd.extend([
+                    "--location".into(),
+                    format!("bench://local/app.wasm?{query}"),
+                    app.display().to_string(),
+                ]);
+            } else {
+                cmd.push(native.display().to_string());
+                cmd.extend([
+                    "--mode".into(),
+                    mode.to_string(),
+                    "--size".into(),
+                    size.into(),
+                ]);
+                cmd.extend(["--events".into(), events.to_string()]);
+                cmd.extend(["--interval".into(), interval.to_string()]);
+                cmd.extend(["--frames".into(), frames.to_string()]);
+                cmd.extend(["--work".into(), work.to_string()]);
+                if let Some(ms) = cadence {
+                    cmd.extend(["--cadence".into(), ms.to_string()]);
+                }
+                cmd.extend(["--out".into(), out.display().to_string()]);
+                if *terminal {
+                    cmd.extend(["--backend".into(), "terminal".into()]);
+                }
+            }
+            let status = if *terminal {
+                // A pseudo-terminal of the benchmark size; its output is
+                // consumed and discarded, as a terminal that keeps up would.
+                let (cols, rows) = size.split_once('x').unwrap();
+                let shell = format!(
+                    "stty cols {cols} rows {rows}; {}",
+                    cmd.iter()
+                        .map(|a| shell_quote(a))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                // stdin stays open: at end-of-file `script` would send a
+                // Ctrl-D into the pty, an input event the app never draws
+                // for, which would be charged to the first real frame.
+                let mut child = Command::new("script")
+                    .args(["-qec", &shell, "/dev/null"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                let stdin = child.stdin.take();
+                let status = child.wait()?;
+                drop(stdin);
+                status
+            } else {
+                Command::new(&cmd[0])
+                    .args(&cmd[1..])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?
+            };
+            let text = std::fs::read_to_string(&out).unwrap_or_default();
+            let line = text
+                .lines()
+                .find(|l| l.starts_with("bench ") || l.starts_with("native "))
+                .unwrap_or("");
+            if !status.success() || line.is_empty() {
+                println!("  {runner:<30} failed");
+                continue;
+            }
+            let (latency_avg, latency_p95) = if *rattery {
+                let host_line = text
+                    .lines()
+                    .find_map(|l| l.trim_start().strip_prefix("input to frame: "))
+                    .unwrap_or("");
+                let after = |key: &str| {
+                    host_line
+                        .split_once(&format!("{key} "))
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .map(|v| v.trim_end_matches("ms").to_owned())
+                        .unwrap_or_else(|| "-".into())
+                };
+                (after("avg"), after("p95"))
+            } else {
+                (field(line, "latency_avg_ms"), field(line, "latency_p95_ms"))
+            };
+            let extra = if *mode == "anim" && cadence.is_some() {
+                format!(
+                    "interval p95 {} ms, late {}",
+                    field(line, "interval_p95_ms"),
+                    field(line, "late")
+                )
+            } else {
+                String::new()
+            };
+            let anim = *mode == "anim";
+            Row {
+                name: format!("  {runner}"),
+                frames: field(line, "frames"),
+                frame_avg: field(line, "frame_avg_ms"),
+                frame_p95: field(line, "frame_p95_ms"),
+                latency_avg: if anim { "-".into() } else { latency_avg },
+                latency_p95: if anim { "-".into() } else { latency_p95 },
+                extra,
+            }
+            .print();
+        }
+    }
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn field(line: &str, key: &str) -> String {

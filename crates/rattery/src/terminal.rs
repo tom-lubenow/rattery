@@ -290,7 +290,9 @@ impl KillDetector {
 /// Events queued for the guest, bounded: when the app does not read, the
 /// oldest events are dropped rather than the queue growing.
 pub struct EventQueue {
-    events: Mutex<VecDeque<Event>>,
+    /// Each event with the time it was queued, for key, mouse, and paste
+    /// events: the ones whose latency to the screen a user feels.
+    events: Mutex<VecDeque<(Event, Option<Instant>)>>,
     capacity: usize,
     paste_bytes: usize,
     /// Merge a pointer movement or resize into an unconsumed one of the
@@ -341,14 +343,16 @@ impl EventQueue {
         self.kill.lock().unwrap().observe(&event);
         let now = Instant::now();
         *self.last_push.lock().unwrap() = Some(now);
-        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
+        let is_input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
+        if is_input {
             *self.last_input.lock().unwrap() = Some(now);
         }
         let mut events = self.events.lock().unwrap();
         if self.coalesce.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(last) = events.back_mut()
+            && let Some((last, _)) = events.back_mut()
             && same_position_kind(last, &event)
         {
+            // The older timestamp stays: the pointer has been waiting since.
             *last = event;
             self.coalesced
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -356,7 +360,7 @@ impl EventQueue {
             if events.len() >= self.capacity {
                 events.pop_front();
             }
-            events.push_back(event);
+            events.push_back((event, is_input.then_some(now)));
         }
         drop(events);
         self.notify.notify_one();
@@ -395,23 +399,32 @@ impl EventQueue {
         self.coalesced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     fn drain(&self) -> Vec<Event> {
-        let mut events: Vec<Event> = self.events.lock().unwrap().drain(..).collect();
+        self.drain_timed().into_iter().map(|(e, _)| e).collect()
+    }
+
+    /// Every queued event with the time it was queued (none for the sticky
+    /// update flag).
+    pub fn drain_timed(&self) -> Vec<(Event, Option<Instant>)> {
+        let mut events: Vec<(Event, Option<Instant>)> =
+            self.events.lock().unwrap().drain(..).collect();
         if self.take_update_changed() {
-            events.push(Event::UpdateChanged);
+            events.push((Event::UpdateChanged, None));
         }
         events
     }
 
-    /// Wait for the next event. Backs `terminal.next-event`.
-    pub async fn next(&self) -> Event {
+    /// Wait for the next event and the time it was queued. Backs
+    /// `terminal.next-event`.
+    pub async fn next(&self) -> (Event, Option<Instant>) {
         loop {
             let notified = self.notify.notified();
-            if let Some(event) = self.events.lock().unwrap().pop_front() {
-                return event;
+            if let Some(entry) = self.events.lock().unwrap().pop_front() {
+                return entry;
             }
             if self.take_update_changed() {
-                return Event::UpdateChanged;
+                return (Event::UpdateChanged, None);
             }
             notified.await;
         }
@@ -467,6 +480,30 @@ pub struct Stats {
     pub logs: u64,
     /// Log records dropped by the rate limit.
     pub logs_dropped: u64,
+    /// Input-to-frame latency samples: from an input event being queued to
+    /// the end of the first flush after the app read it. What the user
+    /// feels between acting and seeing the result. At most 65536 kept.
+    pub input_latency: Vec<Duration>,
+}
+
+impl Stats {
+    /// Average, median, 95th percentile, and maximum of
+    /// [`input_latency`](Stats::input_latency), if any.
+    pub fn input_latency_summary(&self) -> Option<(Duration, Duration, Duration, Duration)> {
+        if self.input_latency.is_empty() {
+            return None;
+        }
+        let mut sorted = self.input_latency.clone();
+        sorted.sort();
+        let pct = |p: f64| sorted[((sorted.len() - 1) as f64 * p) as usize];
+        let total: Duration = sorted.iter().sum();
+        Some((
+            total / sorted.len() as u32,
+            pct(0.5),
+            pct(0.95),
+            *sorted.last().unwrap(),
+        ))
+    }
 }
 
 /// The text of a headless screen.
@@ -552,6 +589,8 @@ pub struct TerminalHost {
     ready_reported: bool,
     /// Sliding one-second window for the log rate limit.
     log_window: (Instant, usize),
+    /// The oldest input the app has read but not yet shown (no flush since).
+    latency_start: Option<Instant>,
 }
 
 impl TerminalHost {
@@ -577,6 +616,7 @@ impl TerminalHost {
             on_phase: None,
             ready_reported: false,
             log_window: (Instant::now(), 0),
+            latency_start: None,
         }
     }
 
@@ -601,6 +641,7 @@ impl TerminalHost {
             on_phase: None,
             ready_reported: false,
             log_window: (Instant::now(), 0),
+            latency_start: None,
         }
     }
 
@@ -744,6 +785,12 @@ impl TerminalHost {
         let result = with_backend!(self, |b| Backend::flush(b));
         self.stats.flushes += 1;
         self.stats.flush_time += t.elapsed();
+        if result.is_ok()
+            && let Some(start) = self.latency_start.take()
+            && self.stats.input_latency.len() < 1 << 16
+        {
+            self.stats.input_latency.push(start.elapsed());
+        }
         if result.is_ok() && self.stats.first_draw.is_some() && !self.ready_reported {
             self.ready_reported = true;
             if let Some(hook) = &self.on_phase {
@@ -778,14 +825,25 @@ impl TerminalHost {
     }
 
     pub fn drain_events(&mut self) -> Vec<Event> {
-        let events = self.queue.drain();
+        let events = self.queue.drain_timed();
         self.stats.events += events.len() as u64;
-        events
+        for (_, at) in &events {
+            self.note_read(*at);
+        }
+        events.into_iter().map(|(e, _)| e).collect()
+    }
+
+    /// The app read an event queued at `at`: the next flush shows it.
+    fn note_read(&mut self, at: Option<Instant>) {
+        if let Some(at) = at {
+            self.latency_start = Some(self.latency_start.map_or(at, |s| s.min(at)));
+        }
     }
 
     /// Count an event delivered through `next-event`.
-    pub fn note_event(&mut self) {
+    pub fn note_event(&mut self, queued_at: Option<Instant>) {
         self.stats.events += 1;
+        self.note_read(queued_at);
     }
 
     /// A log record from the app: sanitised, bounded, rate limited, and
@@ -989,6 +1047,35 @@ mod tests {
             [Phase::Ready],
             "ready once, after the flush"
         );
+    }
+
+    #[test]
+    fn input_latency_runs_from_queueing_to_the_next_flush_after_the_read() {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let mut host = host(phases);
+        let queue = host.queue();
+        // A resize is not input: no sample.
+        queue.push(Event::Resize(Size {
+            width: 80,
+            height: 24,
+        }));
+        host.drain_events();
+        host.draw(&[update(0, 0)]).unwrap();
+        host.flush().unwrap();
+        assert!(host.stats().input_latency.is_empty());
+        // Two inputs read together: one sample, from the older one.
+        queue.push(mouse(MouseEventKind::Down(MouseButton::Left), 1));
+        std::thread::sleep(Duration::from_millis(5));
+        queue.push(mouse(MouseEventKind::Up(MouseButton::Left), 1));
+        host.drain_events();
+        host.draw(&[update(1, 1)]).unwrap();
+        host.flush().unwrap();
+        // A flush with nothing read since: no sample.
+        host.flush().unwrap();
+        let stats = host.stats();
+        assert_eq!(stats.input_latency.len(), 1, "{:?}", stats.input_latency);
+        assert!(stats.input_latency[0] >= Duration::from_millis(5));
+        assert!(stats.input_latency_summary().is_some());
     }
 
     #[test]
