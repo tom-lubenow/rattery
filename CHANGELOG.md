@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.3 (2026-09-15)
 
 - Benchmarks against native ratatui: `cargo xtask perf` runs the same
   animation, click, drag, and hover workloads (`examples/bench`, shared by
