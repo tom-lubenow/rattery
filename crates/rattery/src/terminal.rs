@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, EventStream,
@@ -25,7 +26,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::bindings::terminal::{
-    CellUpdate, ClearType, Event, KeyCode, KeyEventKind, KeyModifiers, Position, Size, WindowSize,
+    CellUpdate, ClearType, ClipboardError, Event, KeyCode, KeyEventKind, KeyModifiers, Position,
+    Size, WindowSize,
 };
 use crate::{Phase, convert, sanitize};
 
@@ -579,6 +581,8 @@ pub type PhaseHook = Arc<dyn Fn(Phase) + Send + Sync>;
 
 pub struct TerminalHost {
     output: Output,
+    clipboard_enabled: bool,
+    clipboard: Option<String>,
     queue: Arc<EventQueue>,
     origin: Option<String>,
     location: Option<String>,
@@ -607,6 +611,8 @@ impl TerminalHost {
         tasks.spawn(read_input(queue.clone()));
         Self {
             output: Output::Crossterm(CrosstermBackend::new(io::stdout())),
+            clipboard_enabled: true,
+            clipboard: None,
             queue,
             origin,
             location,
@@ -632,6 +638,8 @@ impl TerminalHost {
     ) -> Self {
         Self {
             output: Output::Test(Arc::new(Mutex::new(TestBackend::new(width, height)))),
+            clipboard_enabled: true,
+            clipboard: None,
             queue: Arc::new(EventQueue::new(interrupter, queue_capacity, paste_bytes)),
             origin,
             location,
@@ -647,6 +655,35 @@ impl TerminalHost {
 
     pub fn set_phase_hook(&mut self, hook: Option<PhaseHook>) {
         self.on_phase = hook;
+    }
+
+    pub fn set_clipboard_enabled(&mut self, yes: bool) {
+        self.clipboard_enabled = yes;
+    }
+
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
+    }
+
+    /// Only this typed operation may emit OSC 52. Check the policy and byte
+    /// bound before encoding or replacing the headless clipboard.
+    pub fn copy_to_clipboard(
+        &mut self,
+        text: String,
+        limits: &crate::Limits,
+    ) -> Result<(), ClipboardError> {
+        if !self.clipboard_enabled {
+            return Err(ClipboardError::Disabled);
+        }
+        if text.len() > limits.clipboard_bytes {
+            return Err(ClipboardError::TooLarge);
+        }
+        match &self.output {
+            Output::Crossterm(_) => write_clipboard(&mut io::stdout().lock(), &text)
+                .map_err(|err| ClipboardError::Io(err.to_string()))?,
+            Output::Test(_) => self.clipboard = Some(text),
+        }
+        Ok(())
     }
 
     /// Counters since the terminal was opened.
@@ -893,6 +930,12 @@ impl TerminalHost {
     }
 }
 
+/// Crossterm base64-encodes the payload and selects only the system
+/// clipboard. Flush immediately so copying does not depend on a redraw.
+fn write_clipboard(out: &mut impl Write, text: &str) -> io::Result<()> {
+    execute!(out, CopyToClipboard::to_clipboard_from(text))
+}
+
 async fn read_input(queue: Arc<EventQueue>) {
     let mut stream = EventStream::new();
     while let Some(item) = stream.next().await {
@@ -1023,6 +1066,99 @@ mod tests {
                 underline_color: Color::Reset,
                 modifier: Modifier::empty(),
             },
+        }
+    }
+
+    #[test]
+    fn clipboard_copies_are_bounded_and_refused_writes_preserve_the_last_copy() {
+        let mut host = host(Arc::default());
+        let limits = crate::Limits {
+            clipboard_bytes: 4,
+            ..crate::Limits::default()
+        };
+        assert_eq!(host.take_clipboard(), None);
+        host.copy_to_clipboard("🐀".into(), &limits).unwrap();
+        assert_eq!(
+            host.copy_to_clipboard("🐀x".into(), &limits),
+            Err(ClipboardError::TooLarge),
+        );
+        host.set_clipboard_enabled(false);
+        assert_eq!(
+            host.copy_to_clipboard("".into(), &limits),
+            Err(ClipboardError::Disabled),
+        );
+        assert_eq!(host.take_clipboard().as_deref(), Some("🐀"));
+
+        host.set_clipboard_enabled(true);
+        host.copy_to_clipboard("old".into(), &limits).unwrap();
+        host.copy_to_clipboard("".into(), &limits).unwrap();
+        assert_eq!(host.take_clipboard().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn clipboard_text_is_preserved_across_a_headless_reload() {
+        let mut host = host(Arc::default());
+        let text = "line one\n🐀\t\x1b]52;c;?\x07";
+        host.copy_to_clipboard(text.into(), &crate::Limits::default())
+            .unwrap();
+        host.reset().unwrap();
+        host.mark_started();
+        assert_eq!(host.take_clipboard().as_deref(), Some(text));
+    }
+
+    #[test]
+    fn clipboard_emits_only_base64_in_one_osc52_command_and_flushes() {
+        #[derive(Default)]
+        struct Output {
+            bytes: Vec<u8>,
+            flushed: bool,
+        }
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                Ok(())
+            }
+        }
+        for (text, encoded) in [
+            ("hello", "aGVsbG8="),
+            ("🐀\n", "8J+QgAo="),
+            ("\x1b]52;c;?\x07", "G101MjtjOz8H"),
+            ("", ""),
+        ] {
+            let mut output = Output::default();
+            write_clipboard(&mut output, text).unwrap();
+            assert_eq!(
+                output.bytes,
+                format!("\x1b]52;c;{encoded}\x1b\\").as_bytes()
+            );
+            assert!(output.flushed, "copy must not wait for the next frame");
+        }
+    }
+
+    #[test]
+    fn clipboard_output_errors_are_returned() {
+        struct FailingOutput {
+            fail_on_flush: bool,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for fail_on_flush in [false, true] {
+            let error = write_clipboard(&mut FailingOutput { fail_on_flush }, "text").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         }
     }
 

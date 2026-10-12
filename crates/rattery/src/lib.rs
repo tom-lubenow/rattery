@@ -112,7 +112,7 @@ pub use update::{Offer, Rejection, VERSION_HEADER as APP_VERSION_HEADER};
 /// It names the WIT package version of the terminal and websocket
 /// interfaces, the component-model async ABI, and the WASI HTTP version the
 /// guest runtime uses. Any change to these is a new identifier.
-pub const ABI: &str = "rattery:tui@0.4.0;cm-async;wasi:http@0.3.0";
+pub const ABI: &str = "rattery:tui@0.5.0;cm-async;wasi:http@0.3.0";
 
 /// The request header sent with every component fetch, carrying [`ABI`], so
 /// a server can serve the build that matches the host or answer
@@ -320,6 +320,8 @@ pub struct Limits {
     pub guest_output_bytes: usize,
     /// Longest paste event delivered to the app; longer ones are cut.
     pub paste_bytes: usize,
+    /// Largest clipboard write in UTF-8 bytes, before base64 encoding.
+    pub clipboard_bytes: usize,
     /// Longest error or trap message kept from the app.
     pub message_bytes: usize,
     /// Host resources (streams, requests, sockets, bodies) the app may hold
@@ -360,6 +362,7 @@ impl Default for Limits {
             response_body_bytes: 64 << 20,
             guest_output_bytes: 1 << 20,
             paste_bytes: 1 << 20,
+            clipboard_bytes: 64 << 10,
             message_bytes: 16 << 10,
             resources: 4096,
             storage_bytes: 5 << 20,
@@ -398,6 +401,7 @@ impl Limits {
             ("request_body_bytes", self.request_body_bytes),
             ("response_body_bytes", self.response_body_bytes),
             ("guest_output_bytes", self.guest_output_bytes),
+            ("clipboard_bytes", self.clipboard_bytes),
             ("message_bytes", self.message_bytes),
             ("resources", self.resources),
             ("storage_bytes", self.storage_bytes),
@@ -686,8 +690,8 @@ pub enum AppStatus {
 
 /// What happened while the app ran.
 ///
-/// `stdout`, `stderr`, and a trap message are guest-controlled text: print
-/// them through [`sanitize::text`], never verbatim.
+/// `stdout`, `stderr`, `clipboard`, and a trap message are guest-controlled
+/// text: print them through [`sanitize::text`], never verbatim.
 #[derive(Debug, Clone)]
 pub struct Report {
     pub status: AppStatus,
@@ -699,6 +703,10 @@ pub struct Report {
     pub snapshots: Vec<Screen>,
     /// The screen when the app ended (headless only).
     pub final_screen: Option<Screen>,
+    /// Last successful clipboard copy (headless only). `None` means no
+    /// copy; `Some("")` means the app cleared it. Raw, unsanitised text.
+    /// The real clipboard is never touched in headless mode.
+    pub clipboard: Option<String>,
     /// Phase timings.
     pub timings: Timings,
     /// Terminal counters from the last run of the app.
@@ -762,6 +770,7 @@ pub struct App {
     pub(crate) allow_origins: Vec<String>,
     pub(crate) allow_all_origins: bool,
     pub(crate) mouse: bool,
+    pub(crate) clipboard: bool,
     pub(crate) coalesce_input: bool,
     pub(crate) cache: bool,
     pub(crate) env: Vec<(String, String)>,
@@ -789,6 +798,7 @@ impl App {
             allow_origins: Vec::new(),
             allow_all_origins: false,
             mouse: true,
+            clipboard: true,
             coalesce_input: true,
             cache: true,
             env: Vec::new(),
@@ -899,6 +909,16 @@ impl App {
 
     pub fn mouse(mut self, yes: bool) -> Self {
         self.mouse = yes;
+        self
+    }
+
+    /// Allow the app to write the system clipboard using OSC 52 (default:
+    /// yes). Clipboard reads are never exposed. The terminal must support
+    /// and allow OSC 52; the host cannot confirm it accepted a copy.
+    /// Headless runs keep the last copy in [`Report::clipboard`] instead.
+    /// Writes are bounded by [`Limits::clipboard_bytes`].
+    pub fn clipboard(mut self, yes: bool) -> Self {
+        self.clipboard = yes;
         self
     }
 
@@ -1097,5 +1117,10 @@ mod limit_tests {
             ..Limits::default()
         };
         assert!(zero.validate().is_err());
+        let no_clipboard_capacity = Limits {
+            clipboard_bytes: 0,
+            ..Limits::default()
+        };
+        assert!(no_clipboard_capacity.validate().is_err());
     }
 }

@@ -5,8 +5,8 @@ What a rattery host promises about the app it runs, and what it does not.
 ## The app is untrusted
 
 Everything an app does reaches the outside world through the host. The host
-treats the app the way a browser treats a page: it may draw, read input, keep
-state on the server it came from, and nothing else.
+treats the app the way a browser treats a page: it may draw, read input, copy
+text to the clipboard, and keep state through the host's scoped APIs.
 
 **No ambient capabilities.** The component is linked against the terminal
 interface, a clock, randomness, and `wasi:http`. No filesystem preopens, no
@@ -23,6 +23,17 @@ message are kept raw in the `Report`, and `sanitize::text` renders them with
 every control character shown as an escape; embedders must print them through
 it, as `examples/rattery-cli` does. The counters in `Stats::cells_rejected`
 show when an app tried.
+
+**Clipboard.** A typed `copy-to-clipboard` call writes the system clipboard
+using OSC 52. The host selects the clipboard and base64-encodes the entire
+payload, so embedded control characters remain data. Each copy is bounded
+by `Limits::clipboard_bytes` before encoding (64 KiB by default). Writes are
+enabled by default and do not require a recent input event; embedders can
+refuse all writes with `App::clipboard(false)` (`--no-clipboard` in the CLI).
+The app cannot query the clipboard. The terminal and any multiplexer must
+allow OSC 52; sending a command does not confirm acceptance. Headless mode
+keeps only the last successful copy in `Report::clipboard`, as raw text,
+without touching the real clipboard.
 
 **Origin policy.** HTTP requests and websocket handshakes may only go to the
 app's own origin and to origins the embedder allow-lists. The app's origin is
@@ -66,6 +77,7 @@ ordinary TUI and can be tightened for untrusted apps.
 | download time | 60 s | HTTP client timeout |
 | input event queue | 1024 | oldest events dropped |
 | paste event | 1 MiB | longer pastes are cut at a character boundary |
+| clipboard write | 64 KiB of UTF-8 before base64 encoding | oversized copies return `too-large`; headless mode retains only the last successful copy |
 | cells per frame | 1 M | frame refused, app stopped |
 | open websockets | 16 | a semaphore permit taken before the handshake and held by the socket resource, so cancelled attempts, failures, and drops all release it |
 | websocket queues | 64 messages and 8 MiB per direction | incoming: oldest dropped; outgoing: `send` is async and waits (backpressure); a message larger than the queue is refused |

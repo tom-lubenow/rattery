@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod bindings;
 pub mod client;
+pub mod clipboard;
 pub mod events;
 pub mod log;
 pub mod storage;

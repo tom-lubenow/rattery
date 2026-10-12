@@ -5,7 +5,7 @@
 /// terminal. It is deliberately shaped like ratatui's `Backend` trait plus a
 /// crossterm-style event stream, so the guest never emits escape sequences and
 /// the host never needs to know what a widget is.
-package rattery:tui@0.4.0;
+package rattery:tui@0.5.0;
 
 interface terminal {
     // ---- rendering types -------------------------------------------------
@@ -273,6 +273,22 @@ interface terminal {
 
     /// Set the terminal window title.
     set-title: func(title: string);
+
+    variant clipboard-error {
+        /// Clipboard writes are disabled by the host.
+        disabled,
+        /// The text exceeds the host's byte limit.
+        too-large,
+        /// Writing the OSC 52 command to the terminal failed.
+        io(string),
+    }
+
+    /// Copy UTF-8 text to the system clipboard using OSC 52. The host
+    /// encodes the text; the guest cannot supply terminal commands. Success
+    /// means the command was written, not that the terminal accepted it.
+    /// Headless hosts retain the last copy without touching the clipboard.
+    /// There is no clipboard read operation; pastes arrive as input events.
+    copy-to-clipboard: func(text: string) -> result<_, clipboard-error>;
 
     /// Tell the host the app is ready for the user: its data is loaded and
     /// it is showing a real screen rather than a placeholder. Optional;

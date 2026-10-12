@@ -165,6 +165,38 @@ macro_rules! require_wasip2 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn clipboard_copy_and_host_policy_cross_the_sandbox() {
+    require_wasip2!();
+    let server = Server::start(&[]);
+    for (enabled, limit, expected, status) in [
+        (true, 64 << 10, Some("-1"), "copy requested"),
+        (false, 64 << 10, None, "copy failed:"),
+        (true, 1, None, "copy failed:"),
+    ] {
+        let report = App::from_url(format!("{}/app.wasm", server.url))
+            .unwrap()
+            .cookies(CookiePolicy::Ephemeral)
+            .storage(StoragePolicy::Ephemeral)
+            .clipboard(enabled)
+            .limits(rattery::Limits {
+                clipboard_bytes: limit,
+                ..rattery::Limits::default()
+            })
+            .headless(headless("sleep 2500\nkey j\nsleep 700\nkey y\nkey q", 20))
+            .run()
+            .await
+            .unwrap();
+        let text = dump(&report);
+        assert_eq!(report.status, AppStatus::Exited(0), "{text}");
+        assert_eq!(report.clipboard.as_deref(), expected, "{text}");
+        assert!(
+            report.final_screen.as_ref().unwrap().contains(status),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn counter_round_trip_and_state_on_server() {
     require_wasip2!();
     let server = Server::start(&[]);
@@ -911,7 +943,14 @@ async fn a_broken_update_never_interrupts_the_app() {
 fn future_abi_component() -> Vec<u8> {
     let mut bytes = std::fs::read(guest("counter-app")).unwrap();
     for interface in ["terminal", "websocket", "storage"] {
-        let from = format!("rattery:tui/{interface}@0.4.0");
+        let version = rattery::ABI
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('@')
+            .unwrap()
+            .1;
+        let from = format!("rattery:tui/{interface}@{version}");
         let to = format!("rattery:tui/{interface}@0.9.0");
         let mut at = 0;
         while let Some(pos) = bytes[at..]

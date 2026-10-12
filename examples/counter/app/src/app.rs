@@ -270,6 +270,14 @@ pub async fn run(mut terminal: Terminal) -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('s') => app.start(slow_snapshot(2000)),
                 KeyCode::Char('w') => app.ping(),
                 KeyCode::Char('u') => app.upload_file(),
+                KeyCode::Char('y') => {
+                    if let Some(snapshot) = &app.snapshot {
+                        match rattery_app::clipboard::copy(&snapshot.count.to_string()) {
+                            Ok(()) => app.feed_writer()("copy requested".into()),
+                            Err(err) => app.feed_writer()(format!("copy failed: {err}")),
+                        }
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -391,6 +399,8 @@ fn ui(frame: &mut Frame, app: &App) {
             "websocket ping  ".into(),
             " u ".bold(),
             "upload  ".into(),
+            " y ".bold(),
+            "copy count  ".into(),
             " q ".bold(),
             "quit".into(),
         ]))

@@ -213,6 +213,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     };
     term.queue().set_coalesce(app.coalesce_input);
     term.set_phase_hook(on_phase.clone());
+    term.set_clipboard_enabled(app.clipboard);
     let snapshots = term.snapshots();
     let screen_source = term.test_backend();
 
@@ -431,6 +432,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
     // handed back.
     tasks.shutdown().await;
     updates.close();
+    let clipboard = term.take_clipboard();
     drop(term);
     drop(session);
     phase(Phase::Exited(status.clone()));
@@ -446,6 +448,7 @@ async fn run_inner(app: App, hook_slot: crate::terminal::HookSlot) -> Result<Rep
         stderr: stderr_all,
         snapshots,
         final_screen,
+        clipboard,
         timings,
         stats,
     })
