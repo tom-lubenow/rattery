@@ -215,6 +215,13 @@ directly, outside server functions.
 so `rattery https://host/app.wasm?team=infra` passes parameters the way a web page
 gets them (the example reads `?title=`). `rattery_app::origin()` is where server calls go.
 
+`rattery_app::clipboard::copy("text to copy")?` copies UTF-8 text to the system
+clipboard using OSC 52. Call it from the app's copy action; the counter example
+uses `y` to copy the count. Newlines and Unicode are preserved, and an empty string
+clears the clipboard. The terminal emulator and any multiplexer (such as tmux)
+must support and allow OSC 52. Success means the command was sent; terminals may
+silently ignore it. Clipboard reads are not exposed; pastes arrive as `Event::Paste`.
+
 Event types mirror crossterm's (`KeyCode::Char('q')`, `KeyModifiers::CONTROL`, ...)
 so existing ratatui code ports by changing an import. `event::next_timeout` and
 `rattery_app::time::sleep` drive animations; `task::wake` lets a long-running task ask for
@@ -229,7 +236,7 @@ a flag, shown here because it reads well:
 rattery <URL or path>
         [--origin URL] [--allow-origin URL]... [--allow-all-origins]
         [--incognito | --no-cookies | --cookie-jar FILE]
-        [--storage-dir DIR | --no-storage] [--log-file FILE]
+        [--storage-dir DIR | --no-storage] [--log-file FILE] [--no-clipboard]
         [--watch [--reload-grace SECS|none]] [--location URL] [--env KEY=VALUE]... [--no-mouse] [--no-cache]
         [--headless COLSxROWS] [--script FILE] [--timeout SECS] [--stats [--stats-file FILE]]
 ```
@@ -258,6 +265,11 @@ has no origin and so gets ephemeral storage.
 `on_phase` hook, sanitised, size-capped, and rate-limited (`Limits::logs_per_second`).
 `--log-file` appends them to a file you can `tail -f` in another terminal while the
 app has the screen.
+
+**Clipboard.** OSC 52 copies are enabled by default. `App::clipboard(false)`
+(`--no-clipboard`) refuses them; `Limits::clipboard_bytes` caps each copy at
+64 KiB of UTF-8 text before encoding. In headless mode the real clipboard is
+untouched and `Report::clipboard` holds the last successful copy for assertions.
 
 **Updates.** Three things are kept apart, the way a browser does: discovery, state,
 and the reload. Discovery is `--watch` polling the URL with `If-None-Match`, a

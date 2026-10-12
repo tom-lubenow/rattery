@@ -387,6 +387,13 @@ impl terminal::Host for HostState {
         Ok(())
     }
 
+    async fn copy_to_clipboard(
+        &mut self,
+        text: String,
+    ) -> wasmtime::Result<Result<(), terminal::ClipboardError>> {
+        Ok(self.term.copy_to_clipboard(text, &self.limits))
+    }
+
     async fn ready(&mut self) -> wasmtime::Result<()> {
         self.term.app_ready();
         Ok(())

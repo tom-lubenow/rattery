@@ -90,6 +90,10 @@ struct Cli {
     #[arg(long)]
     no_mouse: bool,
 
+    /// Refuse the app's OSC 52 clipboard writes.
+    #[arg(long)]
+    no_clipboard: bool,
+
     /// Skip the on-disk cache of compiled components.
     #[arg(long)]
     no_cache: bool,
@@ -180,6 +184,7 @@ async fn main() -> Result<()> {
     let mut app = App::from_source(&cli.source)?
         .allow_all_origins(cli.allow_all_origins)
         .mouse(!cli.no_mouse)
+        .clipboard(!cli.no_clipboard)
         .coalesce_input(!cli.no_coalesce)
         .cache(!cli.no_cache)
         .cookies(if cli.no_cookies {

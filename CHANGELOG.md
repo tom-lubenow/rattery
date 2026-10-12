@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 (2026-10-11)
+
+WIT package `rattery:tui@0.5.0`; `ABI` is now
+`rattery:tui@0.5.0;cm-async;wasi:http@0.3.0`. Rebuild apps and hosts together.
+
+- `rattery_app::clipboard::copy` copies UTF-8 text to the system clipboard
+  through a typed host call using OSC 52. The host base64-encodes the text
+  and flushes immediately. Terminal and multiplexer support is required;
+  success means the command was sent, not that the clipboard changed.
+- `App::clipboard(false)` and the example CLI's `--no-clipboard` refuse
+  clipboard writes. `Limits::clipboard_bytes` bounds each copy to 64 KiB
+  before encoding by default. Clipboard reads are not exposed.
+- Headless runs keep the last successful copy in `Report::clipboard`
+  without touching the real clipboard. The counter example's `y` key
+  copies its count. Tests cover the wire format, error handling, limits,
+  host policy, and the guest-to-host call.
+
 ## 0.4.3 (2026-09-15)
 
 - Benchmarks against native ratatui: `cargo xtask perf` runs the same
